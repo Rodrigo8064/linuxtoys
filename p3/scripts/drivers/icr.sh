@@ -4,7 +4,7 @@
 # description: icr_desc
 # icon: intel.png
 # reboot: yes
-# gpu: Intel
+# gpu: Xe
 
 # --- Start of the script code ---
 source "$SCRIPT_DIR/libs/linuxtoys.lib"
@@ -19,11 +19,10 @@ icr_in () {
         pkg_install intel-compute-runtime clinfo
     fi
 }
-if is_intel; then
-    sudo_rq
+if is_intel && [ "$intel_arc" = "yes" ]; then
+    askpass
     icr_in
-    zeninf "$msg036"
+    info "$rebootmsg"
 else
-    nonfatal "$msg077"
-    exit 1
+    die "$hwincompat"
 fi

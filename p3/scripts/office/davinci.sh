@@ -3,7 +3,8 @@
 # version: 1.0
 # description: davinci_desc
 # icon: resolve.svg
-# hybridgpu: !cachy, !arch, !ostree, !solus
+# hybridgpu: !ostree, !solus
+# gpu: nvidia, rocm, xe
 
 # functions
 #create JSON, user agent and download Resolve
@@ -125,11 +126,11 @@ davincinatd () {
         chmod +x autoresolvedeb.sh
         ./autoresolvedeb.sh
         rm autoresolvedeb.sh
-#    elif is_arch || is_cachy; then
-#        curl -L -o autoresolvepkg.sh "https://raw.githubusercontent.com/psygreg/autoresolvedeb/main/linuxtoys/autoresolvepkg.sh"
-#        chmod +x autoresolvepkg.sh
-#        ./autoresolvepkg.sh
-#        rm autoresolvepkg.sh
+    elif is_arch || is_cachy; then
+        curl -L -o autoresolvepkg.sh "https://raw.githubusercontent.com/psygreg/autoresolvedeb/main/linuxtoys/autoresolvepkg.sh"
+        chmod +x autoresolvepkg.sh
+        ./autoresolvepkg.sh
+        rm autoresolvepkg.sh
     elif is_fedora; then
         curl -L -o autoresolverpm.sh "https://raw.githubusercontent.com/psygreg/autoresolvedeb/main/linuxtoys/autoresolverpm.sh"
         chmod +x autoresolverpm.sh
@@ -286,11 +287,11 @@ source "$SCRIPT_DIR/libs/helpers.lib"
 _lang_
 # warn about just installing Resolve, and still requiring a purchase from BMD to use Studio
 zenwrn "$msg034"
-cd $HOME
+prep_tmp
 export SCRIPT_DIR
 if is_ostree; then
     { ! is_hybridgpu && davinciboxatom; } || die "$incompatmsg"
-elif is_solus || is_arch || is_cachy; then
+elif is_solus; then
     { ! is_hybridgpu && davinciboxd; } || die "$incompatmsg"
 elif is_hybridgpu; then
     davincinatd

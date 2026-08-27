@@ -255,6 +255,7 @@ is_suse() {
     sysdetect_once 
     if [[ "$ID" == "suse" || "$ID" == "opensuse" || "$ID_LIKE" =~ "suse" ]]; then
         { [ "$ID" = "opensuse-leap" ] || [[ "$VERSION_ID" =~ ^[0-9]+\.[0-9]+$ ]]; } && suse_leap="1"
+        [ "$ID" = "opensuse-tumbleweed" ] && suse_tumbleweed="1"
         return 0
     else
         return 1
@@ -265,9 +266,9 @@ is_zorin() { sysdetect_once && [[ "$ID" == "zorin" ]]; }
 is_rhel() { sysdetect_once && [[ ("$ID" == "rhel" || "$ID" == "centos" || "$ID" == "almalinux" || "$ID_LIKE" =~ "rhel") ]] && [ ! -f /run/ostree-booted ] && [[ "$ID" != "nobara" ]]; }
 is_deepin() { sysdetect_once && [[ "$ID" == "deepin" ]]; }
 is_manjaro() { sysdetect_once && [[ "$ID" == "manjaro" || "$ID_LIKE" =~ "manjaro" ]]; }
-is_systemd() { [[ $(ps -p 1 -o comm= || readlink /sbin/init) =~ "systemd" ]] }
+is_systemd() { [[ $(ps -p 1 -o comm= || readlink /sbin/init) =~ "systemd" ]]; }
 
-# GPU detection
+# GPU and compute feature detection
 is_nvidia() {
     local nvidiaGPU=$(lspci | grep -i 'nvidia')
     if [[ -n "$nvidiaGPU" ]]; then
@@ -276,6 +277,7 @@ is_nvidia() {
         return 1
     fi
 }
+
 is_intel() {
     local dev modalias
     unset intel_arc INTEL_XE_SYSFS
@@ -293,10 +295,79 @@ is_intel() {
     done
     [[ -n "$intelGPU" ]]
 }
+is_icr_capable() {
+    is_intel || return 1
+    [[ -n "$intel_arc" ]] || return 1
+}
+
 is_amd() {
     local amdGPU
     amdGPU=$(lspci | grep -Ei 'vga|3d|display' | grep -Ei 'amd|radeon')
     [[ -n "$amdGPU" ]]
+}
+amd_dgpu() {
+    local dev drm vram
+    for dev in /sys/bus/pci/devices/*; do
+        [[ -r "$dev/vendor" && -r "$dev/class" ]] || continue
+        [[ "$(<"$dev/vendor")" == "0x1002" ]] || continue
+        [[ "$(<"$dev/class")" == 0x03* ]] || continue
+        for drm in "$dev"/drm/card*; do
+            [[ -r "$drm/device/mem_info_vram_total" ]] || continue
+            vram=$(<"$drm/device/mem_info_vram_total")
+            # dGPUs have substantial dedicated VRAM.
+            if (( vram >= 2073741824 )); then
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+rocm_apu() {
+    local cpu model
+    cpu=$(awk -F ': ' '/model name/ {print $2; exit}' /proc/cpuinfo)
+    [[ "$cpu" == *"AMD Ryzen"* ]] || return 1
+    if [[ "$cpu" == *"Ryzen AI "* ]]; then
+        return 0
+    fi
+    if [[ "$cpu" =~ Ryzen[[:space:]].*([0-9]{4}) ]]; then
+        model="${BASH_REMATCH[1]}"
+        if (( 10#$model >= 8000 )); then
+            case "$cpu" in
+                *U*|*H*)
+                    return 0
+                    ;;
+            esac
+        fi
+    fi
+    return 1
+}
+is_rocm_capable() {
+    is_amd || return 1
+    { amd_dgpu || rocm_apu; } || return 1
+}
+
+# other features and quirks
+has_rebar() {
+    local pci size unit
+    while read -r pci; do
+        while read -r size unit; do
+            case "$unit" in
+                GB)
+                    return 0
+                    ;;
+                MB)
+                    (( size > 256 )) && return 0
+                    ;;
+            esac
+        done < <(
+            sudo lspci -vv -s "$pci" 2>/dev/null |
+            sed -nE 's/.*current size: ([0-9]+)(MB|GB).*/\1 \2/p'
+        )
+    done < <(
+        lspci -D |
+        awk '/VGA compatible controller|3D controller/ {print $1}'
+    )
+    return 1
 }
 is_hybridgpu() {
     if is_nvidia && ( is_intel || is_amd ); then
@@ -471,12 +542,15 @@ pkg_install () {
     # Handle --ignore-appends and --ostreecheck flags
     local _ignore_appends=0
     local _ostreecheck=0
+    local _allowerasing=0
     local -a _filtered_args=()
     for arg in "$@"; do
         if [[ "$arg" == "--ignore-appends" ]]; then
             _ignore_appends=1
         elif [[ "$arg" == "--ostreecheck" ]]; then
             _ostreecheck=1
+        elif [[ "$arg" == "--allowerasing" ]]; then
+            _allowerasing=1
         else
             _filtered_args+=("$arg")
         fi
@@ -555,7 +629,11 @@ pkg_install () {
             exit 100
         fi
     elif is_fedora || is_rhel; then
-        sudo dnf install -y "${pkg_notfound[@]}" || fatal "Failed to install $to_install"
+        if [[ $_allowerasing -eq 1 ]]; then
+            sudo dnf install -y --allowerasing "${pkg_notfound[@]}" || die "Failed to install $to_install"
+        else
+            sudo dnf install -y "${pkg_notfound[@]}" || die "Failed to install $to_install"
+        fi
         [[ $_ignore_appends -eq 0 ]] && _append_transmap "pkg $to_install"
     elif is_suse; then
         sudo zypper in -y "${pkg_notfound[@]}" || fatal "Failed to install $to_install"
@@ -932,16 +1010,18 @@ bootloader_upd() {
     fi
 }
 initramfs_upd() {
-    if is_debian; then
-        sudo update-initramfs -u || fatal "Failed to update initramfs"
-        _append_transmap "updated initramfs"
+    if is_debian || is_ubuntu; then
+        sudo update-initramfs -u -k all || die "Failed to update initramfs"
     elif is_arch || is_cachy; then
-        sudo mkinitcpio -P || fatal "Failed to update mkinitcpio"
-        _append_transmap "updated initramfs"
+        if command -v dracut &> /dev/null; then
+            sudo dracut -f --regenerate-all || die "Failed to update dracut"
+        else
+            sudo mkinitcpio -P || die "Failed to update mkinitcpio"
+        fi
     elif is_fedora || is_suse || is_rhel ; then
-        sudo dracut -f --regenerate-all || fatal "Failed to update dracut"
-        _append_transmap "updated initramfs"
+        sudo dracut -f --regenerate-all || die "Failed to update dracut"
     fi
+    _append_transmap "updated initramfs"
 }
 kargs_upd() {
     for arg in "$@"; do
@@ -961,6 +1041,10 @@ grubbyargs_upd () {
 
 # systemd service operations
 sysd_enable() {
+    if [ ! -n "$daemon_reloaded" ]; then
+        sudo systemctl daemon-reload || fatal "Failed to reload systemd daemon"
+        daemon_reloaded="1"
+    fi
     for svc in "$@"; do
         sudo systemctl enable "$svc" || fatal "Failed to enable service $svc"
         _append_transmap "sysd enabled $svc"
@@ -973,6 +1057,10 @@ sysd_disable() {
     done
 }
 sysd_start() {
+    if [ ! -n "$daemon_reloaded" ]; then
+        sudo systemctl daemon-reload || fatal "Failed to reload systemd daemon"
+        daemon_reloaded="1"
+    fi
     for svc in "$@"; do
         sudo systemctl start "$svc" || fatal "Failed to start service $svc"
         _append_transmap "sysd started $svc"
@@ -985,6 +1073,10 @@ sysd_stop() {
     done
 }
 sysd_enable_usr() {
+    if [ ! -n "$daemon_reloaded" ]; then
+        sudo systemctl daemon-reload || fatal "Failed to reload systemd daemon"
+        daemon_reloaded="1"
+    fi
     for svc in "$@"; do
         systemctl --user enable "$svc" || fatal "Failed to enable service $svc"
         _append_transmap "sysd usermode enabled $svc"
@@ -997,6 +1089,10 @@ sysd_disable_usr() {
     done
 }
 sysd_start_usr() {
+    if [ ! -n "$daemon_reloaded" ]; then
+        sudo systemctl daemon-reload || fatal "Failed to reload systemd daemon"
+        daemon_reloaded="1"
+    fi
     for svc in "$@"; do
         systemctl --user start "$svc" || fatal "Failed to start service $svc"
         _append_transmap "sysd usermode started $svc"
