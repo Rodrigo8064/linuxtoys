@@ -1,0 +1,196 @@
+Screen {
+  align: center middle;
+}
+
+#body {
+  height: 1fr;
+}
+
+#left-panel {
+  width: 100%;
+  height: 1fr;
+  border: round $primary;
+  border-title-color: $text;
+  padding: 1 2;
+  background: transparent;
+}
+
+#right-panel {
+  width: 2fr;
+  height: 1fr;
+  border: round $accent;
+  padding: 1 2;
+  border-title-color: $text;
+  background: transparent;
+}
+
+#log-box {
+  height: 1fr;
+  border: round $success;
+  padding: 0 1;
+  background: transparent;
+}
+
+
+#history-list {
+  height: 1fr;
+  background: transparent;
+}
+
+#history-details {
+  height: 100%;
+  # border: round $accent;
+  padding: 1 2;
+  content-align: left top;
+  background: transparent;
+  overflow-y: auto;
+}
+
+DescButton {
+  width: 1fr;
+  margin-bottom: 1;
+  border: round $primary;
+  background: transparent;
+}
+
+ConfirmScriptScreen {
+  align: center middle;
+}
+
+#confirm-dialog {
+  width: 60%;
+  max-width: 70;
+  height: auto;
+  border: thick $primary;
+  background: $surface;
+  padding: 1 2;
+}
+
+#confirm-title {
+  text-style: bold;
+  content-align: center middle;
+  margin-bottom: 1;
+  height: auto;
+}
+
+#confirm-description {
+  border: round $accent;
+  padding: 1 2;
+  margin-bottom: 1;
+  height: auto;
+  max-height: 12;
+}
+
+#confirm-buttons {
+  align: center middle;
+  height: auto;
+}
+
+#confirm-buttons Button {
+  margin: 0 2;
+  min-width: 12;
+}
+
+#sudo-error {
+  color: $error;
+  text-style: bold;
+  content-align: center middle;
+  height: auto;
+  margin-bottom: 1;
+}
+
+#sudo-password-input {
+  margin-bottom: 1;
+}
+
+#logo {
+  width: 100%;
+  height: auto;
+  content-align: center middle;
+  background: transparent;
+}
+
+.home {    
+  width: 58;
+  max-width: 100%;
+  height: auto;
+  align: center middle;
+}
+
+#home-menu {
+  background: transparent;
+  width: 1fr;
+  height: auto;
+  margin-top: 2;
+}
+
+#home-menu Label {
+  width: 100%;
+  content-align: center middle;
+}
+
+.hello {
+  width: 100%;
+  height: auto;
+  content-align: center middle;
+}
+
+.contributors-grid {
+  layout: grid;
+  grid-size: 3 2;
+  grid-columns: 16;
+  grid-gutter: 1 0;
+  padding: 1 0;
+  width: auto;
+  height: auto;
+}
+
+.contributors-grid Static {
+  content-align: center middle;
+  width: 100%;
+}
+
+.home-links Link {
+  margin: 0 2;
+}
+
+.home-links {
+  dock: bottom;
+  width: 100%;
+  max-width: 100%;
+  height: auto;
+  align: center middle;
+  padding: 1 0;
+}
+
+#license {
+  width: 100%;
+  height: auto;
+  content-align: center middle;
+}
+
+#left-column {
+  width: 1fr;
+  height: 1fr;
+}
+
+#search-input {
+  margin-bottom: 1;
+}
+
+#search-registry {
+  margin-bottom: 1;
+}
+
+#menu-panel {
+  width: 2fr;
+  height: 1fr;
+  border: round $accent;
+  padding: 1 2;
+}
+
+#menu-panel #logo {
+  width: 100%;
+  height: auto;
+  content-align: center middle;
+}
