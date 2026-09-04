@@ -4,8 +4,6 @@ import os
 
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.screen import Screen
-from textual.types import DuplicateID
 from textual.widgets import (
     Button,
     Footer,
@@ -24,6 +22,7 @@ from app.lang_utils import create_translator
 from app.parser import get_scripts_for_category
 from app.registry_utils import parse_registry_file
 
+from . import logo
 from .about_lt import AboutScreen
 from .dialog_screen import (
     ConfirmScriptScreen,
@@ -249,7 +248,7 @@ class LinuxToys(ScriptRunnerMixin, HistoryOpenerMixin, App):
                         )
             # right panel widgets
             with Vertical(id="menu-panel"):
-                yield Static(get_sidebar_logo(), id="logo")
+                yield Static(logo, id="logo")
                 yield ListView(
                     ListItem(Label(about), id="about"),
                     ListItem(Label(registry), id="registry"),
