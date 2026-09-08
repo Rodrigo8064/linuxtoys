@@ -117,6 +117,11 @@ ConfirmScriptScreen {
   align: center middle;
 }
 
+.home Button {
+  width: 30;
+  margin: 1 1;
+}
+
 #home-menu {
   background: transparent;
   width: 100%;
@@ -163,12 +168,6 @@ ConfirmScriptScreen {
   padding: 1 0;
 }
 
-#license {
-  width: 100%;
-  height: auto;
-  content-align: center middle;
-}
-
 #left-column {
   width: 1fr;
   height: 1fr;
@@ -194,4 +193,14 @@ ConfirmScriptScreen {
   width: 100%;
   height: auto;
   content-align: center middle;
+}
+
+#terminal-conteiner {
+  width: 2fr;
+  height: 1fr;
+}
+
+Terminal {
+  width: 100%;
+  height: 100%;
 }
