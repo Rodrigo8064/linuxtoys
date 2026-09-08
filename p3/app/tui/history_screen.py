@@ -11,7 +11,7 @@ from textual.widgets import (
 )
 
 from app.lang_utils import create_translator
-from app.registry_utils import parse_registry_file
+from app.registry_utils import parse_registry_file, search_registry_entries
 
 from .my_widgets import HistoryListItem
 
@@ -30,10 +30,11 @@ class HistoryScreen(Screen):
         _ = create_translator()
         credits = _("credits_label")
         suport = _("support_footer")
-        yield Header(name="Histórico de execição")
+        placeholder = _("search")
+        yield Header()
         with Horizontal(id="body"):
             with Vertical(id="left-column"):
-                yield Input(placeholder="Buscar", id="search-registry")
+                yield Input(placeholder=placeholder, id="search-registry")
                 with Vertical(id="left-panel"):
                     script_name = sorted(self.registry_data.keys())
                     yield ListView(
@@ -69,24 +70,18 @@ class HistoryScreen(Screen):
         if isinstance(item, HistoryListItem):
             self._display_script_details(item.script_name)
 
-    def on_input_changed(self, event: Input.Changed) -> None:
+    async def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id != "search-registry":
             return
-        self._filter_history(event.value)
+        await self._filter_history(event.value)
 
-    def _filter_history(self, query: str) -> None:
-        query = query.strip().lower()
-        all_names = sorted(self.registry_data.keys())
-        filtered_names = (
-            [name for name in all_names if query in name.lower()]
-            if query
-            else all_names
-        )
+    async def _filter_history(self, query: str) -> None:
+        filtered_data = search_registry_entries(self.registry_data, query)
+        filtered_names = sorted(filtered_data.keys())
         list_view = self.query_one("#history-list", ListView)
-        list_view.clear()
+        await list_view.clear()
         for name in filtered_names:
-            list_view.append(HistoryListItem(name))
-
+            await list_view.append(HistoryListItem(name))
         details = self.query_one("#history-details", Static)
         if filtered_names:
             list_view.index = 0
