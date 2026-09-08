@@ -2,7 +2,7 @@ import requests
 from rich_pixels import Pixels
 from textual import work
 from textual.app import ComposeResult
-from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.containers import Center, Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen, Screen
 from textual.widgets import (
     Button,
@@ -52,7 +52,9 @@ class AboutScreen(Screen):
             yield Rule()
             yield Static(f"[bold]{contributors_label}[/bold]")
             yield Vertical(id="contributors-list", classes="contributors-grid")
-            yield Button(label=license, id="license")
+            with Center():
+                yield Button(label=license, id="license")
+                yield Button(label="voltar", variant="primary", id="go-back")
 
         with Horizontal(classes="home-links"):
             yield Link(" Wiki", url="https://linux.toys/knowledgebase.html")
@@ -69,6 +71,8 @@ class AboutScreen(Screen):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "license":
             self.app.push_screen(LicenseScreen())
+        if event.button.id == "go-back":
+            self.app.pop_screen()
 
     def _get_compat_display_string(self):
         compat_keys = get_system_compat_keys()
@@ -140,7 +144,7 @@ class AboutScreen(Screen):
         )
 
 
-class LicenseScreen(ModalScreen[bool]):
+class LicenseScreen(ModalScreen[None]):
     BINDINGS = [
         ("escape", "app.pop_screen", "Voltar"),
         ("w", "app.pop_screen", "Voltar"),
@@ -150,10 +154,9 @@ class LicenseScreen(ModalScreen[bool]):
         license_path = get_app_resource_path("../LICENSE")
         try:
             with open(license_path, "r", encoding="utf-8") as f:
-                license_text = f.read()
-            return license_text
+                return f.read()
         except Exception as e:
-            print(f"Error loading license. {e}")
+            return f"Error loading license. {e}"
 
     def compose(self) -> ComposeResult:
         license_text = self.get_license_text()
