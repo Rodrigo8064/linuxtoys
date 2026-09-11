@@ -7,6 +7,7 @@ import re
 import shlex
 import struct
 import termios
+import uuid
 
 import pyte
 from rich.text import Text
@@ -80,7 +81,7 @@ class TerminalPTY:
     def _open_terminal(self) -> int:
         pid, fd = pty.fork()
         if pid == 0:
-            argv = shlex.split("bash")
+            argv = ["bash", "--norc", "--noprofile"]
             lang = os.environ.get("LANG") or "C.UTF-8"
             env = dict(
                 os.environ,
@@ -88,6 +89,7 @@ class TerminalPTY:
                 LANG=lang,
                 COLUMNS=str(self.ncol),
                 LINES=str(self.nrow),
+                PS1="$ ",
             )
             os.execvpe(argv[0], argv, env)
         self.child_pid = pid
@@ -163,13 +165,16 @@ class Terminal(Widget, can_focus=True):
         self.ncol = ncol
         self.nrow = nrow
         self._display = PyteDisplay([Text()])
-        self._screen = pyte.Screen(ncol, nrow)
+        self._screen = pyte.HistoryScreen(
+            ncol, nrow, history=10000, ratio=0.25
+        )
         self.stream = pyte.Stream(self._screen)
         self.pty: TerminalPTY | None = None
         self._exit_scan_buffer = ""
         self._awaiting_exit_code = False
         self._password_prompt_scan_buffer = ""
         self._password_prompt_pending = False
+        self._last_run_marker: str | None = None
 
     def on_mount(self) -> None:
         self._spawn_pty()
@@ -180,7 +185,9 @@ class Terminal(Widget, can_focus=True):
         automaticamente se o shell cair no meio do uso)."""
         self.pty = TerminalPTY(self.ncol, self.nrow)
         self.pty.start()
-        self._screen = pyte.HistoryScreen(self.ncol, self.nrow, history=10000)
+        self._screen = pyte.HistoryScreen(
+            self.ncol, self.nrow, history=10000, ratio=0.25
+        )
         self.stream = pyte.Stream(self._screen)
         self._display = PyteDisplay([Text()])
         self._exit_scan_buffer = ""
@@ -188,7 +195,7 @@ class Terminal(Widget, can_focus=True):
             self._recv_started = True
             self.run_worker(self._recv(), exclusive=True)
 
-    def get_full_text(self) -> str:
+    def get_full_text(self, only_last_run: bool = False) -> str:
         """Reconstrói o texto puro (sem ANSI/cor) de tudo que já passou
         pelo terminal nessa sessão — histórico de rolagem + tela atual.
         Pensado pra relatórios de bug, não pra exibição visual."""
@@ -207,17 +214,61 @@ class Terminal(Widget, can_focus=True):
             row_to_text(self._screen.buffer[row_idx])
             for row_idx in sorted(self._screen.buffer.keys())
         )
-        return "\n".join(lines)
+        full_text = "\n".join(lines)
+
+        if only_last_run and self._last_run_marker:
+            idx = full_text.rfind(self._last_run_marker)
+            if idx != -1:
+                newline_idx = full_text.find("\n", idx)
+                if newline_idx != -1:
+                    return full_text[newline_idx + 1 :]
+
+        return full_text
 
     def render(self):
         return self._display
 
     async def on_key(self, event: events.Key) -> None:
+        if event.key == "pageup":
+            self._screen.prev_page()
+            self._render_screen()
+            return
+        if event.key == "pagedown":
+            self._screen.next_page()
+            self._render_screen()
+            return
         if self.pty is None:
             return
         char = self.ctrl_keys.get(event.key) or event.character
         if char:
             await self.pty.recv_queue.put(["stdin", char])
+
+    def on_mouse_scroll_up(self, event: events.MouseScrollUp) -> None:
+        event.stop()  # não deixa o VerticalScroll externo also rolar
+        self._screen.prev_page()
+        self._render_screen()
+
+    def on_mouse_scroll_down(self, event: events.MouseScrollDown) -> None:
+        event.stop()
+        self._screen.next_page()
+        self._render_screen()
+
+    def on_resize(self, event: events.Resize) -> None:
+        self._resize_terminal(event.size.width, event.size.height)
+
+    def _resize_terminal(self, ncol: int, nrow: int) -> None:
+        if ncol <= 0 or nrow <= 0 or (ncol == self.ncol and nrow == self.nrow):
+            return
+
+        self.ncol = ncol
+        self.nrow = nrow
+        self._screen.resize(nrow, ncol)  # pyte: (linhas, colunas)
+        self._render_screen()
+
+        if self.pty is not None:
+            asyncio.create_task(
+                self.pty.recv_queue.put(["set_size", nrow, ncol, 0, 0])
+            )
 
     def run_script(
         self, command: str | list, env: dict[str, str] | None = None
@@ -234,7 +285,7 @@ class Terminal(Widget, can_focus=True):
         else:
             argv = list(command)
 
-        quote_command = " ".join(shlex.quote(str(part)) for part in argv)
+        quoted_command = " ".join(shlex.quote(str(part)) for part in argv)
 
         prefix = ""
         if env:
@@ -242,8 +293,14 @@ class Terminal(Widget, can_focus=True):
                 f"{key}={shlex.quote(value)}" for key, value in env.items()
             )
             prefix = f"export {exports}; "
-
-        line = f"{prefix}{quote_command}; echo {self.EXIT_MARKER}$?\n"
+        self._last_run_marker = f"@@LT_START@@:{uuid.uuid4().hex[:8]}"
+        line = (
+            f"{prefix}echo {self._last_run_marker}; "
+            f"{quoted_command}; "
+            "__lt_code=$?; "
+            'read -rp "Pressione ENTER para continuar..." ; '
+            f"echo {self.EXIT_MARKER}$__lt_code\n"
+        )
         asyncio.create_task(self.pty.recv_queue.put(["stdin", line]))
 
     async def _recv(self) -> None:
