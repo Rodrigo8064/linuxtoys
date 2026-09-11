@@ -446,9 +446,11 @@ class LinuxToys(ScriptRunnerMixin, HistoryOpenerMixin, App):
             with Vertical(id="menu-panel"):
                 yield Static(logo, id="logo")
                 yield ListView(
-                    ListItem(Label(about), id="about"),
-                    ListItem(Label(registry), id="registry"),
-                    ListItem(Label(scripts_resync), id="scripts_resync"),
+                    ListItem(Label(f" {about}"), id="about"),
+                    ListItem(Label(f"󰲃 {registry}"), id="registry"),
+                    ListItem(
+                        Label(f" {scripts_resync}"), id="scripts_resync"
+                    ),
                     id="home-menu",
                 )
                 with Vertical(id="terminal-conteiner"):
