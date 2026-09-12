@@ -157,6 +157,7 @@ ConfirmScriptScreen {
 
 .home-links Link {
   margin: 0 2;
+  color: $accent;
 }
 
 .home-links {
@@ -203,4 +204,16 @@ ConfirmScriptScreen {
 Terminal {
   width: 100%;
   height: 100%;
+}
+
+.report-bug {
+    color: $accent;
+}
+
+.report-bug:hover {
+    color: $accent-lighten-2;
+}
+
+.report-bug:focus {
+  text-style: reverse;
 }
