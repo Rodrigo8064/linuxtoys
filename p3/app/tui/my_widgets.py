@@ -16,7 +16,44 @@ from textual.message import Message
 from textual.widget import Widget
 from textual.widgets import Button, Label, ListItem
 
-from app.registry_utils import parse_registry_file
+
+class FocusableLabel(Label):
+    """Um Label que aceita foco via tecla TAB e emite um evento ao pressionar Enter/Espaço."""
+
+    class Pressed(Message):
+        """Disparado quando o label é clicado ou ativado via teclado."""
+
+        def __init__(self, label: "FocusableLabel") -> None:
+            self.label = label
+            super().__init__()
+
+        @property
+        def control(self) -> Label:
+            return self.label
+
+    def __init__(
+        self,
+        renderable="",
+        *,
+        expand=False,
+        shrink=False,
+        markup=True,
+        **kwargs,
+    ) -> None:
+        can_focus = kwargs.pop("can_focus", True)
+        super().__init__(
+            renderable, expand=expand, shrink=shrink, markup=markup, **kwargs
+        )
+        self.can_focus = can_focus
+
+    def _on_key(self, event: events.Key):
+        if event.key in ("enter", "space"):
+            event.stop()
+            self.post_message(self.Pressed(self))
+
+    def _on_click(self, event: events.Click):
+        event.stop()
+        self.post_message(self.Pressed(self))
 
 
 class DescButton(Button):
@@ -27,6 +64,7 @@ class DescButton(Button):
         path: str,
         is_script: bool,
         is_new: bool = False,
+        is_installed: bool = False,
         **kwargs,
     ) -> None:
         super().__init__(label, tooltip=description, **kwargs)
@@ -35,13 +73,10 @@ class DescButton(Button):
         self.is_script = is_script
         self.is_new = is_new
         self.script_name = label
-
-        script_name = str(label)
-        registry_data = parse_registry_file()
-        self.is_first_run = script_name not in registry_data
+        self.is_installed = is_installed
 
     def on_mount(self) -> None:
-        if not self.is_first_run:
+        if self.is_installed:
             self.styles.border = ("heavy", "red")
             self.label = f"{self.script_name} "
         elif self.is_new:
