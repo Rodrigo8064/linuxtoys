@@ -94,6 +94,7 @@ class ScriptRunnerMixin:
         )
         left_panel = self.query_one("#left-panel", VerticalScroll)
         await left_panel.remove_children()
+        registry_data = parse_registry_file()
         for item in items:
             await left_panel.mount(
                 DescButton(
@@ -102,6 +103,7 @@ class ScriptRunnerMixin:
                     item["path"],
                     item["is_script"],
                     item.get("is_new", False),
+                    item["name"] in registry_data,
                     id=slugify(item["name"]),
                 )
             )
