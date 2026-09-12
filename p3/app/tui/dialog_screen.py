@@ -218,3 +218,40 @@ class CancelledDialog(ModalScreen[None]):
 
     def action_cancel(self) -> None:
         self.dismiss()
+
+
+class ReportBugDialog(ModalScreen[bool]):
+    """Diálogo exibido quando um script termina com um exit code de
+    erro de verdade (não cancelamento nem Ctrl+C). Retorna True via
+    dismiss() se o usuário pediu pra reportar o bug, False caso contrário."""
+
+    BINDINGS = [
+        ("escape", "cancel", "Fechar"),
+        ("w", "app.pop_screen", "Voltar"),
+    ]
+
+    # def __init__(
+    #     # self, script_name: str, exit_code: int | None, action: str = "instalar"
+    # ) -> None:
+    #     super().__init__()
+    #     # self.script_name = script_name
+    #     # self.exit_code = exit_code
+    #     # self.action = action
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="confirm-dialog"):
+            # yield Label(
+            #     f"Falha ao {self.action} '{self.script_name}' "
+            #     f"(código de saída: {self.exit_code})."
+            # )
+            with Horizontal(id="confirm-buttons"):
+                yield Button("Concluir", id="execute-btn", variant="success")
+                yield Button(
+                    "Reportar Bug", id="report-bug", variant="warning"
+                )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "report-bug")
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
