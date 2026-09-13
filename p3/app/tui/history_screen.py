@@ -10,10 +10,10 @@ from textual.widgets import (
     Static,
 )
 
-from app.lang_utils import create_translator
 from app.registry_utils import parse_registry_file, search_registry_entries
 
-from .my_widgets import HistoryListItem
+from .helper import translations
+from .my_widgets import FocusableLabel, HistoryListItem
 
 
 class HistoryScreen(Screen):
@@ -27,14 +27,13 @@ class HistoryScreen(Screen):
         self.registry_data = parse_registry_file()
 
     def compose(self) -> ComposeResult:
-        _ = create_translator()
-        credits = _("credits_label")
-        suport = _("support_footer")
-        placeholder = _("search")
         yield Header()
         with Horizontal(id="body"):
             with Vertical(id="left-column"):
-                yield Input(placeholder=placeholder, id="search-registry")
+                yield Input(
+                    placeholder=translations.get("search", "Search"),
+                    id="search-registry",
+                )
                 with Vertical(id="left-panel"):
                     script_name = sorted(self.registry_data.keys())
                     yield ListView(
@@ -50,8 +49,19 @@ class HistoryScreen(Screen):
                 )
         with Horizontal(classes="home-links"):
             yield Link(" Wiki", url="https://linux.toys/knowledgebase.html")
-            yield Link(f" {credits}", url="https://linux.toys/credits.html")
-            yield Link(f" {suport}", url="https://ko-fi.com/psygreg")
+            yield FocusableLabel(
+                f" [u]{translations.get('report_label', 'Report Bug')}[/u]",
+                id="report-bug",
+                classes="report-bug",
+            )
+            yield Link(
+                f" {translations.get('credits_label', 'Credits')}",
+                url="https://linux.toys/credits.html",
+            )
+            yield Link(
+                f" {translations.get('support_footer', 'Support this project')}",
+                url="https://ko-fi.com/psygreg",
+            )
         yield Footer(show_command_palette=False)
 
     def on_mount(self) -> None:

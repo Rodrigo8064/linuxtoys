@@ -89,6 +89,13 @@ class HistoryListItem(ListItem):
         self.script_name = script_name
 
 
+class LanguageListItem(ListItem):
+    def __init__(self, code: str, display_name: str) -> None:
+        super().__init__(Label(display_name))
+        self.code = code
+        self.display_name = display_name
+
+
 class PyteDisplay:
     def __init__(self, lines):
         self.lines = lines

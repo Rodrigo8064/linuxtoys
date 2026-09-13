@@ -1,7 +1,6 @@
-from textual import events, on
+from textual import on
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.events import Click
 from textual.widgets import (
     Button,
     Footer,
@@ -17,13 +16,12 @@ from textual.widgets import (
 from app.easy_cli import (
     is_dev_mode_enabled,
 )
-from app.lang_utils import create_translator
 from app.registry_utils import parse_registry_file
 
 from . import logo
 from .about_lt import AboutScreen
 from .button_helper import ScriptRunnerMixin
-from .dialog_screen import ReportBugDialog
+from .dialog_screen import LanguageSelectorDialog, ReportBugDialog
 from .helper import (
     get_search_index,
     load_categories,
@@ -53,24 +51,17 @@ class LinuxToys(ScriptRunnerMixin, HistoryOpenerMixin, App):
 
     def compose(self) -> ComposeResult:
         categories = load_categories(translations)
-
-        _ = create_translator()
-        report_label = _("report_label")
-        credits = _("credits_label")
-        suport = _("support_footer")
-        about = _("about_title")
-        registry = _("action_registry")
-        scripts_resync = _("scripts_resync")
-        search_placeholder = _("search_placeholder")
-        load_manifest = _("load_manifest")
-        select_language = _("select_language")
-
         yield Header(icon="")
 
         with Horizontal(id="body"):
             # left panel widgets
             with Vertical(id="left-column"):
-                yield Input(placeholder=search_placeholder, id="search-input")
+                yield Input(
+                    placeholder=translations.get(
+                        "search_placeholder", "Search"
+                    ),
+                    id="search-input",
+                )
                 with VerticalScroll(id="left-panel"):
                     registry_data = parse_registry_file()
                     for item in categories:
@@ -87,12 +78,31 @@ class LinuxToys(ScriptRunnerMixin, HistoryOpenerMixin, App):
             with Vertical(id="menu-panel"):
                 yield Static(logo, id="logo")
                 yield ListView(
-                    ListItem(Label(f" {load_manifest}"), id="manifest"),
-                    ListItem(Label(f" {select_language}"), id="language"),
-                    ListItem(Label(f" {about}"), id="about"),
-                    ListItem(Label(f"󰲃 {registry}"), id="registry"),
                     ListItem(
-                        Label(f" {scripts_resync}"), id="scripts_resync"
+                        Label(
+                            f" {translations.get('load_manifest', 'Load manifest')}"
+                        ),
+                        id="manifest",
+                    ),
+                    ListItem(
+                        Label(
+                            f" {translations.get('select_language', 'Select language')}"
+                        ),
+                        id="language",
+                    ),
+                    ListItem(
+                        Label(f" {translations.get('about', 'About')}"),
+                        id="about",
+                    ),
+                    ListItem(
+                        Label(f"󰲃 {translations.get('action_registry')}"),
+                        id="registry",
+                    ),
+                    ListItem(
+                        Label(
+                            f" {translations.get('scripts_resync', 'Scripts resync')}"
+                        ),
+                        id="scripts_resync",
                     ),
                     id="home-menu",
                 )
@@ -102,12 +112,18 @@ class LinuxToys(ScriptRunnerMixin, HistoryOpenerMixin, App):
         with Horizontal(classes="home-links"):
             yield Link(" Wiki", url="https://linux.toys/knowledgebase.html")
             yield FocusableLabel(
-                f" [u]{report_label}[/u]",
+                f" [u]{translations.get('report_label', 'Report Bug')}[/u]",
                 id="report-bug",
                 classes="report-bug",
             )
-            yield Link(f" {credits}", url="https://linux.toys/credits.html")
-            yield Link(f" {suport}", url="https://ko-fi.com/psygreg")
+            yield Link(
+                f" {translations.get('credits_label', 'Credits')}",
+                url="https://linux.toys/credits.html",
+            )
+            yield Link(
+                f" {translations.get('support_footer', 'Support this project')}",
+                url="https://ko-fi.com/psygreg",
+            )
 
         yield Footer()
 
@@ -142,6 +158,12 @@ class LinuxToys(ScriptRunnerMixin, HistoryOpenerMixin, App):
             self.app.push_screen(HistoryScreen())
         if event.item.id == "scripts_resync":
             self._start_scripts_resync()
+        if event.item.id == "language":
+            self.app.push_screen(
+                LanguageSelectorDialog(), callback=self.apply_language_change
+            )
+        if event.item.id == "manifest":
+            pass
 
     async def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id != "search-input":
@@ -230,6 +252,27 @@ class LinuxToys(ScriptRunnerMixin, HistoryOpenerMixin, App):
                 "Não foi possível sincronizar os scripts agora.",
                 severity="warning",
             )
+
+    def apply_language_change(self, new_language_code: str | None) -> None:
+        if new_language_code is None:
+            return
+
+        from app import lang_utils
+
+        new_translations = lang_utils.load_translations(new_language_code)
+        translations.clear()
+        translations.update(new_translations)  # muta no lugar, não reatribui
+        lang_utils.save_language(new_language_code)
+
+        from . import helper as helper_module
+
+        helper_module._search_index_cache = None  # invalida a busca
+
+        self.run_worker(self.action_reset_to_home())
+        self._refresh_fixed_ui_labels()
+
+    def _refresh_fixed_ui_labels(self):
+        pass
 
 
 if __name__ == "__main__":

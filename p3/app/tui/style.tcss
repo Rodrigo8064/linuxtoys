@@ -265,7 +265,7 @@ TextArea#bug-description {
 }
 
 /* Container dos botões alinhado à direita */
-#confirm-buttons {
+#buttons-aligh-right {
     height: 3;
     align-horizontal: right;
 }
@@ -292,4 +292,38 @@ TextArea#bug-description {
 .field-label {
   margin-top: 1;
   margin-bottom: 1;
+}
+
+SelectLanguageDialog {
+    align: center middle;
+}
+
+#lang-dialog-container {
+    width: 60;
+    height: 70;                 /* Altura fixa para permitir rolagem limpa do ListView */
+    padding: 1 2;
+    background: $surface;
+    border: round $primary;
+}
+
+.lang-label {
+    height: auto;
+    margin-bottom: 1;
+    text-style: bold;
+}
+
+#search-language {
+    margin-bottom: 1;           /* Cria o espaçamento entre o Input e a ListView */
+    border: round $primary;
+}
+
+#language-list {
+    height: 1fr;               /* Ocupa o restante do espaço vertical do container */
+    background: $boost;
+    border: none;
+}
+
+/* Opcional: Estilo suave para os itens da lista */
+LanguageListItem {
+    padding: 0 1;
 }

@@ -2,13 +2,28 @@ from textual import on, work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, Input, Label, Select, Static, TextArea
+from textual.widgets import (
+    Button,
+    Header,
+    Input,
+    Label,
+    ListItem,
+    ListView,
+    Select,
+    Static,
+    TextArea,
+)
 
 from app.antenna import antenna
-from app.lang_utils import create_translator
+from app.lang_utils import (
+    create_translator,
+    get_available_languages,
+    get_localized_language_names,
+)
 from app.official_index import get_bug_report_entries
 
 from .helper import translations
+from .my_widgets import LanguageListItem
 
 
 class ConfirmScriptScreen(ModalScreen[bool]):
@@ -26,11 +41,15 @@ class ConfirmScriptScreen(ModalScreen[bool]):
         self.description = description
 
     def compose(self) -> ComposeResult:
+        _ = create_translator()
+        cancel_btn_label = _("cancel_btn_label")
         with Vertical(id="confirm-dialog"):
             yield Static(f"Executar '{self.script_name}'?", id="confirm-title")
             yield Static(self.description, id="confirm-description")
             with Horizontal(id="confirm-buttons"):
-                yield Button("Cancelar", id="cancel-btn", variant="error")
+                yield Button(
+                    cancel_btn_label, id="cancel-btn", variant="error"
+                )
                 yield Button("Executar", id="execute-btn", variant="success")
 
     def on_mount(self) -> None:
@@ -60,11 +79,15 @@ class RemoveScriptScreen(ModalScreen[bool]):
         self.description = description
 
     def compose(self) -> ComposeResult:
+        _ = create_translator()
+        cancel_btn_label = _("cancel_btn_label")
         with Vertical(id="confirm-dialog"):
             yield Static(f"Remover '{self.script_name}'?", id="confirm-title")
             yield Static(self.description, id="confirm-description")
             with Horizontal(id="confirm-buttons"):
-                yield Button("Cancelar", id="cancel-btn", variant="error")
+                yield Button(
+                    cancel_btn_label, id="cancel-btn", variant="error"
+                )
                 yield Button("Remover", id="execute-btn", variant="success")
 
     def on_mount(self) -> None:
@@ -161,6 +184,8 @@ class SudoPasswordScreen(ModalScreen[str | None]):
         self.error_message = error_message
 
     def compose(self) -> ComposeResult:
+        _ = create_translator()
+        cancel_btn_label = _("cancel_btn_label")
         with Vertical(id="confirm-dialog"):
             yield Static(
                 f"'{self.script_name}' precisa de privilégios sudo",
@@ -174,7 +199,9 @@ class SudoPasswordScreen(ModalScreen[str | None]):
                 id="sudo-password-input",
             )
             with Horizontal(id="confirm-buttons"):
-                yield Button("Cancelar", id="cancel-btn", variant="error")
+                yield Button(
+                    cancel_btn_label, id="cancel-btn", variant="error"
+                )
                 yield Button("Confirmar", id="confirm-btn", variant="success")
 
     def on_mount(self) -> None:
@@ -214,10 +241,12 @@ class CancelledDialog(ModalScreen[None]):
         self.script_name = script_name
 
     def compose(self) -> ComposeResult:
+        _ = create_translator()
+        ok_btn_label = _("ok_btn_label")
         with Vertical(id="confirm-dialog"):
             yield Label(f"Execução de '{self.script_name}' cancelada.")
             with Horizontal(id="confirm-buttons"):
-                yield Button("OK", id="execute-btn", variant="primary")
+                yield Button(ok_btn_label, id="execute-btn", variant="primary")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "execute-btn":
@@ -235,10 +264,9 @@ class ReportBugDialog(ModalScreen[bool]):
 
     def compose(self) -> ComposeResult:
         _ = create_translator()
-        bug_report_app = _("bug_report_app")
-        bug_report_desc = _("bug_report_desc")
-        system_info = _("system_info")
         system_context = antenna.get_system_context()
+        cancel_btn_label = _("cancel_btn_label")
+        ok_btn_label = _("ok_btn_label")
 
         raw_entries = get_bug_report_entries(translations=translations)
         options = [("LinuxToys", "LinuxToys")] + [
@@ -247,21 +275,37 @@ class ReportBugDialog(ModalScreen[bool]):
 
         with Vertical(id="dialog-container"):
             with Horizontal(classes="form-row"):
-                yield Static(bug_report_app, classes="label-inline")
+                yield Static(
+                    translations.get(
+                        "bug_report_app", "Application (optional):"
+                    ),
+                    classes="label-inline",
+                )
                 yield Select(
                     options,
                     value="LinuxToys",
                     id="select-app",
                     allow_blank=False,
                 )
-            yield Static(bug_report_desc, classes="field-label")
+            yield Static(
+                translations.get(
+                    "bug_report_desc",
+                    "Please describe the issue you encountered:",
+                ),
+                classes="field-label",
+            )
             yield TextArea(id="bug-description")
             yield Static(
-                f"{system_info}: {system_context}", id="system-info-text"
+                f"{translations.get('system_info', 'System Info')}: {system_context}",
+                id="system-info-text",
             )
-            with Horizontal(id="confirm-buttons"):
-                yield Button("Cancelar", id="cancel-btn-bug", variant="error")
-                yield Button("OK", id="execute-btn-bug", variant="primary")
+            with Horizontal(id="buttons-aligh-right"):
+                yield Button(
+                    cancel_btn_label, id="cancel-btn-bug", variant="error"
+                )
+                yield Button(
+                    ok_btn_label, id="execute-btn-bug", variant="primary"
+                )
 
     @on(Button.Pressed, "#cancel-btn-bug")
     def handle_cancel(self) -> None:
@@ -270,8 +314,6 @@ class ReportBugDialog(ModalScreen[bool]):
     # 2. Trata o clique no botão OK / Enviar
     @on(Button.Pressed, "#execute-btn-bug")
     def handle_execute(self) -> None:
-        _ = create_translator()
-        bug_report_empty = _("bug_report_empty")
         # Resgata os valores diretamente dos widgets
         comment = self.query_one("#bug-description", TextArea).text.strip()
         selected_app = self.query_one("#select-app", Select).value
@@ -279,7 +321,10 @@ class ReportBugDialog(ModalScreen[bool]):
         # Validação simples para não enviar vazio
         if not comment:
             self.notify(
-                bug_report_empty,
+                translations.get(
+                    "bug_report_empty",
+                    "Please provide a description of the issue.",
+                ),
                 severity="warning",
             )
             return
@@ -294,9 +339,6 @@ class ReportBugDialog(ModalScreen[bool]):
     @work(thread=True)
     def _submit_bug_report(self, comment: str, selected_app=None) -> None:
         """Envia o relatório de bug em uma thread de segundo plano."""
-        _ = create_translator()
-        bug_report_submitted = _("bug_report_submitted")
-        bug_report_failed = _("bug_report_failed")
         try:
             system_context = antenna.get_system_context()
             antenna.submit_issue(
@@ -311,7 +353,10 @@ class ReportBugDialog(ModalScreen[bool]):
             # Notificação de Sucesso na thread principal
             self.app.call_from_thread(
                 self.notify,
-                bug_report_submitted,
+                translations.get(
+                    "bug_report_submitted",
+                    "Thank you! Your bug report has been submitted.",
+                ),
                 title="Sucesso",
                 severity="information",
             )
@@ -323,7 +368,7 @@ class ReportBugDialog(ModalScreen[bool]):
             # Notificação de Erro na thread principal
             self.app.call_from_thread(
                 self.notify,
-                f"{bug_report_failed}: {e}",
+                f"{translations.get('bug_report_failed', 'Failed to submit bug report: ')}: {e}",
                 title="Erro",
                 severity="error",
             )
@@ -334,3 +379,72 @@ class ReportBugDialog(ModalScreen[bool]):
                 "disabled",
                 False,
             )
+
+
+class LanguageSelectorDialog(ModalScreen[str | None]):
+    BINDINGS = [
+        ("escape", "cancel", "Fechar"),
+        ("w", "app.pop_screen", "Voltar"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        display_name = get_localized_language_names(translations)
+        codes = get_available_languages()
+        with Vertical(id="lang-dialog-container"):
+            yield Static(
+                translations.get("select_language_message", "Select Language"),
+                classes="lang-label",
+            )
+            yield Input(
+                placeholder=translations.get(
+                    "search_languages_placeholder", "Search languages"
+                ),
+                id="search-language",
+            )
+            yield ListView(
+                *[
+                    LanguageListItem(code, display_name.get(code, code))
+                    for code in codes
+                ],
+                id="language-list",
+            )
+            with Horizontal(id="buttons-aligh-right"):
+                yield Button(
+                    translations.get("cancel_btn_label", "Cancel"),
+                    id="cancel-btn-bug",
+                    variant="error",
+                )
+                yield Button(
+                    translations.get("select_button", "Select"),
+                    id="execute-btn-bug",
+                    variant="primary",
+                )
+
+    @on(Button.Pressed, "#cancel-btn-bug")
+    def handle_cancel(self) -> None:
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#execute-btn-bug")
+    def handle_select(self) -> None:
+        selected = self.query_one("#language-list", ListView).highlighted_child
+        if isinstance(selected, LanguageListItem):
+            self.dismiss(selected.code)
+
+    @on(Input.Changed, "#search-language")
+    def handle_search_changed(self, event: Input.Changed) -> None:
+        if event.input.id != "search-language":
+            return
+
+        query = event.value.strip().casefold()
+        list_view = self.query_one("#language-list", ListView)
+
+        for item in list_view.query(LanguageListItem):
+            # Lê direto das propriedades salvas na instância
+            code_match = query in item.code.casefold()
+            name_match = query in item.display_name.casefold()
+
+            # Exibe se bater com o código OU com o nome exibido
+            item.display = code_match or name_match
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)

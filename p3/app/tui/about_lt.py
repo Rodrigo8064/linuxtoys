@@ -15,8 +15,10 @@ from textual.widgets import (
 
 from app import get_app_resource_path
 from app.compat import get_system_compat_keys
-from app.lang_utils import create_translator
 from app.updater import __version__
+
+from .helper import translations
+from .my_widgets import FocusableLabel
 
 
 class AboutScreen(Screen):
@@ -26,14 +28,7 @@ class AboutScreen(Screen):
     ]
 
     def compose(self) -> ComposeResult:
-        _ = create_translator()
-        project_lead = _("project_lead")
-        subtitle = _("subtitle")
         compat_display = self._get_compat_display_string()
-        contributors_label = _("contributors")
-        license = _("license_tab")
-        credits = _("credits_label")
-        suport = _("support_footer")
 
         yield Header()
         with Vertical(classes="home"):
@@ -45,21 +40,42 @@ class AboutScreen(Screen):
             )
             yield Static("[bold]LinuxToys[/bold]")
             yield Static(compat_display)
-            yield Static(subtitle)
+            yield Static(
+                translations.get(
+                    "subtitle",
+                    "A collection of tools for Linux in a user-friendly way.",
+                )
+            )
             yield Rule()
             yield Static("[bold]Victor 'psygreg' Gregory[/bold]")
-            yield Static(project_lead)
+            yield Static(translations.get("project_lead", "Project Lead"))
             yield Rule()
-            yield Static(f"[bold]{contributors_label}[/bold]")
+            yield Static(
+                f"[bold]{translations.get('contributors_label', 'Contributors')}[/bold]"
+            )
             yield Vertical(id="contributors-list", classes="contributors-grid")
             with Center():
-                yield Button(label=license, id="license")
+                yield Button(
+                    label=translations.get("license_tab", "License"),
+                    id="license",
+                )
                 yield Button(label="voltar", variant="primary", id="go-back")
 
         with Horizontal(classes="home-links"):
             yield Link(" Wiki", url="https://linux.toys/knowledgebase.html")
-            yield Link(f" {credits}", url="https://linux.toys/credits.html")
-            yield Link(f" {suport}", url="https://ko-fi.com/psygreg")
+            yield FocusableLabel(
+                f" [u]{translations.get('report_label', 'Report Bug')}[/u]",
+                id="report-bug",
+                classes="report-bug",
+            )
+            yield Link(
+                f" {translations.get('credits_label', 'Credits')}",
+                url="https://linux.toys/credits.html",
+            )
+            yield Link(
+                f" {translations.get('support_footer', 'Support this project')}",
+                url="https://ko-fi.com/psygreg",
+            )
         yield Footer()
 
     def on_mount(self) -> None:
