@@ -80,13 +80,21 @@ class LinuxToys(ScriptRunnerMixin, HistoryOpenerMixin, App):
                 yield ListView(
                     ListItem(
                         Label(
-                            f" {translations.get('load_manifest', 'Load manifest')}"
+                            f" {
+                                translations.get(
+                                    'load_manifest', 'Load manifest'
+                                )
+                            }"
                         ),
                         id="manifest",
                     ),
                     ListItem(
                         Label(
-                            f" {translations.get('select_language', 'Select language')}"
+                            f" {
+                                translations.get(
+                                    'select_language', 'Select language'
+                                )
+                            }"
                         ),
                         id="language",
                     ),
@@ -100,7 +108,11 @@ class LinuxToys(ScriptRunnerMixin, HistoryOpenerMixin, App):
                     ),
                     ListItem(
                         Label(
-                            f" {translations.get('scripts_resync', 'Scripts resync')}"
+                            f" {
+                                translations.get(
+                                    'scripts_resync', 'Scripts resync'
+                                )
+                            }"
                         ),
                         id="scripts_resync",
                     ),
@@ -110,15 +122,15 @@ class LinuxToys(ScriptRunnerMixin, HistoryOpenerMixin, App):
                     yield Terminal(id="terminal")
 
         with Horizontal(classes="home-links"):
-            yield Link(" Wiki", url="https://linux.toys/knowledgebase.html")
+            yield Link(" Wiki", url="https://linux.toys/documentation.html")
             yield FocusableLabel(
                 f" [u]{translations.get('report_label', 'Report Bug')}[/u]",
                 id="report-bug",
                 classes="report-bug",
             )
             yield Link(
-                f" {translations.get('credits_label', 'Credits')}",
-                url="https://linux.toys/credits.html",
+                f" {translations.get('devportal_label', 'Credits')}",
+                url="https://dev.linux.toys",
             )
             yield Link(
                 f" {translations.get('support_footer', 'Support this project')}",
@@ -253,7 +265,9 @@ class LinuxToys(ScriptRunnerMixin, HistoryOpenerMixin, App):
                 severity="warning",
             )
 
-    def apply_language_change(self, new_language_code: str | None) -> None:
+    async def apply_language_change(
+        self, new_language_code: str | None
+    ) -> None:
         if new_language_code is None:
             return
 
@@ -268,11 +282,76 @@ class LinuxToys(ScriptRunnerMixin, HistoryOpenerMixin, App):
 
         helper_module._search_index_cache = None  # invalida a busca
 
-        self.run_worker(self.action_reset_to_home())
-        self._refresh_fixed_ui_labels()
+        await self.action_reset_to_home()
+        await self._refresh_fixed_ui_labels()
 
-    def _refresh_fixed_ui_labels(self):
-        pass
+    async def _refresh_fixed_ui_labels(self):
+        self.query_one("#search-input", Input).placeholder = translations.get(
+            "search_placeholder", "Search"
+        )
+        menu = self.query_one("#home-menu", ListView)
+        await menu.remove_children()
+        await menu.mount(
+            ListItem(
+                Label(
+                    f" {translations.get('load_manifest', 'Load manifest')}"
+                ),
+                id="manifest",
+            )
+        )
+        await menu.mount(
+            ListItem(
+                Label(
+                    f" {translations.get('select_language', 'Select language')}"
+                ),
+                id="language",
+            )
+        )
+        await menu.mount(
+            ListItem(
+                Label(f" {translations.get('about', 'About')}"),
+                id="about",
+            )
+        )
+        await menu.mount(
+            ListItem(
+                Label(f"󰲃 {translations.get('action_registry')}"),
+                id="registry",
+            )
+        )
+        await menu.mount(
+            ListItem(
+                Label(
+                    f" {translations.get('scripts_resync', 'Scripts resync')}"
+                ),
+                id="scripts_resync",
+            )
+        )
+
+        links_container = self.query_one(".home-links", Horizontal)
+        await links_container.remove_children()
+        await links_container.mount(
+            Link(" Wiki", url="https://linux.toys/documentation.html")
+        )
+        await links_container.mount(
+            FocusableLabel(
+                f" [u]{translations.get('report_label', 'Report Bug')}[/u]",
+                id="report-bug",
+                classes="report-bug",
+            )
+        )
+        await links_container.mount(
+            Link(
+                f" {translations.get('devportal_label', 'Credits')}",
+                url="https://dev.linux.toys",
+            )
+        )
+        await links_container.mount(
+            Link(
+                f" {translations.get('support_footer', 'Support this project')}",
+                url="https://ko-fi.com/psygreg",
+            )
+        )
 
 
 if __name__ == "__main__":

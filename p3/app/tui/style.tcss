@@ -300,7 +300,7 @@ SelectLanguageDialog {
 
 #lang-dialog-container {
     width: 60;
-    height: 70;                 /* Altura fixa para permitir rolagem limpa do ListView */
+    height: 30;
     padding: 1 2;
     background: $surface;
     border: round $primary;
@@ -313,12 +313,13 @@ SelectLanguageDialog {
 }
 
 #search-language {
-    margin-bottom: 1;           /* Cria o espaçamento entre o Input e a ListView */
+    margin-bottom: 1;
     border: round $primary;
 }
 
 #language-list {
-    height: 1fr;               /* Ocupa o restante do espaço vertical do container */
+    width: 1fr;
+    height: 1fr;
     background: $boost;
     border: none;
 }
