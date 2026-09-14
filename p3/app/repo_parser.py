@@ -311,6 +311,41 @@ def _normalize_hardware_key(kind, value):
     return f"{kind}-{value}"
 
 
+def _normalize_os_spec(value):
+    """Normalize an ``os`` declaration into included and excluded OS keys."""
+    if value is None:
+        return set(), set()
+
+    values = _as_list(value)
+    if not values:
+        return None
+
+    included = set()
+    excluded = set()
+
+    for item in values:
+        if not isinstance(item, str):
+            return None
+
+        item = item.strip().lower()
+        if not item:
+            return None
+
+        is_exclusion = item.startswith("!")
+        key = item[1:] if is_exclusion else item
+
+        if not key or key not in OS_KEYS:
+            return None
+
+        (excluded if is_exclusion else included).add(key)
+
+    # Contradictory declarations are invalid rather than order-dependent.
+    if included & excluded:
+        return None
+
+    return included, excluded
+
+
 def _resolve_install_type(entry, compat_keys):
     """Resolve an entry's install type, including optional per-OS mappings."""
     value = entry.get("type", "git")
@@ -526,17 +561,22 @@ def _entry_is_compatible(entry, compat_keys, scripts_dir=None):
 
     if scripts_dir is not None and not _git_db_requirement_matches(entry, compat_keys, scripts_dir):
         return False
-    
-    # OS compatibility
+
+    # OS compatibility. Positive tags are an allow-list; !tags are exclusions
+    # that always take precedence. An exclusion-only list means "all except".
     os_value = entry.get("os")
 
-    if os_value:
-        requested = set(_as_list(os_value))
-
-        if not requested or not requested <= OS_KEYS:
+    if os_value is not None:
+        os_spec = _normalize_os_spec(os_value)
+        if os_spec is None:
             return False
 
-        if not requested & compat_keys:
+        included, excluded = os_spec
+
+        if excluded & compat_keys:
+            return False
+
+        if included and not (included & compat_keys):
             return False
 
     # Optional desktop-environment compatibility.
@@ -594,7 +634,7 @@ def _entry_is_compatible(entry, compat_keys, scripts_dir=None):
 
     if not _dependencies_are_compatible(entry, compat_keys):
         return False
-    
+
     return True
 
 
@@ -669,6 +709,33 @@ def _validate_native_package_spec(value):
     """Backward-compatible alias for native package-name validation."""
     return _validate_package_spec(value)
 
+def _validate_release_asset_selector(value):
+    """Validate an optional pkg_fromrelease asset name/glob or per-OS mapping."""
+    if value is None:
+        return True
+
+    def valid_selector(selector):
+        if not isinstance(selector, str):
+            return False
+        selector = selector.strip()
+        return bool(
+            selector
+            and selector not in {".", ".."}
+            and "/" not in selector
+            and "\\" not in selector
+        )
+
+    if isinstance(value, str):
+        return valid_selector(value)
+
+    if not isinstance(value, dict) or not value:
+        return False
+
+    if set(value) - (OS_KEYS | {"all"}):
+        return False
+
+    return all(valid_selector(selector) for selector in value.values())
+
 
 def _validate_type(entry, compat_keys):
     install_type = _resolve_install_type(entry, compat_keys)
@@ -678,6 +745,9 @@ def _validate_type(entry, compat_keys):
 
     if install_type in {"flathub", "native"}:
         return _validate_package_spec(entry.get("package-name"))
+
+    if install_type in {"git", "tar"}:
+        return _validate_release_asset_selector(entry.get("package-name"))
 
     if install_type == "bin":
         asset_name = entry.get("package-name")
@@ -701,8 +771,6 @@ def _validate_type(entry, compat_keys):
             for key, value in urls.items()
         )
 
-    # Placeholder entries shouldn't currently be displayed because
-    # they cannot yet be installed correctly.
     if install_type == "repository":
         return False
 
@@ -1379,6 +1447,40 @@ def _resolve_app_page_metadata(
     }
 
 
+def _resolve_hook_paths(entry, scripts_dir):
+    """
+    Normalize repository-local hook scripts to paths relative to scripts/lists/.
+
+    Hook declarations are resolved relative to the JSON file that declared the
+    entry, then reduced to a stable lists-relative path for run_list_hook. This
+    keeps generated scripts independent from the current CACHE_DIR location.
+    """
+    overrides = entry.get("overrides")
+
+    if not isinstance(overrides, dict):
+        return overrides
+
+    resolved_overrides = dict(overrides)
+    lists_dir = os.path.realpath(os.path.join(scripts_dir, "lists"))
+
+    for key in ("pre", "post"):
+        value = overrides.get(key)
+
+        if not isinstance(value, dict):
+            continue
+
+        script = value.get("script")
+        path = _safe_list_relative_path(entry, scripts_dir, script)
+
+        if not path or not os.path.isfile(path):
+            return None
+
+        relative = os.path.relpath(path, lists_dir)
+        resolved_overrides[key] = {"script": relative}
+
+    return resolved_overrides
+
+
 def _resolve_list_icon(entry, scripts_dir):
     """
     Resolve repository-list icons.
@@ -1512,7 +1614,14 @@ def _build_repo_entries(scripts_dir, translations=None, list_paths=None, compat_
         if not description:
             continue
 
+        resolved_overrides = _resolve_hook_paths(entry, scripts_dir)
+        if entry.get("overrides") is not None and resolved_overrides is None:
+            continue
+
         item = dict(entry)
+        if resolved_overrides is not None:
+            item["overrides"] = resolved_overrides
+
         app_page_metadata = _resolve_app_page_metadata(
             entry,
             scripts_dir,
@@ -1814,10 +1923,16 @@ def create_install_script(entry):
     command = None
 
     if install_type == "git":
+        asset_selectors = _resolve_package_names(entry, compat_keys)
         command = f"pkg_fromrelease {shlex.quote(repo)}"
+        if asset_selectors:
+            command += f" {shlex.quote(asset_selectors[0])}"
 
     elif install_type == "tar":
+        asset_selectors = _resolve_package_names(entry, compat_keys)
         command = f"pkg_fromrelease --tar {shlex.quote(repo)}"
+        if asset_selectors:
+            command += f" {shlex.quote(asset_selectors[0])}"
 
     elif install_type == "bin":
         asset_name = entry.get("package-name", "").strip()
