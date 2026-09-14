@@ -4,10 +4,8 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
-    Header,
     Input,
     Label,
-    ListItem,
     ListView,
     Select,
     Static,
@@ -16,7 +14,6 @@ from textual.widgets import (
 
 from app.antenna import antenna
 from app.lang_utils import (
-    create_translator,
     get_available_languages,
     get_localized_language_names,
 )
@@ -41,14 +38,14 @@ class ConfirmScriptScreen(ModalScreen[bool]):
         self.description = description
 
     def compose(self) -> ComposeResult:
-        _ = create_translator()
-        cancel_btn_label = _("cancel_btn_label")
         with Vertical(id="confirm-dialog"):
             yield Static(f"Executar '{self.script_name}'?", id="confirm-title")
             yield Static(self.description, id="confirm-description")
             with Horizontal(id="confirm-buttons"):
                 yield Button(
-                    cancel_btn_label, id="cancel-btn", variant="error"
+                    translations.get("cancel_btn_label", "Cancel"),
+                    id="cancel-btn",
+                    variant="error",
                 )
                 yield Button("Executar", id="execute-btn", variant="success")
 
@@ -79,14 +76,14 @@ class RemoveScriptScreen(ModalScreen[bool]):
         self.description = description
 
     def compose(self) -> ComposeResult:
-        _ = create_translator()
-        cancel_btn_label = _("cancel_btn_label")
         with Vertical(id="confirm-dialog"):
             yield Static(f"Remover '{self.script_name}'?", id="confirm-title")
             yield Static(self.description, id="confirm-description")
             with Horizontal(id="confirm-buttons"):
                 yield Button(
-                    cancel_btn_label, id="cancel-btn", variant="error"
+                    translations.get("cancel_btn_label", "Cancel"),
+                    id="cancel-btn",
+                    variant="error",
                 )
                 yield Button("Remover", id="execute-btn", variant="success")
 
@@ -184,8 +181,6 @@ class SudoPasswordScreen(ModalScreen[str | None]):
         self.error_message = error_message
 
     def compose(self) -> ComposeResult:
-        _ = create_translator()
-        cancel_btn_label = _("cancel_btn_label")
         with Vertical(id="confirm-dialog"):
             yield Static(
                 f"'{self.script_name}' precisa de privilégios sudo",
@@ -200,7 +195,9 @@ class SudoPasswordScreen(ModalScreen[str | None]):
             )
             with Horizontal(id="confirm-buttons"):
                 yield Button(
-                    cancel_btn_label, id="cancel-btn", variant="error"
+                    translations.get("cancel_btn_label", "Cancel"),
+                    id="cancel-btn",
+                    variant="error",
                 )
                 yield Button("Confirmar", id="confirm-btn", variant="success")
 
@@ -241,12 +238,14 @@ class CancelledDialog(ModalScreen[None]):
         self.script_name = script_name
 
     def compose(self) -> ComposeResult:
-        _ = create_translator()
-        ok_btn_label = _("ok_btn_label")
         with Vertical(id="confirm-dialog"):
             yield Label(f"Execução de '{self.script_name}' cancelada.")
             with Horizontal(id="confirm-buttons"):
-                yield Button(ok_btn_label, id="execute-btn", variant="primary")
+                yield Button(
+                    translations.get("ok_btn_label", "OK"),
+                    id="execute-btn",
+                    variant="primary",
+                )
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "execute-btn":
@@ -263,10 +262,7 @@ class ReportBugDialog(ModalScreen[bool]):
     ]
 
     def compose(self) -> ComposeResult:
-        _ = create_translator()
         system_context = antenna.get_system_context()
-        cancel_btn_label = _("cancel_btn_label")
-        ok_btn_label = _("ok_btn_label")
 
         raw_entries = get_bug_report_entries(translations=translations)
         options = [("LinuxToys", "LinuxToys")] + [
@@ -301,10 +297,14 @@ class ReportBugDialog(ModalScreen[bool]):
             )
             with Horizontal(id="buttons-aligh-right"):
                 yield Button(
-                    cancel_btn_label, id="cancel-btn-bug", variant="error"
+                    translations.get("cancel_btn_label", "Cancel"),
+                    id="cancel-btn-bug",
+                    variant="error",
                 )
                 yield Button(
-                    ok_btn_label, id="execute-btn-bug", variant="primary"
+                    translations.get("ok_btn_label", "OK"),
+                    id="execute-btn-bug",
+                    variant="primary",
                 )
 
     @on(Button.Pressed, "#cancel-btn-bug")
