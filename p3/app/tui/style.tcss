@@ -24,14 +24,6 @@ Screen {
   background: transparent;
 }
 
-#log-box {
-  height: 1fr;
-  border: round $success;
-  padding: 0 1;
-  background: transparent;
-}
-
-
 #history-list {
   height: 1fr;
   background: transparent;
@@ -294,10 +286,6 @@ TextArea#bug-description {
   margin-bottom: 1;
 }
 
-SelectLanguageDialog {
-    align: center middle;
-}
-
 #lang-dialog-container {
     width: 60;
     height: 30;
@@ -326,5 +314,54 @@ SelectLanguageDialog {
 
 /* Opcional: Estilo suave para os itens da lista */
 LanguageListItem {
-    padding: 0 1;
+  padding: 0 1;
+}
+
+/* Fundo escurecido da Modal */
+ManifestDialog {
+    align: center middle;
+}
+
+/* Container principal simulando uma janela grande */
+#manifest-container {
+    width: 90%;
+    height: 90%;
+    background: $surface;
+    border: round $primary;
+    padding: 1 2;
+}
+
+/* Barra superior (Header) */
+#manifest-header {
+    height: 3;
+    align-vertical: middle;
+    margin-bottom: 1;
+}
+
+/* O título age como um espaçador expansível */
+#manifest-title {
+    width: 1fr;
+    height: 3;
+    content-align: center middle;
+    text-style: bold;
+    color: $text-muted;
+}
+
+/* Campo de busca menor e ao lado do botão Selecionar */
+#manifest-search {
+    width: 30;
+    margin-right: 1;
+}
+
+/* Botões do cabeçalho */
+#cancel-btn-manifest, #execute-btn-manifest {
+    min-width: 16;
+}
+
+/* Área da árvore de diretórios */
+#manifest-tree {
+    height: 1fr;
+    background: $boost;
+    border: solid $panel;
+    padding: 1;
 }
