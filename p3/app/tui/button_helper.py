@@ -26,7 +26,7 @@ from .dialog_screen import (
     SudoPasswordScreen,
 )
 from .helper import (
-    slugify,
+    make_widget_id,
     translations,
 )
 from .my_widgets import (
@@ -104,7 +104,7 @@ class ScriptRunnerMixin:
                     item["is_script"],
                     item.get("is_new", False),
                     item["name"] in registry_data,
-                    id=slugify(item["name"]),
+                    id=make_widget_id(item["path"]),
                 )
             )
 

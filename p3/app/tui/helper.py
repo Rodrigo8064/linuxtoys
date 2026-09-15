@@ -12,8 +12,17 @@ def load_categories(translations) -> list[dict]:
     return categories
 
 
-def slugify(texto: str) -> str:
-    return re.sub(r"[^a-z0-9_-]", "_", texto.lower())
+# def slugify(texto: str) -> str:
+#     return re.sub(r"[^a-z0-9_-]", "_", texto.lower())
+def make_widget_id(identifier: str) -> str:
+    """Gera um id de widget válido e estável a partir de algo que já é
+    único e independente de idioma (ex.: o path do script).
+    NUNCA passar texto traduzido aqui — só chaves/paths estáveis."""
+    slug = re.sub(r"[^a-zA-Z0-9_-]", "_", identifier)
+    # Textual exige que o id comece com letra ou underscore
+    if not slug or not (slug[0].isalpha() or slug[0] == "_"):
+        slug = f"id_{slug}"
+    return slug
 
 
 def get_search_index() -> list[dict]:

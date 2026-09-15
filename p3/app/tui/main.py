@@ -25,11 +25,12 @@ from .dialog_screen import LanguageSelectorDialog, ReportBugDialog
 from .helper import (
     get_search_index,
     load_categories,
+    make_widget_id,
     search_scripts,
-    slugify,
     translations,
 )
 from .history_screen import HistoryOpenerMixin, HistoryScreen
+from .manifest_dialog import ManifestDialog
 from .my_widgets import (
     DescButton,
     FocusableLabel,
@@ -72,7 +73,7 @@ class LinuxToys(ScriptRunnerMixin, HistoryOpenerMixin, App):
                             item["is_script"],
                             item.get("is_new", False),
                             item["name"] in registry_data,
-                            id=slugify(item["name"]),
+                            id=make_widget_id(item["path"]),
                         )
             # right panel widgets
             with Vertical(id="menu-panel"):
@@ -175,7 +176,7 @@ class LinuxToys(ScriptRunnerMixin, HistoryOpenerMixin, App):
                 LanguageSelectorDialog(), callback=self.apply_language_change
             )
         if event.item.id == "manifest":
-            pass
+            self.app.push_screen(ManifestDialog())
 
     async def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id != "search-input":
@@ -199,7 +200,7 @@ class LinuxToys(ScriptRunnerMixin, HistoryOpenerMixin, App):
                     item["is_script"],
                     item.get("is_new", False),
                     item["name"] in registry_data,
-                    id=slugify(item["name"]),
+                    id=make_widget_id(item["path"]),
                 )
             )
 
@@ -217,7 +218,7 @@ class LinuxToys(ScriptRunnerMixin, HistoryOpenerMixin, App):
                     item["is_script"],
                     item.get("is_new", False),
                     item["name"] in registry_data,
-                    id=slugify(item["name"]),
+                    id=make_widget_id(item["path"]),
                 )
             )
 
