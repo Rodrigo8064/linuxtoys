@@ -93,6 +93,7 @@ pkg_install () {
     [[ ${#pkg_found[@]} -gt 0 ]] && echo "Packages ${pkg_found[*]} already installed, skipping."
     [[ ${#pkg_notfound[@]} -eq 0 ]] && return 0
     local to_install="${pkg_notfound[*]}"
+    runner_lock "package-transaction"
     if is_debian || is_ubuntu; then
         interrupted_apt_guard
         sudo apt-get install -y "${pkg_notfound[@]}" || fatal "Failed to install $to_install"
@@ -125,7 +126,7 @@ pkg_install () {
         # check for lock before installing
         if [ -n "$to_install_pacman" ]; then
             if is_manjaro; then
-                pamac install --no-confirm "${_pacman_pkgs[@]}" || fatal "Failed to install $to_install_pacman"
+                sudo pamac install --no-confirm "${_pacman_pkgs[@]}" || fatal "Failed to install $to_install_pacman"
                 [[ $_ignore_appends -eq 0 ]] && _append_transmap "pkg $to_install_pacman"
             else
                 pacman_lock_guard
@@ -135,7 +136,9 @@ pkg_install () {
         fi
         if [ -n "$to_install_paru" ]; then
             if is_manjaro; then
+                runner_unlock
                 pamac build --no-confirm "${_paru_pkgs[@]}" || die "Failed to install $to_install_paru"
+                runner_lock "package-transaction"
             else
                 if ! command -v paru &>/dev/null; then
                     if question "Installer" "$msg305" 300 300; then
@@ -149,11 +152,16 @@ pkg_install () {
                     fi
                 fi
                 if ! paru --version >/dev/null 2>&1; then # handle broken paru compiled against different libs, fix #1196
+                    runner_unlock
+                    info "$parumsg"
                     call_script paru || die "Failed to repair paru"
                     paru --version >/dev/null 2>&1 || die "Paru is still unusable after reinstalling it"
+                    runner_lock "package-transaction"
                 fi
+                runner_unlock
                 paru -S -a --noconfirm --skipreview "${_paru_pkgs[@]}" || die "Failed to install $to_install_paru"
                 [[ $_ignore_appends -eq 0 ]] && _append_transmap "pkg $to_install_paru"
+                runner_lock "package-transaction"
             fi
         fi
     elif is_ostree; then
@@ -178,6 +186,23 @@ pkg_install () {
         sudo eopkg it -y "${pkg_notfound[@]}" || fatal "Failed to install $to_install"
         [[ $_ignore_appends -eq 0 ]] && _append_transmap "pkg $to_install"
     fi
+    runner_unlock
+}
+
+# List installed Freedesktop runtime-extension refs in a stable, registry-friendly form.
+# Runtime extensions may exist for several branches at once, so callers can use
+# snapshots of this list to record what a single Flatpak transaction actually added.
+_flatpak_runtime_extension_refs() {
+    local scope="$1"
+    flatpak list "$scope" --runtime --columns=application,arch,branch 2>/dev/null | \
+        awk '$1 ~ /^org\.freedesktop\.Platform\./ { print $1 "/" $2 "/" $3 }' | \
+        sort -u
+}
+
+_flatpak_runtime_extension_delta() {
+    local before_file="$1"
+    local scope="$2"
+    comm -13 "$before_file" <(_flatpak_runtime_extension_refs "$scope")
 }
 
 pkg_flat() {
@@ -201,31 +226,66 @@ pkg_flat() {
         flatpak_scope="--system"
     fi
 
-    # Extract base package names (remove version/architecture specifications)
-    local -a _flatpak_basenames=()
-    for arg in "${_flatpak_args[@]}"; do
-        local basename="${arg%%/*}"
-        _flatpak_basenames+=("$basename")
+    local -a _flatpak_normal=()
+    local -a _flatpak_new=()
+    local arg basename
 
-        # Only mark applications that weren't already installed
-        if ! flatpak info "$flatpak_scope" "$arg" &>/dev/null; then
-            _flatpak_new+=("$arg")
+    # Runtime extensions are transactional: install each requested ref separately
+    # and register the exact branch(es) that appeared as a result of that transaction.
+    for arg in "${_flatpak_args[@]}"; do
+        basename="${arg%%/*}"
+        if [[ "$basename" == org.freedesktop.Platform.* ]]; then
+            local _runtime_before
+            _runtime_before=$(mktemp)
+            _flatpak_runtime_extension_refs "$flatpak_scope" > "$_runtime_before"
+
+            if [[ "$flatpak_scope" == "--user" ]]; then
+                flatpak install --or-update "$flatpak_scope" -y flathub "$arg" || {
+                    rm -f "$_runtime_before"
+                    fatal "Failed to install flatpak package $arg"
+                }
+            else
+                flatpak install --or-update "$flatpak_scope" -y flathub "$arg" 2>/dev/null || {
+                    sudo_rq && sudo flatpak install --or-update "$flatpak_scope" -y flathub "$arg"
+                } || {
+                    rm -f "$_runtime_before"
+                    fatal "Failed to install flatpak package $arg"
+                }
+            fi
+
+            local -a _runtime_new=()
+            mapfile -t _runtime_new < <(_flatpak_runtime_extension_delta "$_runtime_before" "$flatpak_scope")
+            rm -f "$_runtime_before"
+            if [[ ${#_runtime_new[@]} -gt 0 ]]; then
+                _append_transmap "flatpak ${_runtime_new[*]}"
+            fi
+        else
+            _flatpak_normal+=("$arg")
+            if ! flatpak info "$flatpak_scope" "$arg" &>/dev/null; then
+                _flatpak_new+=("$arg")
+            fi
         fi
     done
 
-    if [ "$flatpak_scope" = "--user" ]; then
-        flatpak install --or-update "$flatpak_scope" -y flathub "${_flatpak_args[@]}" || fatal "Failed to install flatpak packages ${_flatpak_args[*]}"
-        for basename in "${_flatpak_basenames[@]}"; do
-            flatpak list "$flatpak_scope" | grep -q "$basename" || fatal "Failed to install flatpak package $basename"
+    # Keep the existing batched path for ordinary applications/runtimes.
+    if [[ ${#_flatpak_normal[@]} -gt 0 ]]; then
+        if [[ "$flatpak_scope" == "--user" ]]; then
+            flatpak install --or-update "$flatpak_scope" -y flathub "${_flatpak_normal[@]}" || \
+                fatal "Failed to install flatpak packages ${_flatpak_normal[*]}"
+        else
+            flatpak install --or-update "$flatpak_scope" -y flathub "${_flatpak_normal[@]}" 2>/dev/null || \
+                { sudo_rq && sudo flatpak install --or-update "$flatpak_scope" -y flathub "${_flatpak_normal[@]}"; } || \
+                fatal "Failed to install flatpak packages ${_flatpak_normal[*]}"
+        fi
+
+        for arg in "${_flatpak_normal[@]}"; do
+            basename="${arg%%/*}"
+            flatpak list "$flatpak_scope" --columns=application | grep -Fxq "$basename" || \
+                fatal "Failed to install flatpak package $basename"
         done
-    else
-        flatpak install --or-update "$flatpak_scope" -y flathub "${_flatpak_args[@]}" 2>/dev/null || { sudo_rq && sudo flatpak install --or-update "$flatpak_scope" -y flathub "${_flatpak_args[@]}"; }
-        for basename in "${_flatpak_basenames[@]}"; do
-            flatpak list "$flatpak_scope" | grep -q "$basename" || fatal "Failed to install flatpak package $basename"
-        done
-    fi
-    if [[ ${#_flatpak_new[@]} -gt 0 ]]; then
-        _append_transmap "flatpak ${_flatpak_new[*]}"
+        if [[ ${#_flatpak_new[@]} -gt 0 ]]; then
+            _append_transmap "flatpak ${_flatpak_new[*]}"
+        fi
     fi
 }
 
@@ -247,8 +307,13 @@ pkg_fromfile () {
     # Use filtered args for the rest of the function
     set -- "${_filtered_args[@]}"
 
+    # Native package files require elevation. Authenticate before engaging the
+    # runner lock, otherwise the terminal input lock can block the sudo prompt.
+    [[ "$1" != *.flatpak ]] && askpass
+    runner_lock "package-transaction"
+
     if [[ "$1" == *.flatpak ]]; then
-        if ! which flatpak &>/dev/null || ! flatpak remote-list | grep -q flathub; then
+        if ! command -v flatpak &>/dev/null || ! flatpak remote-list | grep -q flathub; then
             summon_helpers
             sudo_rq
             flatpak_in_lib
@@ -261,13 +326,62 @@ pkg_fromfile () {
              ! flatpak remote-list --user 2>/dev/null | grep -q flathub; then
             flatpak_scope="--system"
         fi
-        local _flatpak_stderr
-        if ! flatpak install "$flatpak_scope" --noninteractive "$flatpak_file" &>/dev/null; then  # force --system install
-            _flatpak_stderr=$(
-                sudo flatpak install --system --noninteractive "$flatpak_file" 2>&1 >/dev/null
-            ) || fatal "Failed to install flatpak from file: $flatpak_file due to: $_flatpak_stderr"
+
+        # Runtime-extension bundles commonly share one application ID across many
+        # runtime branches. Snapshot the exact installed refs for each transaction.
+        local _is_runtime_extension=0
+        local _runtime_before=""
+        local _runtime_before_system=""
+        if [[ "$(basename "$flatpak_file")" == org.freedesktop.Platform.* ]]; then
+            _is_runtime_extension=1
+            _runtime_before=$(mktemp)
+            _flatpak_runtime_extension_refs "$flatpak_scope" > "$_runtime_before"
+            # A user-scope failure may legitimately fall back to system. Capture that
+            # scope before the first attempt as well so its delta remains attributable.
+            if [[ "$flatpak_scope" != "--system" ]]; then
+                _runtime_before_system=$(mktemp)
+                _flatpak_runtime_extension_refs --system > "$_runtime_before_system"
+            fi
         fi
-        _append_transmap "pkg file $flatpak_file"
+
+        # --or-update makes an already-installed bundle a successful no-op/update
+        # instead of treating it as a reason to escalate to a system installation.
+        local _flatpak_stderr
+        if ! _flatpak_stderr=$(flatpak install --or-update "$flatpak_scope" --noninteractive "$flatpak_file" 2>&1 >/dev/null); then
+            # A genuine fallback needs sudo. Authenticate while terminal input is
+            # unlocked, then restore the package-transaction lock before continuing.
+            runner_unlock
+            askpass
+            runner_lock "package-transaction"
+            _flatpak_stderr=$(
+                sudo flatpak install --or-update --system --noninteractive "$flatpak_file" 2>&1 >/dev/null
+            ) || {
+                [[ -n "$_runtime_before" ]] && rm -f "$_runtime_before"
+                [[ -n "$_runtime_before_system" ]] && rm -f "$_runtime_before_system"
+                fatal "Failed to install flatpak from file: $flatpak_file due to: $_flatpak_stderr"
+            }
+            # The successful fallback changed the effective scope. Use the system
+            # snapshot captured before either attempt so the delta stays exact.
+            if [[ $_is_runtime_extension -eq 1 && "$flatpak_scope" != "--system" ]]; then
+                rm -f "$_runtime_before"
+                _runtime_before="$_runtime_before_system"
+                _runtime_before_system=""
+            fi
+            flatpak_scope="--system"
+        fi
+
+        if [[ $_is_runtime_extension -eq 1 ]]; then
+            local -a _runtime_new=()
+            mapfile -t _runtime_new < <(_flatpak_runtime_extension_delta "$_runtime_before" "$flatpak_scope")
+            rm -f "$_runtime_before"
+            [[ -n "$_runtime_before_system" ]] && rm -f "$_runtime_before_system"
+            if [[ ${#_runtime_new[@]} -gt 0 ]]; then
+                _append_transmap "flatpak ${_runtime_new[*]}"
+            fi
+        else
+            _append_transmap "pkg file $flatpak_file"
+        fi
+        runner_unlock
         return 0
     fi
 
@@ -277,7 +391,7 @@ pkg_fromfile () {
     elif { is_arch || is_cachy; } && ! is_manjaro; then
         # check for lock before installing local package
         pacman_lock_guard
-        if sudo pacman -U "${@}"; then
+        if sudo pacman -U --noconfirm "${@}"; then
             _append_transmap "pkg file $*"
         else
             if [ -f PKGBUILD ]; then
@@ -289,7 +403,7 @@ pkg_fromfile () {
             fi
         fi
     elif is_manjaro; then
-        { pamac install --no-confirm "./${*}" && _append_transmap "pkg file $*"; } || fatal "Failed to install package $*"
+        { sudo pamac install --no-confirm "./${*}" && _append_transmap "pkg file $*"; } || fatal "Failed to install package $*"
     elif is_ostree; then
         sudo rpm-ostree install "${@}" || fatal "Failed to install $*"
         _append_transmap "pkg file $*"
@@ -308,6 +422,7 @@ pkg_fromfile () {
         sudo eopkg it -y "${@}" || fatal "Failed to install $*"
         _append_transmap "pkg file $*"
     fi
+    runner_unlock
 }
 
 pkg_tarball () {
@@ -618,26 +733,283 @@ pkg_fromurl () {
     done
 }
 
+pkg_make () {
+    [[ $# -gt 0 ]] || die "Usage: pkg_make [--command INSTALL_COMMAND] [--tar REPOSITORY_URL [ASSET_GLOB] | --url TARBALL_URL | --uninstall SOURCE_URL | REPOSITORY_URL]"
+
+    unset LINUXTOYS_MAKE_DIR
+
+    local mode="git" uninstall=0 source="" selector="" install_command="sudo make install"
+    local arg
+    local -a args=() build_dependencies=()
+
+    # A custom command is kept as one argument and executed from the directory
+    # containing the Makefile. The uninstall path derives the matching command
+    # by replacing the install target with its uninstall counterpart.
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --command)
+                shift
+                [[ $# -gt 0 ]] || die "pkg_make --command requires an install command"
+                install_command="$1"
+                ;;
+            --dependency)
+                shift
+                [[ $# -gt 0 ]] || die "pkg_make --dependency requires a package name"
+                build_dependencies+=("$1")
+                ;;
+            *)
+                args+=("$1")
+                ;;
+        esac
+        shift
+    done
+    set -- "${args[@]}"
+    [[ $# -gt 0 ]] || die "pkg_make requires a source"
+    [[ -n "${install_command//[[:space:]]/}" ]] || die "pkg_make install command cannot be empty"
+
+    case "$1" in
+        --tar|--tarball)
+            mode="release-tar"
+            shift
+            [[ $# -ge 1 && $# -le 2 ]] || die "Usage: pkg_make [--command INSTALL_COMMAND] --tar REPOSITORY_URL [ASSET_GLOB]"
+            source="$1"
+            selector="${2:-*}"
+            ;;
+        --url)
+            mode="tar-url"
+            shift
+            [[ $# -eq 1 ]] || die "Usage: pkg_make [--command INSTALL_COMMAND] --url TARBALL_URL"
+            source="$1"
+            ;;
+        --uninstall)
+            uninstall=1
+            shift
+            [[ $# -eq 1 ]] || die "Usage: pkg_make [--command INSTALL_COMMAND] --uninstall SOURCE_URL"
+            source="$1"
+            case "${source%%[?#]*}" in
+                *.tar.gz|*.tar.xz) mode="tar-url" ;;
+                *) mode="git" ;;
+            esac
+            ;;
+        *)
+            [[ $# -eq 1 ]] || die "Usage: pkg_make [--command INSTALL_COMMAND] REPOSITORY_URL"
+            source="$1"
+            ;;
+    esac
+
+    # Release tarball selection deliberately reuses pkg_fromrelease so make
+    # installs follow exactly the same stable-release, architecture and asset
+    # selection rules as every other LinuxToys release install.
+    if [[ "$mode" == "release-tar" ]]; then
+        local -a release_make_args=(--make --make-command "$install_command")
+        for arg in "${build_dependencies[@]}"; do
+            release_make_args+=(--make-dependency "$arg")
+        done
+        pkg_fromrelease "${release_make_args[@]}" "$source" "$selector"
+        return $?
+    fi
+
+    [[ "$source" == https://* ]] || die "pkg_make only accepts HTTPS sources"
+
+    local user_level_make=0 steamos_readonly_toggled=0
+    if [[ ! "$install_command" =~ (^|[[:space:];|&()])sudo([[:space:]]|$) ]]; then
+        user_level_make=1
+    fi
+
+    if is_steamos && (( user_level_make )); then
+        # User-level Make applications are SteamOS-compatible. Their declared
+        # native dependencies are treated as build-only Arch packages. Temporarily
+        # unlock the system image only while installing the build toolchain.
+        local -a steamos_build_packages=(base-devel)
+        if (( ! uninstall )); then
+            steamos_build_packages+=("${build_dependencies[@]}")
+        fi
+
+        askpass
+        command -v steamos-readonly >/dev/null 2>&1 || \
+            die "steamos-readonly is required for pkg_make on SteamOS"
+
+        if steamos-readonly status 2>/dev/null | grep -qi 'enabled'; then
+            sudo steamos-readonly disable || die "Failed to disable SteamOS read-only mode"
+            steamos_readonly_toggled=1
+        fi
+
+        pacman_lock_guard
+        if ! sudo pacman -S --needed --noconfirm "${steamos_build_packages[@]}"; then
+            if (( steamos_readonly_toggled )); then
+                sudo steamos-readonly enable || warn "Failed to restore SteamOS read-only mode after package installation failure"
+            fi
+            die "Failed to install SteamOS make build dependencies"
+        fi
+
+        if (( steamos_readonly_toggled )); then
+            sudo steamos-readonly enable || die "Failed to restore SteamOS read-only mode"
+            steamos_readonly_toggled=0
+        fi
+    else
+        if ! command -v make >/dev/null 2>&1; then
+            askpass
+            pkg_install make
+        fi
+        if (( ! uninstall && ${#build_dependencies[@]} > 0 )); then
+            askpass
+            pkg_install --ignore-appends "${build_dependencies[@]}"
+        fi
+    fi
+
+    local workdir source_dir archive make_dir run_command="$install_command"
+    local -a makefiles=()
+    prep_tmp_noram
+    workdir=$(mktemp -d ./pkg_make.XXXXXX) || die "Failed to create make build directory"
+
+    if [[ "$mode" == "git" ]]; then
+        command -v git >/dev/null 2>&1 || die "git is required for pkg_make repository installs"
+        git clone --depth 1 -- "$source" "$workdir/source" || {
+            rm -rf -- "$workdir"
+            die "Failed to clone make source: $source"
+        }
+        source_dir="$workdir/source"
+    else
+        archive="$workdir/source.tar"
+        curl -fL --retry 3 \
+            --proto '=https' \
+            --tlsv1.2 \
+            --output "$archive" \
+            -- "$source" || {
+            rm -rf -- "$workdir"
+            die "Failed to download make source: $source"
+        }
+
+        # Reject archive path traversal before extraction.
+        local member normalized
+        while IFS= read -r member; do
+            normalized="${member#./}"
+            [[ -n "$normalized" ]] || continue
+            if [[ "$normalized" == /* || "$normalized" == ".." || \
+                  "$normalized" == ../* || "$normalized" == */../* || \
+                  "$normalized" == */.. ]]; then
+                rm -rf -- "$workdir"
+                die "Unsafe path in make tarball: $member"
+            fi
+        done < <(tar -tf "$archive") || {
+            rm -rf -- "$workdir"
+            die "Failed to inspect make tarball: $source"
+        }
+
+        source_dir="$workdir/source"
+        mkdir -p -- "$source_dir" || die "Failed to create make extraction directory"
+        tar --no-same-owner --no-same-permissions -xf "$archive" -C "$source_dir" || {
+            rm -rf -- "$workdir"
+            die "Failed to extract make tarball: $source"
+        }
+    fi
+
+    # Prefer a top-level makefile. If there is none, accept exactly one makefile
+    # in the fetched tree rather than guessing between unrelated subprojects.
+    if [[ -f "$source_dir/Makefile" || -f "$source_dir/makefile" || -f "$source_dir/GNUmakefile" ]]; then
+        make_dir="$source_dir"
+    else
+        mapfile -t makefiles < <(find "$source_dir" -type f \
+            \( -iname 'Makefile' -o -iname 'GNUmakefile' \) -print 2>/dev/null)
+        [[ ${#makefiles[@]} -gt 0 ]] || {
+            rm -rf -- "$workdir"
+            die "No Makefile found in make source: $source"
+        }
+        [[ ${#makefiles[@]} -eq 1 ]] || {
+            rm -rf -- "$workdir"
+            die "Multiple Makefiles found in make source; unable to choose safely"
+        }
+        make_dir="$(dirname -- "${makefiles[0]}")"
+    fi
+
+    export LINUXTOYS_MAKE_DIR="$make_dir"
+
+    if (( uninstall )); then
+        # Keep the install flow intact and only turn the Make install target into
+        # its uninstall equivalent: install -> uninstall, install-user -> uninstall-user.
+        run_command=$(python3 - "$install_command" <<'PY2'
+import re
+import sys
+
+command = sys.argv[1]
+updated, count = re.subn(r'(?<![A-Za-z0-9_])install(?=$|[-_]|[^A-Za-z0-9_])', 'uninstall', command, count=1)
+if count != 1:
+    sys.exit(1)
+print(updated)
+PY2
+        ) || {
+            rm -rf -- "$workdir"
+            die "Unable to derive make uninstall command from: $install_command"
+        }
+    fi
+
+    if (( ! uninstall )); then
+        make -C "$make_dir" || {
+            die "Failed to build make source: $source"
+        }
+    fi
+
+    # Only prompt for authentication when this flow actually invokes sudo.
+    if [[ "$run_command" =~ (^|[[:space:];|&()])sudo([[:space:]]|$) ]]; then
+        askpass
+    fi
+    runner_lock "package-transaction"
+
+    ( cd -- "$make_dir" && bash -c "$run_command" ) || {
+        runner_unlock
+        rm -rf -- "$workdir"
+        if (( uninstall )); then
+            die "Failed to uninstall make source: $source"
+        else
+            die "Failed to install make source: $source"
+        fi
+    }
+
+    if (( ! uninstall )); then
+        local encoded_command
+        encoded_command=$(printf '%s' "$install_command" | base64 -w 0) || die "Failed to encode make install command"
+        _append_transmap "pkg make $source cmd64:$encoded_command"
+    fi
+
+    runner_unlock
+}
+
 pkg_fromrelease () {
-    local _tarball=0 _binary=0 arg
-    local -a release_args=()
-    for arg in "$@"; do
-        case "$arg" in
+    local _tarball=0 _binary=0 _make=0 arg make_command="sudo make install"
+    local -a release_args=() make_dependencies=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
             --tar|--tarball)
                 _tarball=1
                 ;;
             --bin|--binary)
                 _binary=1
                 ;;
+            --make)
+                _make=1
+                _tarball=1
+                ;;
+            --make-command)
+                shift
+                [[ $# -gt 0 ]] || die "pkg_fromrelease --make-command requires a command"
+                make_command="$1"
+                ;;
+            --make-dependency)
+                shift
+                [[ $# -gt 0 ]] || die "pkg_fromrelease --make-dependency requires a package name"
+                make_dependencies+=("$1")
+                ;;
             *)
-                release_args+=("$arg")
+                release_args+=("$1")
                 ;;
         esac
+        shift
     done
     set -- "${release_args[@]}"
 
-    [[ $# -ge 1 && $# -le 2 ]] || die "Usage: pkg_fromrelease [--tar|--bin] REPOSITORY_URL [ASSET_NAME_OR_GLOB]"
+    [[ $# -ge 1 && $# -le 2 ]] || die "Usage: pkg_fromrelease [--tar|--bin|--make] REPOSITORY_URL [ASSET_NAME_OR_GLOB]"
     [[ $_tarball -eq 0 || $_binary -eq 0 ]] || die "--tar and --bin cannot be used together"
+    [[ $_make -eq 0 || $_binary -eq 0 ]] || die "--make and --bin cannot be used together"
     [[ $_binary -eq 0 || $# -eq 2 ]] || die "pkg_fromrelease --bin requires the exact release asset name"
 
     local native_type="" package_url
@@ -826,7 +1198,13 @@ PY
     export APP_GIT_VERSION="${release_selection[0]}"
     package_url="${release_selection[1]}"
 
-    if [[ $_binary -eq 1 ]]; then
+    if [[ $_make -eq 1 ]]; then
+        local -a make_args=(--command "$make_command")
+        for arg in "${make_dependencies[@]}"; do
+            make_args+=(--dependency "$arg")
+        done
+        pkg_make "${make_args[@]}" --url "$package_url"
+    elif [[ $_binary -eq 1 ]]; then
         pkg_fromurl --bin "$package_url"
     elif [[ $_tarball -eq 1 ]]; then
         pkg_fromurl --tar "$package_url"
@@ -907,26 +1285,36 @@ PY
 pkg_remove () {
     pkg_exists "$@"
     [[ ${#pkg_found[@]} -eq 0 ]] && return 0
-
     local to_remove="${pkg_found[*]}"
 
+    runner_lock "package-transaction"
+
     if is_debian || is_ubuntu; then
-        sudo apt-get remove -y --allow-unauthenticated "${pkg_found[@]}" || fatal "Failed to remove packages: $to_remove"
+        sudo apt-get remove -y --allow-unauthenticated "${pkg_found[@]}" \
+            || fatal "Failed to remove packages: $to_remove"
     elif { is_arch || is_cachy; } && ! is_manjaro; then
-        # check for lock before removing (stale lock otherwise aborts pacman -Rsn)
         pacman_lock_guard
-        sudo pacman -Rsn --noconfirm "${pkg_found[@]}" || fatal "Failed to remove packages: $to_remove"
+        sudo pacman -Rsn --noconfirm "${pkg_found[@]}" \
+            || fatal "Failed to remove packages: $to_remove"
     elif is_manjaro; then
-        pamac remove --no-confirm "${pkg_found[@]}" || fatal "Failed to remove packages: $to_remove"
+        pamac remove --no-confirm "${pkg_found[@]}" \
+            || fatal "Failed to remove packages: $to_remove"
     elif is_ostree; then
-        sudo rpm-ostree uninstall "${pkg_found[@]}" || fatal "Failed to remove packages: $to_remove"
-    elif is_fedora || is_rhel ; then
-        sudo dnf remove -y "${pkg_found[@]}" || fatal "Failed to remove packages: $to_remove"
+        sudo rpm-ostree uninstall "${pkg_found[@]}" \
+            || fatal "Failed to remove packages: $to_remove"
+    elif is_fedora || is_rhel; then
+        sudo dnf remove -y "${pkg_found[@]}" \
+            || fatal "Failed to remove packages: $to_remove"
     elif is_suse; then
-        sudo zypper rm -y "${pkg_found[@]}" || fatal "Failed to remove packages: $to_remove"
+        sudo zypper rm -y "${pkg_found[@]}" \
+            || fatal "Failed to remove packages: $to_remove"
     elif is_solus; then
-        sudo eopkg rmf -y "${pkg_found[@]}" || fatal "Failed to remove packages: $to_remove"
+        sudo eopkg rmf -y "${pkg_found[@]}" \
+            || fatal "Failed to remove packages: $to_remove"
     fi
+
+    runner_unlock
+
     _append_transmap "pkg rm $to_remove"
 }
 pkg_rm () { pkg_remove "$@"; }
@@ -1020,62 +1408,55 @@ EOF
     { ( is_fedora || is_ostree || is_rhel ) && pkg_install fuse; }
     { ( is_arch || is_cachy || is_solus ) && pkg_install fuse2; }
     prep_dir "$HOME/AppImages"
-    if is_systemd; then
-        # Use Gear Lever for systemd systems
-        call_script GEAR_LEVER
-        local output
-        output=$(echo "y" | flatpak run it.mijorus.gearlever --integrate "$@" 2>&1) || {
-            echo "$output"
-            fatal "Failed to integrate AppImage."
-        }
-        local appimage_name
-        appimage_name=$(
-            find "$HOME/AppImages" -maxdepth 1 -type f -printf '%T@ %f\n' 2>/dev/null |
-                sort -nr |
-                head -n1 |
-                cut -d' ' -f2-
-        )
-        if [[ -n "$appimage_name" ]]; then
-            _append_transmap "appimage $appimage_name"
-        else
-            nonfatal "Could not determine integrated AppImage filename."
-        fi
-    else
-        # Manual integration for non-systemd systems
-        for appimage_file in "$@"; do
-            [[ -f "$appimage_file" ]] || fatal "AppImage file not found: $appimage_file"
-            local appimage_basename=$(basename "$appimage_file")
-            prep_create "$HOME/AppImages/$appimage_basename"
-            cp -f "$appimage_file" "$HOME/AppImages/$appimage_basename"
-            chmod +x "$HOME/AppImages/$appimage_basename"
 
-            prep_tmp_noram
-            local extract_dir
-            extract_dir="$HOME/.cache/linuxtoys/tmp" || fatal "Failed to create temp directory for extraction"
-            cd "$extract_dir" || fatal "Failed to change to temp directory"
-            "$HOME/AppImages/$appimage_basename" --appimage-extract >/dev/null 2>&1 || \
-                { nonfatal "Failed to extract AppImage: $appimage_basename"; rm -rf "$extract_dir"; continue; }
-            local desktop_file
-            desktop_file=$(find squashfs-root -name "*.desktop" -type f 2>/dev/null | head -1)
-            if [[ -n "$desktop_file" && -f "$desktop_file" ]]; then
-                prep_dir "$HOME/.local/share/applications"
-                local desktop_basename=$(basename "$desktop_file")
-                prep_create "$HOME/.local/share/applications/$desktop_basename"
-                cp -f "$desktop_file" "$HOME/.local/share/applications/$desktop_basename" || \
-                    fatal "Failed to copy desktop file"
+    # Prefer Gear Lever on systemd systems. If it cannot inspect/integrate an
+    # otherwise valid AppImage, fall back to LinuxToys' own simple integration.
+    if is_systemd; then
+        if ! flatpak list | grep "it.mijorus.gearlever"; then
+            info "$gearlevermsg"
+            call_script GEAR_LEVER
+        fi
+        local output
+        if output=$(echo "y" | flatpak run it.mijorus.gearlever --integrate "$@" 2>&1); then
+            local appimage_name
+            appimage_name=$(
+                find "$HOME/AppImages" -maxdepth 1 -type f -printf '%T@ %f\n' 2>/dev/null |
+                    sort -nr |
+                    head -n1 |
+                    cut -d' ' -f2-
+            )
+            if [[ -n "$appimage_name" ]]; then
+                _append_transmap "appimage $appimage_name"
+            else
+                warn "Could not determine integrated AppImage filename."
             fi
-            local icon_file
-            icon_file=$(find squashfs-root \( -name "*.png" -o -name "*.svg" -o -name "*.xpm" \) -type f 2>/dev/null | head -1)
-            if [[ -n "$icon_file" && -f "$icon_file" ]]; then
-                prep_dir "$HOME/.local/share/icons"
-                local icon_basename=$(basename "$icon_file")
-                prep_create "$HOME/.local/share/icons/$icon_basename"
-                cp -f "$icon_file" "$HOME/.local/share/icons/$icon_basename" || \
-                    nonfatal "Failed to copy icon file"
-            fi
-            _append_transmap "appimage $appimage_basename"
-        done
+            return 0
+        fi
+
+        echo "$output"
+        warn "Gear Lever integration failed. Falling back to LinuxToys AppImage integration."
     fi
+
+    # Minimal fallback/non-systemd integration. Repository metadata already
+    # supplies the application name, description and icon, so desktop_shortcut
+    # can create a consistent launcher without extracting AppImage metadata.
+    for appimage_file in "$@"; do
+        [[ -f "$appimage_file" ]] || fatal "AppImage file not found: $appimage_file"
+
+        local appimage_basename target_appimage
+        appimage_basename="$(basename -- "$appimage_file")"
+        target_appimage="$HOME/AppImages/$appimage_basename"
+
+        prep_create "$target_appimage"
+        cp -f -- "$appimage_file" "$target_appimage" || fatal "Failed to copy AppImage: $appimage_basename"
+        chmod +x -- "$target_appimage" || fatal "Failed to make AppImage executable: $appimage_basename"
+
+        # Keep the desktop launcher bound to the AppImage's absolute path, while
+        # exposing a stable LinuxToys app-ID command through ~/.local/bin.
+        path_link --useappid "$target_appimage"
+        desktop_shortcut "\"$target_appimage\""
+        _append_transmap "appimage $appimage_basename"
+    done
 }
 
 pkg_appimage_rm () {

@@ -88,6 +88,9 @@ class AppWindow(
         self._featured_last_count = None
         self._featured_swap_timer = None
         self._featured_hovered = False
+        self._featured_last_layout = None
+        self._featured_large_positions = set()
+        self._featured_history = []
         self.featured_scripts_revealer = None
         self.random_scripts_revealer = None
 
@@ -200,22 +203,24 @@ class AppWindow(
         self.featured_scripts_container.pack_start(self.random_scripts_label, False, False, 0)
 
         # Create flowbox for random scripts (without extra margins since container has them)
-        self.random_scripts_flowbox = Gtk.FlowBox()
+        # Featured needs true row-spanning cards, which Gtk.FlowBox cannot provide.
+        # Keep the historical attribute name for compatibility with the Featured
+        # controller, but back it with a homogeneous Gtk.Grid.
+        self.random_scripts_flowbox = Gtk.Grid()
         self.random_scripts_flowbox.set_valign(Gtk.Align.START)
-        self.random_scripts_flowbox.set_max_children_per_line(5)
-        self.random_scripts_flowbox.set_activate_on_single_click(False)
-        self.random_scripts_flowbox.set_selection_mode(Gtk.SelectionMode.MULTIPLE)
-        self.random_scripts_flowbox.connect(
-            "key-press-event", self._on_flowbox_key_press
-        )
-        self.random_scripts_flowbox.set_homogeneous(True)
-        # No margins here since the container already has them
+        self.random_scripts_flowbox.set_column_homogeneous(True)
+        self.random_scripts_flowbox.set_row_homogeneous(True)
+        # No margins here since the container already has them.
         self.random_scripts_flowbox.set_margin_left(0)
         self.random_scripts_flowbox.set_margin_top(0)
         self.random_scripts_flowbox.set_margin_right(0)
         self.random_scripts_flowbox.set_margin_bottom(0)
-        self.random_scripts_flowbox.set_column_spacing(16)
-        self.random_scripts_flowbox.set_row_spacing(12)
+        # Gtk.FlowBox adds a small amount of visual breathing room around its
+        # children through the FlowBoxChild wrapper. Featured uses Gtk.Grid so
+        # cards can span rows, therefore compensate for that wrapper here to
+        # make the *visible* card-to-card gaps match the main-menu FlowBoxes.
+        self.random_scripts_flowbox.set_column_spacing(20)
+        self.random_scripts_flowbox.set_row_spacing(18)
 
         self.random_scripts_revealer = Gtk.Revealer()
         self.random_scripts_revealer.set_transition_type(
@@ -1552,19 +1557,28 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
 
     def _refresh_ui_with_new_translations(self):
         """Refresh all UI elements with new translations"""
+        current_view = self.main_stack.get_visible_child_name()
+        app_page_info = None
+        if current_view == "app_page":
+            current_page = self.main_stack.get_child_by_name("app_page")
+            if current_page is not None:
+                app_page_info = current_page.script_info
+
         # Hidden retained category views contain already-rendered translated
         # labels/tooltips. Drop them so Back never resurrects the old locale.
         self._discard_retained_category_views()
 
-        # Update header
-        self._update_header(self.current_category_info)
+        # App pages own their own InfosHead. Rebuilding the normal category header
+        # while one is visible both exposes that header and corrupts the page state.
+        if current_view != "app_page":
+            self._update_header(self.current_category_info)
 
-        # Update title bar
-        if self.current_category_info:
-            category_name = self.current_category_info.get("name", "Unknown")
-            self.header_bar.props.title = f"LinuxToys: {category_name}"
-        else:
-            self.header_bar.props.title = "LinuxToys"
+            # Update title bar
+            if self.current_category_info:
+                category_name = self.current_category_info.get("name", "Unknown")
+                self.header_bar.props.title = f"LinuxToys: {category_name}"
+            else:
+                self.header_bar.props.title = "LinuxToys"
 
         # Refresh the dropdown menu with new translations
         if hasattr(self, "menu_button"):
@@ -1575,6 +1589,21 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
 
         # Refresh footer translations
         self.reveal.update_translations(self.translations)
+
+        # App pages are snapshots of translated repository metadata, so recreate
+        # the active page from freshly parsed metadata while preserving the exact
+        # view it should return to on Back.
+        if current_view == "app_page":
+            fresh_info = None
+            if app_page_info:
+                script_name = app_page_info.get("name")
+                if script_name:
+                    fresh_info = manifest_helper.find_script_by_name(
+                        script_name, self.translations
+                    )
+
+            self.refresh_app_page_with_fade(fresh_info or app_page_info)
+            return
 
         # If the Skills Seeker is active, recreate it with the new translations
         if self.main_stack.get_visible_child_name() == "skills_seeker":

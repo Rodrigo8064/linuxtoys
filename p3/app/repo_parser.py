@@ -70,7 +70,7 @@ OS_KEYS = {
     "manjaro",
 }
 
-VALID_TYPES = {"git", "tar", "bin", "flathub", "native", "repository", "url", "external"}
+VALID_TYPES = {"git", "tar", "bin", "make", "flathub", "native", "repository", "url", "external"}
 
 URL_PACKAGE_KEYS = {
     "deb",
@@ -478,50 +478,58 @@ def _desktop_requirement_matches(entry, compat_keys):
     return bool(requested & compat_keys)
 
 
-def _steamos_entry_is_compatible(entry, compat_keys):
-    """
-    Restrict SteamOS entries to portable installs that do not require native packages.
+def _make_command_uses_sudo(entry):
+    """Return whether a make entry's effective install command requires sudo."""
+    command = entry.get("make-command")
+    if command is None:
+        command = "sudo make install"
+    if not isinstance(command, str) or not command.strip():
+        return True
+    return bool(re.search(r"(?:^|[\s;|&()])sudo(?:\s|$)", command))
 
-    Native package declarations for other operating systems are harmless here. For
-    example, an entry may use a native package on Arch while falling back to Flathub
-    on SteamOS. Direct URL installs may resolve to Flatpak, AppImage, tarball, or
-    single-binary payloads, while generic git release entries defer asset selection
-    to pkg_fromrelease. In all cases, a native package dependency makes the entry
-    incompatible.
-    """
+
+def _steamos_user_make(entry, compat_keys):
+    return (
+        "steamos" in compat_keys
+        and _resolve_install_type(entry, compat_keys) == "make"
+        and not _make_command_uses_sudo(entry)
+    )
+
+
+def _steamos_entry_is_compatible(entry, compat_keys):
+    """Restrict SteamOS entries to user-level installation flows."""
     if "steamos" not in compat_keys:
         return True
 
     install_type = _resolve_install_type(entry, compat_keys)
+    user_make = _steamos_user_make(entry, compat_keys)
 
     if install_type in {"git", "flathub", "tar", "bin", "external"}:
-        # Git release installs are resolved by pkg_fromrelease. On SteamOS it
-        # permits AppImage/Flatpak assets, plus explicitly requested tarballs
-        # and single binaries, all of which are installed at user level.
         pass
+    elif install_type == "make":
+        # Make installs are supported only when the application itself installs
+        # at user level. LinuxToys may temporarily unlock SteamOS later to install
+        # build-only Arch dependencies and base-devel.
+        if not user_make:
+            return False
     elif install_type == "url":
         resolved = _resolve_url_package(entry, compat_keys)
         if not resolved or resolved[0] not in {"flatpak", "appimage", "tar", "bin"}:
             return False
     else:
-        # Native packages and third-party repository installs modify the base
-        # system and are therefore not compatible with SteamOS.
         return False
 
-    # A native dependency makes the portable application depend on modifications
-    # to the SteamOS base system, so the whole entry becomes incompatible.
-    # Native package alternatives for other distro branches do NOT trigger this.
-    for dependency in entry.get("dependencies", []):
-        if (
-            isinstance(dependency, dict)
-            and dependency.get("type") == "native"
-        ):
-            return False
+    # Native dependencies remain disallowed for normal portable SteamOS entries.
+    # A user-level make entry is the exception: they are treated as build-only
+    # dependencies and resolved using the Arch package declaration.
+    if not user_make:
+        for dependency in entry.get("dependencies", []):
+            if (
+                isinstance(dependency, dict)
+                and dependency.get("type") == "native"
+            ):
+                return False
 
-    # Pre-install hooks remain disallowed because they can prepare or modify the
-    # host before the portable payload is installed. Tarball entries are the one
-    # exception for post hooks: LinuxToys requires one to integrate the extracted
-    # user-level application (desktop entry, launcher, etc.).
     overrides = entry.get("overrides")
     if isinstance(overrides, dict):
         if overrides.get("pre") is not None:
@@ -533,8 +541,6 @@ def _steamos_entry_is_compatible(entry, compat_keys):
             if not resolved or resolved[0] != "tar":
                 return False
 
-    # Service enablement is also a host-level integration, so require explicit
-    # script support instead of allowing it through the automatic repo path.
     services = _normalize_services(entry)
     if services is None or services["system"] or services["user"]:
         return False
@@ -758,6 +764,24 @@ def _validate_type(entry, compat_keys):
 
     if install_type in {"git", "tar"}:
         return _validate_release_asset_selector(entry.get("package-name"))
+
+    if install_type == "make":
+        make_source = entry.get("make-source", "git")
+        if not isinstance(make_source, str) or make_source.strip().lower() not in {"git", "tar"}:
+            return False
+
+        make_command = entry.get("make-command")
+        if make_command is not None:
+            if not isinstance(make_command, str) or not make_command.strip():
+                return False
+            # Reversion derives the uninstall flow by replacing the first
+            # install target: install -> uninstall, install-user -> uninstall-user.
+            if not re.search(r"(?<![A-Za-z0-9_])install(?=$|[-_]|[^A-Za-z0-9_])", make_command):
+                return False
+
+        if make_source.strip().lower() == "tar":
+            return _validate_release_asset_selector(entry.get("package-name"))
+        return entry.get("package-name") is None
 
     if install_type == "bin":
         asset_name = entry.get("package-name")
@@ -1976,6 +2000,21 @@ def create_install_script(entry):
         entry,
         compat_keys,
     )
+    steamos_user_make = _steamos_user_make(entry, compat_keys)
+    make_build_dependencies = []
+    if steamos_user_make:
+        make_build_dependencies = [
+            cmd[len("pkg_install "):]
+            for cmd in dependency_commands
+            if cmd.startswith("pkg_install ")
+        ]
+        dependency_commands = [
+            cmd for cmd in dependency_commands if not cmd.startswith("pkg_install ")
+        ]
+    needs_askpass = any(
+        cmd.startswith("pkg_install ")
+        for cmd in dependency_commands
+    )
     command = None
 
     if install_type == "git":
@@ -1989,6 +2028,22 @@ def create_install_script(entry):
         command = f"pkg_fromrelease --tar {shlex.quote(repo)}"
         if asset_selectors:
             command += f" {shlex.quote(asset_selectors[0])}"
+
+    elif install_type == "make":
+        make_source = entry.get("make-source", "git").strip().lower()
+        make_command = entry.get("make-command")
+        command = "pkg_make"
+        if make_command is not None:
+            command += f" --command {shlex.quote(make_command.strip())}"
+        for dependency in make_build_dependencies:
+            command += f" --dependency {dependency}"
+        if make_source == "tar":
+            asset_selectors = _resolve_package_names(entry, compat_keys)
+            command += f" --tar {shlex.quote(repo)}"
+            if asset_selectors:
+                command += f" {shlex.quote(asset_selectors[0])}"
+        else:
+            command += f" {shlex.quote(repo)}"
 
     elif install_type == "bin":
         asset_name = entry.get("package-name", "").strip()
@@ -2022,6 +2077,7 @@ def create_install_script(entry):
             f"pkg_install {shlex.quote(package)}"
             for package in packages
         )
+        needs_askpass = True
 
     elif install_type == "url":
         compat_keys = get_system_compat_keys()
@@ -2093,8 +2149,19 @@ python3 "$SCRIPT_DIR/app/library_loader.py" "$_external_script" || exit $?
     override_commands = _create_override_commands(entry)
     service_commands = _create_service_commands(entry)
 
+    # Authenticate before any generated pkg_install can engage the runner lock.
+    # Keep this at script level so multiple native packages/dependencies share one
+    # authentication request. pkg_fromfile handles downloaded native packages itself.
+    auth_commands = ["askpass"] if needs_askpass else []
+
+    # A system service also requires authentication, but avoid emitting a second
+    # askpass when the package installation already requested it above.
+    if needs_askpass and service_commands and service_commands[0] == "askpass":
+        service_commands = service_commands[1:]
+
     commands = (
-        dependency_commands
+        auth_commands
+        + dependency_commands
         + [command]
         + override_commands
         + service_commands
@@ -2230,7 +2297,8 @@ def _dependencies_are_compatible(entry, compat_keys):
                 return False
 
         elif dependency_type == "native":
-            if not _resolve_native_package(dependency, compat_keys):
+            dependency_compat = {"arch"} if _steamos_user_make(entry, compat_keys) else compat_keys
+            if not _resolve_native_package(dependency, dependency_compat):
                 return False
 
     return True
@@ -2242,9 +2310,10 @@ def _create_dependency_commands(entry, compat_keys):
         dependency_type = dependency["type"]
 
         if dependency_type == "native":
+            dependency_compat = {"arch"} if _steamos_user_make(entry, compat_keys) else compat_keys
             packages = _resolve_native_package(
                 dependency,
-                compat_keys,
+                dependency_compat,
             )
 
             if not packages:

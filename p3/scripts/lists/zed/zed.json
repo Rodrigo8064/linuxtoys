@@ -7,11 +7,12 @@
         "repo": "https://github.com/zed-industries/zed",
         "category": "ides",
         "icon": "zed.png",
+        "license": "GPLv3",
         "descriptions": "descriptions.json",
         "screenshots": "screenshots/",
         "type": "tar",
         "overrides": {
-            "post": "desktop_shortcut --class \"dev.zed.Zed\" \"$LINUXTOYS_TARBALL_DIR/bin/zed\" && path_link \"$LINUXTOYS_TARBALL_DIR/bin/zed\""
+            "post": "desktop_shortcut --class \"dev.zed.Zed\" \"$LINUXTOYS_TARBALL_DIR/bin/zed\" && path_link \"$LINUXTOYS_TARBALL_DIR/bin/zed\" && { { is_steam || ! is_systemd; } || { askpass && sudo sysctl fs.inotify.max_user_instances=512; }; }"
         }
     }
 ]

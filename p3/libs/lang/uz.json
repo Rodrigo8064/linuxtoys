@@ -421,7 +421,7 @@
   "sysup": "Sistemani Yangilash",
   "sysup_desc": "Teriqalar paketlarini tozalash va taqsimot paketlari va Flatpaks uchun to'liq sistem yangilashni bajaradi.",
   "autosysup": "Avtomatik Yangilashlari",
-  "autosysup_desc": "LinuxToys systemd uchun avtomatik sistem yangilash xizmatlarini yoqing. Bu yetim paketlarni tozalash va ushbu tarqalish paketlari va Flatpaks uchun to'liq sistem yangilashni muntazam ravishda o'tkazadi, shunchaki o'zingiz haqida xavotir qilishingiz kerak bo'lmaydi. ESOLAMNOMA: bu faqat sizning sistemingizning joriy chiqarish versiyasini yangilaydi, lekin uni yangilamas - buning uchun yangi chiqarish mavjud bo'lganda asosiy menyudan qo'lda yangilashni o'tkazishingiz kerak.",
+  "autosysup_desc": "systemd uchun LinuxToys avtomatik tizim yangilash xizmatlarini yoqadi. Ular muntazam ravishda yetim paketlarni tozalaydi va distributivingiz paketlari hamda Flatpaklarni to‘liq yangilaydi, shuning uchun bu haqda o‘zingiz qayg‘urishingiz shart emas. ESLATMA: bu distributivning yangi reliz versiyasiga o‘tishni amalga oshirmaydi — buning uchun yangi reliz mavjud bo‘lganda asosiy menyudan qo‘lda yangilashni ishga tushirishingiz kerak.",
   "cachykrn_desc": "CachyOS kustomli tuning kerneli. Fedora-da ananicy-cpp va SteamOS VRAM Optimization istifoda qilish uchun talab qilinadi. Secure Boot bilan foydalanish uchun imzo qilish bosqichlarini o'z ichiga oladi, agar bu xususiyat faollashtirilgan bo'lsa yoki sozlash rejimida bo'lsa.",
   "optivram": "SteamOS VRAM optimizasiyasi",
   "optivram_desc": "SteamOS dan kelib chiqqan bu optimizatsiya o'yinlarda samaradorlikni seziladi daraja kattalashtiradi, ayniqsa 6GB VRAM yoki undan kam bo'lgan tizimlarda, sovuq VRAM sahifalarini RAM-ga yuborish orqali. Fedora-da CachyOS Kernel talab qilinadi.",
@@ -556,5 +556,9 @@
   "registry_export_tooltip": "Barcha ro‘yxatdan o‘tgan amallarni manifest fayli sifatida eksport qilish",
   "registry_export_error_title": "Manifest eksporti amalga oshmadi",
   "registry_export_success_title": "Manifest eksport qilindi",
-  "registry_export_success_message": "{count} ta ro‘yxatdan o‘tgan amal quyidagi manzilga eksport qilindi:\n{path}"
+  "registry_export_success_message": "{count} ta ro‘yxatdan o‘tgan amal quyidagi manzilga eksport qilindi:\n{path}",
+  "bug_report_outdated_title": "Xatolik hisoboti mavjud emas",
+  "bug_report_outdated_message": "Siz LinuxToys ${current} versiyasidan foydalanmoqdasiz, ammo joriy versiya ${latest}. Xatolik hisobotini yuborishdan oldin LinuxToys-ni yangilang.",
+  "quarto_desc": "Ilmiy va texnik nashrlar uchun ochiq kodli tizim.",
+  "rbase_desc": "Statistik hisoblash va grafika uchun erkin dasturiy ta'minot muhiti."
 }

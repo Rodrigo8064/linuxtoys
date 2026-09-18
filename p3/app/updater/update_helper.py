@@ -179,6 +179,31 @@ class UpdateHelper:
         )
 
 
+def get_latest_release_version() -> str | None:
+    """Return the latest published LinuxToys release version, or None on failure."""
+    helper = UpdateHelper()
+    latest = helper._get_latest_version().get("tag_name", "").strip()
+    return latest or None
+
+
+def is_current_version(version: str | None = None) -> tuple[bool, str | None]:
+    """Return whether *version* matches the latest published LinuxToys release.
+
+    DEV_MODE bypasses the release guard. If the release lookup fails, fail open so
+    bug reporting remains available during network/update-service outages.
+    """
+    if os.environ.get("DEV_MODE") == "1":
+        return True, None
+
+    current = (version or __version__).strip()
+    latest = get_latest_release_version()
+    if not latest:
+        return True, None
+
+    helper = UpdateHelper()
+    return helper._compare_versions(current, latest) != 1, latest
+
+
 def run_background_update():
     """Install the latest LinuxToys release without opening the VTE viewer.
 
@@ -187,7 +212,9 @@ def run_background_update():
     the user-level AppImage/Gear Lever update path. Returns
     (success, error_message).
     """
+    env = os.environ.copy()
     script_dir = os.environ.get("SCRIPT_DIR")
+    env["LINUXTOYS_NONINTERACTIVE"] = "1"
 
     is_steamos = False
     try:
@@ -243,11 +270,16 @@ def run_background_update():
         os.chmod(script_path, 0o700)
 
         result = subprocess.run(
-            ["bash", script_path],
+            [
+                "script",
+                "-qefc",
+                f"bash {shlex.quote(script_path)}",
+                "/dev/null",
+            ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            env=os.environ.copy(),
+            env=env,
         )
 
         if result.returncode == 0:
@@ -269,4 +301,3 @@ def run_background_update():
                 os.remove(script_path)
             except OSError:
                 pass
-

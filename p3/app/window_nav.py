@@ -128,20 +128,21 @@ class NavCtl:
                 defer_initial=True,
             )
 
-    def open_app_page(self, info):
+    def open_app_page(self, info, preserve_previous=False):
         """Open a repository entry's optional details page without altering checklist state."""
         old_page = self.main_stack.get_child_by_name("app_page")
         if old_page is not None:
             self.main_stack.remove(old_page)
             old_page.destroy()
 
-        self._app_page_prev = {
-            "child": self.main_stack.get_visible_child(),
-            "header_visible": self.header_widget.get_visible(),
-            "title": self.header_bar.props.title,
-            "footer_revealed": self.reveal.get_reveal_child(),
-            "back_visible": self.back_button.get_visible(),
-        }
+        if not preserve_previous:
+            self._app_page_prev = {
+                "child": self.main_stack.get_visible_child(),
+                "header_visible": self.header_widget.get_visible(),
+                "title": self.header_bar.props.title,
+                "footer_revealed": self.reveal.get_reveal_child(),
+                "back_visible": self.back_button.get_visible(),
+            }
 
         page = app_page.AppPageView(
             info,
@@ -157,6 +158,60 @@ class NavCtl:
         self.back_button.show()
         self.header_bar.props.title = f"LinuxToys: {info.get('name', 'App')}"
         self.main_stack.set_visible_child_name("app_page")
+
+    def refresh_app_page_with_fade(self, info):
+        """Replace the visible app page with a translated copy using a cross-fade."""
+        old_page = self.main_stack.get_child_by_name("app_page")
+        if old_page is None:
+            self.open_app_page(info, preserve_previous=True)
+            return
+
+        page = app_page.AppPageView(
+            info,
+            self,
+            self.translations,
+            on_install_callback=self._install_from_app_page,
+        )
+
+        # Keep both pages alive for the transition. Removing the old page first
+        # makes Gtk.Stack animate from the underlying category instead.
+        refresh_name = f"app_page_refresh_{self.view_counter}"
+        self.view_counter += 1
+        self.main_stack.add_named(page, refresh_name)
+        page.show_all()
+
+        old_transition = self.main_stack.get_transition_type()
+        old_duration = self.main_stack.get_transition_duration()
+        fade_duration = 180
+        self.main_stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        self.main_stack.set_transition_duration(fade_duration)
+        self.main_stack.set_visible_child(page)
+
+        self.header_widget.hide()
+        self.reveal.set_reveal_child(False)
+        self.back_button.show()
+        self.header_bar.props.title = f"LinuxToys: {info.get('name', 'App')}"
+
+        def finish_refresh():
+            try:
+                if old_page.get_parent() is self.main_stack:
+                    self.main_stack.remove(old_page)
+                old_page.destroy()
+            except (AttributeError, TypeError):
+                pass
+
+            # Restore the canonical child name so normal app-page Back/install
+            # handling continues to find the page exactly as before.
+            try:
+                self.main_stack.child_set_property(page, "name", "app_page")
+            except (AttributeError, TypeError):
+                pass
+
+            self.main_stack.set_transition_type(old_transition)
+            self.main_stack.set_transition_duration(old_duration)
+            return False
+
+        GLib.timeout_add(fade_duration + 20, finish_refresh)
 
     def close_app_page_for_install(self):
         """Remove the app page immediately before entering the terminal flow."""
@@ -178,6 +233,17 @@ class NavCtl:
         
         run_box = term_view.TermRunScripts(
             infos, self, self.translations, removable_script_info=removable_script_info, auto_run=auto_run
+        )
+
+        # Header-menu actions can mutate global UI/application state in ways that
+        # are unsafe or confusing while the terminal workflow owns navigation.
+        self.menu_button.set_sensitive(False)
+
+        # Defensive restore for any non-standard path that destroys the terminal
+        # widget without going through on_back_button_clicked().
+        run_box.connect(
+            "destroy",
+            lambda *_args: self.menu_button.set_sensitive(True),
         )
 
         # Keep the exact previous view alive, just like app-page/category
@@ -299,6 +365,11 @@ class NavCtl:
 
         # Handle leaving the terminal before normal search navigation.
         if self.main_stack.get_visible_child_name() == "running_scripts":
+            # Package transactions explicitly lock navigation because interrupting a
+            # native package manager can leave the system package database inconsistent.
+            if getattr(self, "_runner_navigation_locked", False):
+                return
+
             child = self.main_stack.get_child_by_name("running_scripts")
 
             # This branch returns before the generic running-script check below,
@@ -389,6 +460,12 @@ class NavCtl:
                     self._enable_drag_and_drop()
                 else:
                     self._disable_drag_and_drop()
+
+                # Installation/removal may have changed which scripts are eligible
+                # for Featured. Returning to the root must therefore recalculate the
+                # set immediately instead of waiting for the next periodic rotation.
+                if self.current_category_info is None:
+                    self._prepare_random_scripts_display()
 
                 GLib.timeout_add(transition_delay, cleanup_terminal_view)
                 self._term_prev = None
