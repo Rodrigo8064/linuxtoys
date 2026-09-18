@@ -59,7 +59,7 @@ class LinuxToys(ScriptRunnerMixin, HistoryOpenerMixin, App):
             with Vertical(id="left-column"):
                 yield Input(
                     placeholder=translations.get(
-                        "search_placeholder", "Search"
+                        "search_placeholder", "Search features"
                     ),
                     id="search-input",
                 )
@@ -176,7 +176,9 @@ class LinuxToys(ScriptRunnerMixin, HistoryOpenerMixin, App):
                 LanguageSelectorDialog(), callback=self.apply_language_change
             )
         if event.item.id == "manifest":
-            self.app.push_screen(ManifestDialog())
+            self.app.push_screen(
+                ManifestDialog(), callback=self.on_manifest_chosen
+            )
 
     async def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id != "search-input":
@@ -286,7 +288,7 @@ class LinuxToys(ScriptRunnerMixin, HistoryOpenerMixin, App):
         await self.action_reset_to_home()
         await self._refresh_fixed_ui_labels()
 
-    async def _refresh_fixed_ui_labels(self):
+    async def _refresh_fixed_ui_labels(self) -> None:
         self.query_one("#search-input", Input).placeholder = translations.get(
             "search_placeholder", "Search"
         )

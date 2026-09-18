@@ -29,6 +29,7 @@ from .helper import (
     make_widget_id,
     translations,
 )
+from .manifest_dialog import ManifestReportDialog
 from .my_widgets import (
     DescButton,
     PasswordPromptDetected,
@@ -45,6 +46,9 @@ class ScriptRunnerMixin:
     _running_temp_path: str | None = None
     _running_dev_mode: bool = False
     _running_is_uninstall: bool = False
+    _manifest_queue: list[dict] = []
+    _manifest_results: list[dict] = []
+    _is_manifest_run: bool = False
 
     async def handle_desc_button(self, button: DescButton) -> None:
         """Call a function based on is script or not."""
@@ -109,9 +113,15 @@ class ScriptRunnerMixin:
             )
 
     def run_script(self, button: DescButton) -> None:
-        script_info = {"name": str(button.label), "path": button.path}
-        script_info = materialize_repo_script(script_info)
+        self._running_button = button
+        self._execute_script_info(
+            {"name": str(button.label), "path": button.path}
+        )
 
+    def _execute_script_info(self, script_info: dict) -> None:
+        """O que já era o corpo de run_script, só que recebendo o dict
+        direto — usado tanto por clique normal quanto pela fila do manifesto."""
+        script_info = materialize_repo_script(script_info)
         dev_mode = is_dev_mode_enabled()
 
         if dev_mode:
@@ -125,7 +135,6 @@ class ScriptRunnerMixin:
             except (IOError, OSError):
                 pass
 
-        self._running_button = button
         self._running_script_info = script_info
         self._running_temp_path = temp_path
         self._running_dev_mode = dev_mode
@@ -141,6 +150,128 @@ class ScriptRunnerMixin:
                 "CACHE_DIR": os.environ.get("SCRIPT_DIR", "") + "/scripts",
             },
         )
+
+    def on_manifest_chosen(self, manifest_path: str | None) -> None:
+        if manifest_path is None:
+            return
+        self.notify("Carregando manifesto...", timeout=3)
+        self.run_worker(
+            lambda: self._classify_manifest(manifest_path),
+            thread=True,
+            exclusive=True,
+            name="manifest_classify",
+        )
+
+    def _classify_manifest(self, manifest_path: str) -> None:
+        import asyncio
+
+        from app.manifest_helper import (
+            check_flatpaks_async,
+            check_package_exists,
+            find_script_by_name,
+            load_manifest,
+        )
+
+        names = load_manifest(manifest_path)
+        if not names:
+            self.call_from_thread(
+                self.notify, "Manifesto vazio ou inválido.", severity="warning"
+            )
+            return
+
+        results = []
+        potential_flatpaks = []
+        items_to_check = []
+
+        for name in names:
+            script_info = find_script_by_name(name, translations)
+            if script_info is not None:
+                results.append(script_info)
+            elif name.count(".") >= 2:
+                potential_flatpaks.append(name)
+            else:
+                items_to_check.append(name)
+
+        packages_to_install = []
+        flatpaks_to_install = []
+
+        if potential_flatpaks:
+            exists_results = asyncio.run(
+                check_flatpaks_async(potential_flatpaks)
+            )
+            for name, exists in zip(potential_flatpaks, exists_results):
+                if exists:
+                    flatpaks_to_install.append(name)
+                elif check_package_exists(name):
+                    packages_to_install.append(name)
+
+        for name in items_to_check:
+            if check_package_exists(name):
+                packages_to_install.append(name)
+
+        if packages_to_install or flatpaks_to_install:
+            temp_path = self._build_packages_flatpaks_script(
+                packages_to_install, flatpaks_to_install
+            )
+            results.append(
+                {
+                    "name": translations.get(
+                        "packages_flatpaks", "Pacotes e Flatpaks"
+                    ),
+                    "path": temp_path,
+                    "is_script": True,
+                }
+            )
+
+        if not results:
+            self.call_from_thread(
+                self.notify,
+                "Nenhum item válido encontrado no manifesto.",
+                severity="warning",
+            )
+            return
+
+        self.call_from_thread(self._start_manifest_queue, results)
+
+    def _build_packages_flatpaks_script(
+        self, packages: list[str], flatpaks: list[str]
+    ) -> str:
+        import shlex
+        import tempfile
+
+        script_dir = resolve_script_dir()
+        lib_path = os.path.join(script_dir, "libs", "linuxtoys.bash")
+        packages_str = " ".join(shlex.quote(p) for p in packages)
+        flatpaks_str = " ".join(shlex.quote(f) for f in flatpaks)
+
+        script_content = f"""#!/bin/bash
+    source {shlex.quote(lib_path)}
+
+    _packages=({packages_str})
+    [ "${{#_packages[@]}}" -eq 0 ] || {{ sudo_rq; _install_; }}
+
+    _flatpaks=({flatpaks_str})
+    _flatpak_
+    """
+        tmp = tempfile.NamedTemporaryFile(delete=False, mode="w", suffix=".sh")
+        tmp.write(script_content)
+        tmp.close()
+        os.chmod(tmp.name, 0o700)
+        return tmp.name
+
+    def _start_manifest_queue(self, items: list[dict]) -> None:
+        self._manifest_queue = items
+        self._manifest_results = []
+        self._is_manifest_run = True
+        self._run_next_manifest_item()
+
+    def _run_next_manifest_item(self) -> None:
+        if not self._manifest_queue:
+            self._finish_manifest_run()
+            return
+        self._running_button = None
+        script_info = self._manifest_queue.pop(0)
+        self._execute_script_info(script_info)
 
     def run_uninstall(self, button: DescButton) -> None:
         script_info = {"name": str(button.label), "path": button.path}
@@ -192,6 +323,9 @@ class ScriptRunnerMixin:
         menu.display = True
 
     def on_script_finished(self, message: ScriptFinished) -> None:
+        if self._is_manifest_run:
+            self._on_manifest_item_finished(message)
+            return
         script_info = self._running_script_info or {}
         script_name = script_info.get("name", "o script")
         temp_path = self._running_temp_path
@@ -265,6 +399,36 @@ class ScriptRunnerMixin:
                     wants_report, script_name, exit_code, terminal_text
                 ),
             )
+
+    def _on_manifest_item_finished(self, message: ScriptFinished) -> None:
+        script_info = self._running_script_info or {}
+        script_name = script_info.get("name", "item desconhecido")
+        exit_code = message.exit_code
+        temp_path = self._running_temp_path
+        dev_mode = self._running_dev_mode
+        success = exit_code == 0
+
+        if not dev_mode:
+            if success:
+                _save_script_to_registry(script_name, TRANSMAP_PATH)
+                _cleanup_tmp_noram_dirs(TRANSMAP_PATH)
+            self._remove_transmap()
+        self._cleanup_temp_file(temp_path, dev_mode)
+
+        self._manifest_results.append(
+            {"name": script_name, "exit_code": exit_code, "success": success}
+        )
+        self._run_next_manifest_item()
+
+    def _finish_manifest_run(self) -> None:
+        self._hide_terminal()
+        results = self._manifest_results
+        self._is_manifest_run = False
+        self._manifest_queue = []
+        self._manifest_results = []
+        self._running_script_info = None
+        self._running_temp_path = None
+        self.app.push_screen(ManifestReportDialog(results))
 
     def _remove_transmap(self) -> None:
         try:
