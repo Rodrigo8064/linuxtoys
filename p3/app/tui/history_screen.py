@@ -1,4 +1,5 @@
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import (
@@ -18,8 +19,9 @@ from .my_widgets import FocusableLabel, HistoryListItem
 
 class HistoryScreen(Screen):
     BINDINGS = [
-        ("escape", "close_history", "Fechar"),
-        ("w", "app.pop_screen", "Voltar"),
+        Binding(
+            "escape", "close_history", translations.get("script_runner_close")
+        ),
     ]
 
     def __init__(self) -> None:
@@ -65,8 +67,12 @@ class HistoryScreen(Screen):
         yield Footer(show_command_palette=False)
 
     def on_mount(self) -> None:
-        self.query_one("#left-panel").border_title = "Scripts"
-        self.query_one("#right-panel").border_title = "Detalhes do registro"
+        self.query_one("#left-panel").border_title = translations.get(
+            "scripts_label"
+        )
+        self.query_one("#right-panel").border_title = translations.get(
+            "registry_details_label"
+        )
 
         list_view = self.query_one("#history-list", ListView)
         list_view.focus()
@@ -97,7 +103,7 @@ class HistoryScreen(Screen):
             list_view.index = 0
             self._display_script_details(filtered_names[0])
         else:
-            details.update("Nenhum script encontrado.")
+            details.update("No script found.")  # criar tradução
 
     def _display_script_details(self, script_name: str) -> None:
         executions = self.registry_data.get(script_name, [])

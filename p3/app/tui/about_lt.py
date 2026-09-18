@@ -80,7 +80,7 @@ class AboutScreen(Screen):
 
     def on_mount(self) -> None:
         self.query_one("#contributors-list").mount(
-            Static("Carregando colaboradores....")
+            Static("Loading contributors....")
         )
         self._load_contributors()
 
@@ -90,7 +90,7 @@ class AboutScreen(Screen):
         if event.button.id == "go-back":
             self.app.pop_screen()
 
-    def _get_compat_display_string(self):
+    def _get_compat_display_string(self) -> str:
         compat_keys = get_system_compat_keys()
         os_keys = [
             "debian",
@@ -147,7 +147,7 @@ class AboutScreen(Screen):
         container = self.query_one("#contributors-list")
         container.remove_children()
         if not contributors:
-            container.mount(Static("Nenhum colaborador encontrado."))
+            container.mount(Static("Unable to load contributors."))
             return
         for c in contributors:
             container.mount(Static(c.get("login", "?")))
@@ -155,9 +155,7 @@ class AboutScreen(Screen):
     def _show_contributors_error(self, exc: Exception) -> None:
         container = self.query_one("#contributors-list")
         container.remove_children()
-        container.mount(
-            Static(f"Não foi possível carregar colaboradores: {exc}")
-        )
+        container.mount(Static(f"Error loading contributors: {exc}"))
 
 
 class LicenseScreen(ModalScreen[None]):
@@ -166,7 +164,7 @@ class LicenseScreen(ModalScreen[None]):
         ("w", "app.pop_screen", "Voltar"),
     ]
 
-    def get_license_text(self):
+    def get_license_text(self) -> str:
         license_path = get_app_resource_path("../LICENSE")
         try:
             with open(license_path, "r", encoding="utf-8") as f:

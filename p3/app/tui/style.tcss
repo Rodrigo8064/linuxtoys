@@ -310,11 +310,18 @@ TextArea#bug-description {
     height: 1fr;
     background: $boost;
     border: none;
+    scrollbar-size-vertical: 1;
 }
 
-/* Opcional: Estilo suave para os itens da lista */
-LanguageListItem {
+#language-list ListItem {
+    width: 1fr;
+    overflow: hidden;
+}
+
+LanguageListItem Label {
   padding: 0 1;
+  width: 1fr;
+  text-overflow: ellipsis;
 }
 
 /* Fundo escurecido da Modal */
