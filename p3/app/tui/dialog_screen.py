@@ -1,9 +1,11 @@
 from textual import on, work
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
+    Footer,
     Input,
     Label,
     ListView,
@@ -28,8 +30,7 @@ class ConfirmScriptScreen(ModalScreen[bool]):
     dois botões: Cancelar e Executar. Retorna True/False via dismiss()."""
 
     BINDINGS = [
-        ("escape", "cancel", "Cancelar"),
-        ("w", "app.pop_screen", "Voltar"),
+        Binding("escape", "cancel", translations.get("script_runner_close"))
     ]
 
     def __init__(self, name: str, description: str) -> None:
@@ -48,6 +49,7 @@ class ConfirmScriptScreen(ModalScreen[bool]):
                     variant="error",
                 )
                 yield Button("Executar", id="execute-btn", variant="success")
+            yield Footer()
 
     def on_mount(self) -> None:
         self.query_one("#confirm-description").border_title = "Descrição"
@@ -66,8 +68,7 @@ class RemoveScriptScreen(ModalScreen[bool]):
     dois botões: Cancelar e Executar. Retorna True/False via dismiss()."""
 
     BINDINGS = [
-        ("escape", "cancel", "Cancelar"),
-        ("w", "app.pop_screen", "Voltar"),
+        Binding("escape", "cancel", translations.get("script_runner_close"))
     ]
 
     def __init__(self, name: str, description: str) -> None:
@@ -86,6 +87,7 @@ class RemoveScriptScreen(ModalScreen[bool]):
                     variant="error",
                 )
                 yield Button("Remover", id="execute-btn", variant="success")
+            yield Footer()
 
     def on_mount(self) -> None:
         self.query_one("#confirm-description").border_title = "Descrição"
@@ -103,8 +105,7 @@ class SuccessDialog(ModalScreen[None]):
     """Diálogo exibido quando um script termina com exit code 0."""
 
     BINDINGS = [
-        ("escape", "cancel", "Fechar"),
-        ("w", "app.pop_screen", "Voltar"),
+        Binding("escape", "cancel", translations.get("script_runner_close"))
     ]
 
     def __init__(self, script_name: str, action: str = "instalado") -> None:
@@ -117,6 +118,7 @@ class SuccessDialog(ModalScreen[None]):
             yield Label(f"'{self.script_name}' foi {self.action} com sucesso.")
             with Horizontal(id="confirm-buttons"):
                 yield Button("Concluir", id="execute-btn", variant="success")
+            yield Footer()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "execute-btn":
@@ -132,8 +134,7 @@ class ErrorDialog(ModalScreen[bool]):
     dismiss() se o usuário pediu pra reportar o bug, False caso contrário."""
 
     BINDINGS = [
-        ("escape", "cancel", "Fechar"),
-        ("w", "app.pop_screen", "Voltar"),
+        Binding("escape", "cancel", translations.get("script_runner_close"))
     ]
 
     def __init__(
@@ -155,6 +156,7 @@ class ErrorDialog(ModalScreen[bool]):
                 yield Button(
                     "Reportar Bug", id="report-bug", variant="warning"
                 )
+        yield Footer()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(event.button.id == "report-bug")
@@ -169,8 +171,7 @@ class SudoPasswordScreen(ModalScreen[str | None]):
     Retorna a senha via dismiss(), ou None se cancelado."""
 
     BINDINGS = [
-        ("escape", "cancel", "Cancelar"),
-        ("w", "app.pop_screen", "Voltar"),
+        Binding("escape", "cancel", translations.get("script_runner_close"))
     ]
 
     def __init__(
@@ -200,6 +201,7 @@ class SudoPasswordScreen(ModalScreen[str | None]):
                     variant="error",
                 )
                 yield Button("Confirmar", id="confirm-btn", variant="success")
+        yield Footer()
 
     def on_mount(self) -> None:
         self.query_one("#sudo-password-input", Input).focus()
@@ -229,8 +231,7 @@ class CancelledDialog(ModalScreen[None]):
     cancelar o prompt de senha, seja gerado pelo próprio script)."""
 
     BINDINGS = [
-        ("escape", "cancel", "Fechar"),
-        ("w", "app.pop_screen", "Voltar"),
+        Binding("escape", "cancel", translations.get("script_runner_close"))
     ]
 
     def __init__(self, script_name: str) -> None:
@@ -246,6 +247,7 @@ class CancelledDialog(ModalScreen[None]):
                     id="execute-btn",
                     variant="primary",
                 )
+        yield Footer()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "execute-btn":
@@ -257,8 +259,7 @@ class CancelledDialog(ModalScreen[None]):
 
 class ReportBugDialog(ModalScreen[bool]):
     BINDINGS = [
-        ("escape", "cancel", "Fechar"),
-        ("w", "app.pop_screen", "Voltar"),
+        Binding("escape", "cancel", translations.get("script_runner_close"))
     ]
 
     def compose(self) -> ComposeResult:
@@ -306,6 +307,7 @@ class ReportBugDialog(ModalScreen[bool]):
                     id="execute-btn-bug",
                     variant="primary",
                 )
+        yield Footer()
 
     @on(Button.Pressed, "#cancel-btn-bug")
     def handle_cancel(self) -> None:
@@ -383,8 +385,7 @@ class ReportBugDialog(ModalScreen[bool]):
 
 class LanguageSelectorDialog(ModalScreen[str | None]):
     BINDINGS = [
-        ("escape", "cancel", "Fechar"),
-        ("w", "app.pop_screen", "Voltar"),
+        Binding("escape", "cancel", translations.get("script_runner_close"))
     ]
 
     def compose(self) -> ComposeResult:
@@ -419,6 +420,7 @@ class LanguageSelectorDialog(ModalScreen[str | None]):
                     id="execute-btn-bug",
                     variant="primary",
                 )
+        yield Footer()
 
     @on(Button.Pressed, "#cancel-btn-bug")
     def handle_cancel(self) -> None:
