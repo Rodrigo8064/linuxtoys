@@ -1,16 +1,15 @@
 import requests
-from rich_pixels import Pixels
 from textual import work
 from textual.app import ComposeResult
-from textual.containers import Center, Horizontal, Vertical, VerticalScroll
-from textual.screen import ModalScreen, Screen
+from textual.binding import Binding
+from textual.containers import Vertical, VerticalScroll
+from textual.screen import ModalScreen
 from textual.widgets import (
-    Button,
     Footer,
-    Header,
-    Link,
     Rule,
     Static,
+    TabbedContent,
+    TabPane,
 )
 
 from app import get_app_resource_path
@@ -18,64 +17,70 @@ from app.compat import get_system_compat_keys
 from app.updater import __version__
 
 from .helper import translations
-from .my_widgets import FocusableLabel
 
 
-class AboutScreen(Screen):
+class AboutScreen(ModalScreen[None]):
     BINDINGS = [
-        ("escape", "app.pop_screen", "Voltar"),
-        ("w", "app.pop_screen", "Voltar"),
+        Binding(
+            "escape", "app.pop_screen", translations.get("script_runner_close")
+        ),
     ]
 
     def compose(self) -> ComposeResult:
         compat_display = self._get_compat_display_string()
 
-        yield Header()
-        with Vertical(classes="home"):
-            yield Static(
-                Pixels.from_image_path(
-                    "app/icons/linuxtoys_tui.png", resize=(40, 40)
-                ),
-                id="logo",
-            )
-            yield Static("[bold]LinuxToys[/bold]")
-            yield Static(compat_display)
-            yield Static(
-                translations.get(
-                    "subtitle",
-                    "A collection of tools for Linux in a user-friendly way.",
-                )
-            )
-            yield Rule()
-            yield Static("[bold]Victor 'psygreg' Gregory[/bold]")
-            yield Static(translations.get("project_lead", "Project Lead"))
-            yield Rule()
-            yield Static(
-                f"[bold]{translations.get('contributors_label', 'Contributors')}[/bold]"
-            )
-            yield Vertical(id="contributors-list", classes="contributors-grid")
-            with Center():
-                yield Button(
-                    label=translations.get("license_tab", "License"),
-                    id="license",
-                )
-                yield Button(label="voltar", variant="primary", id="go-back")
+        with Vertical(id="about-container"):
+            with TabbedContent(initial="about"):
+                with TabPane(
+                    translations.get("about_tab", "About"),
+                    id="about",
+                ):
+                    with VerticalScroll(classes="about-scroll"):
+                        # logo and info
+                        with Vertical(classes="profile-text"):
+                            yield Static(
+                                "[bold]LinuxToys[/bold]",
+                            )
+                            yield Static(compat_display)
+                            yield Static(
+                                translations.get(
+                                    "subtitle",
+                                    "A collection of tools for Linux in a user-friendly way.",
+                                ),
+                            )
 
-        with Horizontal(classes="home-links"):
-            yield Link(" Wiki", url="https://linux.toys/knowledgebase.html")
-            yield FocusableLabel(
-                f" [u]{translations.get('report_label', 'Report Bug')}[/u]",
-                id="report-bug",
-                classes="report-bug",
-            )
-            yield Link(
-                f" {translations.get('credits_label', 'Credits')}",
-                url="https://linux.toys/credits.html",
-            )
-            yield Link(
-                f" {translations.get('support_footer', 'Support this project')}",
-                url="https://ko-fi.com/psygreg",
-            )
+                        yield Rule()
+                        # Autor
+                        with Vertical(classes="profile-text"):
+                            yield Static(
+                                "[bold]Victor 'psygreg' Gregory[/bold]"
+                            )
+                            yield Static(
+                                translations.get(
+                                    "project_lead", "Project Lead"
+                                )
+                            )
+
+                        yield Rule()
+
+                        # contributors grid
+                        with Vertical(classes="section-title"):
+                            yield Static(
+                                f"[bold]{translations.get('contributors_label', 'Contributors')}[/bold]",
+                            )
+                        yield Vertical(
+                            id="contributors-list",
+                            classes="contributors-grid",
+                        )
+                with TabPane(
+                    translations.get("license_tab", "License"), id="license"
+                ):
+                    license_text = self.get_license_text()
+                    with VerticalScroll(id="license-scroll"):
+                        yield Static(
+                            content=license_text, classes="license-text"
+                        )
+
         yield Footer()
 
     def on_mount(self) -> None:
@@ -83,12 +88,6 @@ class AboutScreen(Screen):
             Static("Loading contributors....")
         )
         self._load_contributors()
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "license":
-            self.app.push_screen(LicenseScreen())
-        if event.button.id == "go-back":
-            self.app.pop_screen()
 
     def _get_compat_display_string(self) -> str:
         compat_keys = get_system_compat_keys()
@@ -157,13 +156,6 @@ class AboutScreen(Screen):
         container.remove_children()
         container.mount(Static(f"Error loading contributors: {exc}"))
 
-
-class LicenseScreen(ModalScreen[None]):
-    BINDINGS = [
-        ("escape", "app.pop_screen", "Voltar"),
-        ("w", "app.pop_screen", "Voltar"),
-    ]
-
     def get_license_text(self) -> str:
         license_path = get_app_resource_path("../LICENSE")
         try:
@@ -171,11 +163,3 @@ class LicenseScreen(ModalScreen[None]):
                 return f.read()
         except Exception as e:
             return f"Error loading license. {e}"
-
-    def compose(self) -> ComposeResult:
-        license_text = self.get_license_text()
-        yield Header()
-        with Horizontal(id="home"):
-            with VerticalScroll(id="hello"):
-                yield Static(content=license_text, classes="hello")
-        yield Footer()
