@@ -96,7 +96,7 @@ class ScriptRunnerMixin:
         items = get_scripts_for_category(
             button.path, translations=translations
         )
-        left_panel = self.query_one("#left-panel", VerticalScroll)
+        left_panel = self.query_one("#left-panel-home", VerticalScroll)
         await left_panel.remove_children()
         registry_data = parse_registry_file()
         for item in items:

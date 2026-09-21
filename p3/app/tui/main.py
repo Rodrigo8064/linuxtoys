@@ -1,6 +1,9 @@
+from rich.text import Text
 from textual import on
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.screen import Screen
 from textual.widgets import (
     Button,
     Footer,
@@ -10,6 +13,7 @@ from textual.widgets import (
     Link,
     ListItem,
     ListView,
+    Rule,
     Static,
 )
 
@@ -29,41 +33,45 @@ from .helper import (
     search_scripts,
     translations,
 )
-from .history_screen import HistoryOpenerMixin, HistoryScreen
 from .manifest_dialog import ManifestDialog
 from .my_widgets import (
     DescButton,
     FocusableLabel,
     Terminal,
 )
+from .registry_screen import RegistryOpenerMixin, RegistryScreen
 
 
-class LinuxToys(ScriptRunnerMixin, HistoryOpenerMixin, App):
+class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
     """main screen for linuxtoys TUI"""
 
     CSS_PATH = "style.tcss"
 
     BINDINGS = [
-        ("q", "quit", "Sair"),
-        ("tab", "focus_next", "Navegar"),
-        ("shift+tab", "focus_previous", "Anterior"),
-        ("h", "reset_to_home", "Home"),
+        Binding("q", "quit", "Sair"),
+        Binding("tab", "app.focus_next", "Navegar"),
+        Binding("shift+tab", "app.focus_previous", "Anterior"),
+        Binding("h", "reset_to_home", "Home"),
+        Binding("f1", "noop", "🔴 Uninstall   🟡 New", key_display=" "),
     ]
+
+    def action_noop(self) -> None:
+        """Empty action for purely informational captions in the footer."""
 
     def compose(self) -> ComposeResult:
         categories = load_categories(translations)
         yield Header(icon="")
 
-        with Horizontal(id="body"):
+        with Horizontal(id="body-home"):
             # left panel widgets
-            with Vertical(id="left-column"):
+            with Vertical(id="left-column-home"):
                 yield Input(
                     placeholder=translations.get(
                         "search_placeholder", "Search features"
                     ),
                     id="search-input",
                 )
-                with VerticalScroll(id="left-panel"):
+                with VerticalScroll(id="left-panel-home"):
                     registry_data = parse_registry_file()
                     for item in categories:
                         yield DescButton(
@@ -124,15 +132,18 @@ class LinuxToys(ScriptRunnerMixin, HistoryOpenerMixin, App):
 
         with Horizontal(classes="home-links"):
             yield Link(" Wiki", url="https://linux.toys/documentation.html")
+            yield Static("│", classes="link-sep")
             yield FocusableLabel(
                 f" [u]{translations.get('report_label', 'Report Bug')}[/u]",
                 id="report-bug",
                 classes="report-bug",
             )
+            yield Static("│", classes="link-sep")
             yield Link(
                 f" {translations.get('devportal_label', 'Credits')}",
                 url="https://dev.linux.toys",
             )
+            yield Static("│", classes="link-sep")
             yield Link(
                 f" {translations.get('support_footer', 'Support this project')}",
                 url="https://ko-fi.com/psygreg",
@@ -142,7 +153,7 @@ class LinuxToys(ScriptRunnerMixin, HistoryOpenerMixin, App):
 
     def on_mount(self) -> None:
         self.query_one("#terminal-conteiner").display = False
-        self.query_one("#left-panel").border_title = "Categorias/Scripts"
+        self.query_one("#left-panel-home").border_title = "Categorias/Scripts"
         self.query_one("#menu-panel").border_title = "Menu"
         self.run_worker(
             get_search_index,
@@ -153,7 +164,7 @@ class LinuxToys(ScriptRunnerMixin, HistoryOpenerMixin, App):
 
     @on(FocusableLabel.Pressed, "#report-bug")
     def handle_report_bug(self) -> None:
-        self.push_screen(ReportBugDialog())
+        self.app.push_screen(ReportBugDialog())
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         """Check if the pressed button is a DescButton instance
@@ -168,7 +179,7 @@ class LinuxToys(ScriptRunnerMixin, HistoryOpenerMixin, App):
         if event.item.id == "about":
             self.app.push_screen(AboutScreen())
         if event.item.id == "registry":
-            self.app.push_screen(HistoryScreen())
+            self.app.push_screen(RegistryScreen())
         if event.item.id == "scripts_resync":
             self._start_scripts_resync()
         if event.item.id == "language":
@@ -188,7 +199,7 @@ class LinuxToys(ScriptRunnerMixin, HistoryOpenerMixin, App):
     async def _filter_scripts(self, query: str) -> None:
         categories = load_categories(translations)
         query = query.strip().lower()
-        left_panel = self.query_one("#left-panel", VerticalScroll)
+        left_panel = self.query_one("#left-panel-home", VerticalScroll)
         await left_panel.remove_children()
         items = categories if not query else search_scripts(query)
         registry_data = parse_registry_file()
@@ -208,7 +219,7 @@ class LinuxToys(ScriptRunnerMixin, HistoryOpenerMixin, App):
 
     async def action_reset_to_home(self) -> None:
         categories = load_categories(translations)
-        left_panel = self.query_one("#left-panel", VerticalScroll)
+        left_panel = self.query_one("#left-panel-home", VerticalScroll)
         await left_panel.remove_children()
         registry_data = parse_registry_file()
         for item in categories:
@@ -245,10 +256,10 @@ class LinuxToys(ScriptRunnerMixin, HistoryOpenerMixin, App):
 
         def progress(key: str) -> None:
             message = translations.get(key, key)
-            self.call_from_thread(self.notify, message, timeout=3)
+            self.app.call_from_thread(self.notify, message, timeout=3)
 
         success = force_update_scripts(progress_callback=progress)
-        self.call_from_thread(self._on_scripts_resync_done, success)
+        self.app.call_from_thread(self._on_scripts_resync_done, success)
 
     def _on_scripts_resync_done(self, success: bool) -> None:
         if success:
@@ -355,6 +366,15 @@ class LinuxToys(ScriptRunnerMixin, HistoryOpenerMixin, App):
                 url="https://ko-fi.com/psygreg",
             )
         )
+
+
+class LinuxToys(ScriptRunnerMixin, RegistryOpenerMixin, App):
+    """enter for linuxtoys TUI"""
+
+    CSS_PATH = "style.tcss"
+
+    def on_mount(self) -> None:
+        self.push_screen(HomeScreen())
 
 
 if __name__ == "__main__":
