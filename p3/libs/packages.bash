@@ -13,7 +13,7 @@ pacman_lock_guard () {
             die "Another package operation is in progress (pacman is running). Please wait for it to finish, or close it manually and retry."
         else
             warn "Stale pacman lock detected. Removing /var/lib/pacman/db.lck"
-            { { [ "$UPD_SERVICE" = "1" ] && rm -f /var/lib/pacman/db.lck; } || sudo rm -f /var/lib/pacman/db.lck; } || die "Failed to remove stale lock. Run: sudo rm /var/lib/pacman/db.lck"
+            { { [ "$UPD_SERVICE" = "1" ] && rm -f /var/lib/pacman/db.lck; } || sudo_ rm -f /var/lib/pacman/db.lck; } || die "Failed to remove stale lock. Run: sudo_ rm /var/lib/pacman/db.lck"
         fi
     fi
 }
@@ -22,18 +22,18 @@ interrupted_apt_guard () {
 
     if [ -n "$(dpkg --audit 2>/dev/null)" ]; then
         info "An interrupted package operation was detected. Attempting recovery..."
-        { { [ "$UPD_SERVICE" = "1" ] && dpkg --configure -a; } || sudo dpkg --configure -a; } || \
+        { { [ "$UPD_SERVICE" = "1" ] && dpkg --configure -a; } || sudo_ dpkg --configure -a; } || \
             die "Failed to recover interrupted dpkg operation. Manual user intervention required."
         needs_repair=1
     fi
-    if ! { { [ "$UPD_SERVICE" = "1" ] && apt-get check; } || sudo apt-get check; } >/dev/null 2>&1; then
+    if ! { { [ "$UPD_SERVICE" = "1" ] && apt-get check; } || sudo_ apt-get check; } >/dev/null 2>&1; then
         info "Broken package dependencies were detected. Attempting recovery..."
         needs_repair=1
     fi
 
     if [ "$needs_repair" -eq 1 ]; then
         { { [ "$UPD_SERVICE" = "1" ] && apt-get --fix-broken install -y; } ||
-            sudo apt-get --fix-broken install -y; } || die "Failed to fix broken packages. Manual user intervention required."
+            sudo_ apt-get --fix-broken install -y; } || die "Failed to fix broken packages. Manual user intervention required."
         apt-get check >/dev/null 2>&1 || die "Package dependencies remain broken. Manual user intervention required."
     fi
 }
@@ -93,22 +93,23 @@ pkg_install () {
     [[ ${#pkg_found[@]} -gt 0 ]] && echo "Packages ${pkg_found[*]} already installed, skipping."
     [[ ${#pkg_notfound[@]} -eq 0 ]] && return 0
     local to_install="${pkg_notfound[*]}"
+    askpass
     runner_lock "package-transaction"
     if is_debian || is_ubuntu; then
         interrupted_apt_guard
-        sudo apt-get install -y "${pkg_notfound[@]}" || fatal "Failed to install $to_install"
+        sudo_ apt-get install -y "${pkg_notfound[@]}" || fatal "Failed to install $to_install"
         [[ $_ignore_appends -eq 0 ]] && _append_transmap "pkg $to_install"
     elif is_arch || is_cachy || is_manjaro; then
         if ! is_manjaro; then
             if ! pacman-conf --repo-list 2>/dev/null | grep -qx 'extra'; then
                 prep_edit /etc/pacman.conf
                 printf '\n[extra]\nInclude = /etc/pacman.d/mirrorlist\n' |
-                    sudo tee -a /etc/pacman.conf >/dev/null
+                    sudo_ tee -a /etc/pacman.conf >/dev/null
             fi
             # fix #1255
             if [[ ! -e /var/lib/pacman/sync/extra.db ]]; then
                 pacman_lock_guard
-                sudo pacman -Sy --noconfirm || die "Failed to synchronize package databases"
+                sudo_ pacman -Sy --noconfirm || die "Failed to synchronize package databases"
             fi
         fi
         local _pacman_pkgs=()
@@ -126,11 +127,11 @@ pkg_install () {
         # check for lock before installing
         if [ -n "$to_install_pacman" ]; then
             if is_manjaro; then
-                sudo pamac install --no-confirm "${_pacman_pkgs[@]}" || fatal "Failed to install $to_install_pacman"
+                sudo_ pamac install --no-confirm "${_pacman_pkgs[@]}" || fatal "Failed to install $to_install_pacman"
                 [[ $_ignore_appends -eq 0 ]] && _append_transmap "pkg $to_install_pacman"
             else
                 pacman_lock_guard
-                sudo pacman -S --noconfirm "${_pacman_pkgs[@]}" || fatal "Failed to install $to_install_pacman"
+                sudo_ pacman -S --noconfirm "${_pacman_pkgs[@]}" || fatal "Failed to install $to_install_pacman"
                 [[ $_ignore_appends -eq 0 ]] && _append_transmap "pkg $to_install_pacman"
             fi
         fi
@@ -140,6 +141,7 @@ pkg_install () {
                 pamac build --no-confirm "${_paru_pkgs[@]}" || die "Failed to install $to_install_paru"
                 runner_lock "package-transaction"
             else
+                runner_unlock
                 if ! command -v paru &>/dev/null; then
                     if question "Installer" "$msg305" 300 300; then
                         if pacman -Si paru &>/dev/null; then
@@ -152,20 +154,17 @@ pkg_install () {
                     fi
                 fi
                 if ! paru --version >/dev/null 2>&1; then # handle broken paru compiled against different libs, fix #1196
-                    runner_unlock
                     info "$parumsg"
                     call_script paru || die "Failed to repair paru"
                     paru --version >/dev/null 2>&1 || die "Paru is still unusable after reinstalling it"
-                    runner_lock "package-transaction"
                 fi
-                runner_unlock
                 paru -S -a --noconfirm --skipreview "${_paru_pkgs[@]}" || die "Failed to install $to_install_paru"
                 [[ $_ignore_appends -eq 0 ]] && _append_transmap "pkg $to_install_paru"
                 runner_lock "package-transaction"
             fi
         fi
     elif is_ostree; then
-        sudo rpm-ostree install "${pkg_notfound[@]}" || fatal "Failed to install $to_install"
+        sudo_ rpm-ostree install "${pkg_notfound[@]}" || fatal "Failed to install $to_install"
         [[ $_ignore_appends -eq 0 ]] && _append_transmap "pkg $to_install"
         # Perform ostree check if requested and packages were actually installed
         if [[ $_ostreecheck -eq 1 && ${#pkg_notfound[@]} -gt 0 ]]; then
@@ -174,16 +173,16 @@ pkg_install () {
         fi
     elif is_fedora || is_rhel; then
         if [[ $_allowerasing -eq 1 ]]; then
-            sudo dnf install -y --allowerasing "${pkg_notfound[@]}" || die "Failed to install $to_install"
+            sudo_ dnf install -y --allowerasing "${pkg_notfound[@]}" || die "Failed to install $to_install"
         else
-            sudo dnf install -y "${pkg_notfound[@]}" || die "Failed to install $to_install"
+            sudo_ dnf install -y "${pkg_notfound[@]}" || die "Failed to install $to_install"
         fi
         [[ $_ignore_appends -eq 0 ]] && _append_transmap "pkg $to_install"
     elif is_suse; then
-        sudo zypper in -y "${pkg_notfound[@]}" || fatal "Failed to install $to_install"
+        sudo_ zypper in -y "${pkg_notfound[@]}" || fatal "Failed to install $to_install"
         [[ $_ignore_appends -eq 0 ]] && _append_transmap "pkg $to_install"
     elif is_solus; then
-        sudo eopkg it -y "${pkg_notfound[@]}" || fatal "Failed to install $to_install"
+        sudo_ eopkg it -y "${pkg_notfound[@]}" || fatal "Failed to install $to_install"
         [[ $_ignore_appends -eq 0 ]] && _append_transmap "pkg $to_install"
     fi
     runner_unlock
@@ -217,6 +216,10 @@ pkg_flat() {
     done
     if ! command -v flatpak &>/dev/null || ! flatpak remote-list | grep -q flathub; then
         call_script flathub
+        # Installing Flatpak or adding Flathub changes the AppStream source universe.
+        # Keep the last completed catalog usable, but force the next AppStream check
+        # to rebuild it against the newly available source.
+        rm -f "$HOME/.cache/linuxtoys/appstream/state.json"
     fi
     local flatpak_scope="--user"
     if [[ $_skip_user -eq 1 ]]; then
@@ -246,7 +249,7 @@ pkg_flat() {
                 }
             else
                 flatpak install --or-update "$flatpak_scope" -y flathub "$arg" 2>/dev/null || {
-                    sudo_rq && sudo flatpak install --or-update "$flatpak_scope" -y flathub "$arg"
+                    sudo_ flatpak install --or-update "$flatpak_scope" -y flathub "$arg"
                 } || {
                     rm -f "$_runtime_before"
                     fatal "Failed to install flatpak package $arg"
@@ -274,7 +277,7 @@ pkg_flat() {
                 fatal "Failed to install flatpak packages ${_flatpak_normal[*]}"
         else
             flatpak install --or-update "$flatpak_scope" -y flathub "${_flatpak_normal[@]}" 2>/dev/null || \
-                { sudo_rq && sudo flatpak install --or-update "$flatpak_scope" -y flathub "${_flatpak_normal[@]}"; } || \
+                { sudo_ flatpak install --or-update "$flatpak_scope" -y flathub "${_flatpak_normal[@]}"; } || \
                 fatal "Failed to install flatpak packages ${_flatpak_normal[*]}"
         fi
 
@@ -307,15 +310,12 @@ pkg_fromfile () {
     # Use filtered args for the rest of the function
     set -- "${_filtered_args[@]}"
 
-    # Native package files require elevation. Authenticate before engaging the
-    # runner lock, otherwise the terminal input lock can block the sudo prompt.
-    [[ "$1" != *.flatpak ]] && askpass
+    [[ "$1" == *.flatpak ]] || askpass
     runner_lock "package-transaction"
 
     if [[ "$1" == *.flatpak ]]; then
         if ! command -v flatpak &>/dev/null || ! flatpak remote-list | grep -q flathub; then
             summon_helpers
-            sudo_rq
             flatpak_in_lib
         fi
         local flatpak_file="$1"
@@ -354,7 +354,7 @@ pkg_fromfile () {
             askpass
             runner_lock "package-transaction"
             _flatpak_stderr=$(
-                sudo flatpak install --or-update --system --noninteractive "$flatpak_file" 2>&1 >/dev/null
+                sudo_ flatpak install --or-update --system --noninteractive "$flatpak_file" 2>&1 >/dev/null
             ) || {
                 [[ -n "$_runtime_before" ]] && rm -f "$_runtime_before"
                 [[ -n "$_runtime_before_system" ]] && rm -f "$_runtime_before_system"
@@ -386,12 +386,12 @@ pkg_fromfile () {
     fi
 
     if is_debian || is_ubuntu; then
-        { sudo apt-get -o APT::Sandbox::User=root install -y "${@}" || sudo dpkg -i "${@}"; } || fatal "Failed to install $*"
+        { sudo_ apt-get -o APT::Sandbox::User=root install -y "${@}" || sudo_ dpkg -i "${@}"; } || fatal "Failed to install $*"
         _append_transmap "pkg file $*"
     elif { is_arch || is_cachy; } && ! is_manjaro; then
         # check for lock before installing local package
         pacman_lock_guard
-        if sudo pacman -U --noconfirm "${@}"; then
+        if sudo_ pacman -U --noconfirm "${@}"; then
             _append_transmap "pkg file $*"
         else
             if [ -f PKGBUILD ]; then
@@ -403,9 +403,9 @@ pkg_fromfile () {
             fi
         fi
     elif is_manjaro; then
-        { sudo pamac install --no-confirm "./${*}" && _append_transmap "pkg file $*"; } || fatal "Failed to install package $*"
+        { sudo_ pamac install --no-confirm "./${*}" && _append_transmap "pkg file $*"; } || fatal "Failed to install package $*"
     elif is_ostree; then
-        sudo rpm-ostree install "${@}" || fatal "Failed to install $*"
+        sudo_ rpm-ostree install "${@}" || fatal "Failed to install $*"
         _append_transmap "pkg file $*"
         # Perform ostree check if requested
         if [[ $_ostreecheck -eq 1 ]]; then
@@ -413,13 +413,13 @@ pkg_fromfile () {
             exit 100
         fi
     elif is_fedora || is_rhel; then
-        sudo dnf install -y "${@}" || fatal "Failed to install $*"
+        sudo_ dnf install -y "${@}" || fatal "Failed to install $*"
         _append_transmap "pkg file $*"
     elif is_suse; then
-        sudo zypper in -y "${@}" || fatal "Failed to install $*"
+        sudo_ zypper in -y "${@}" || fatal "Failed to install $*"
         _append_transmap "pkg file $*"
     elif is_solus; then
-        sudo eopkg it -y "${@}" || fatal "Failed to install $*"
+        sudo_ eopkg it -y "${@}" || fatal "Failed to install $*"
         _append_transmap "pkg file $*"
     fi
     runner_unlock
@@ -825,35 +825,32 @@ pkg_make () {
             steamos_build_packages+=("${build_dependencies[@]}")
         fi
 
-        askpass
-        command -v steamos-readonly >/dev/null 2>&1 || \
+                command -v steamos-readonly >/dev/null 2>&1 || \
             die "steamos-readonly is required for pkg_make on SteamOS"
 
         if steamos-readonly status 2>/dev/null | grep -qi 'enabled'; then
-            sudo steamos-readonly disable || die "Failed to disable SteamOS read-only mode"
+            sudo_ steamos-readonly disable || die "Failed to disable SteamOS read-only mode"
             steamos_readonly_toggled=1
         fi
 
         pacman_lock_guard
-        if ! sudo pacman -S --needed --noconfirm "${steamos_build_packages[@]}"; then
+        if ! sudo_ pacman -S --needed --noconfirm "${steamos_build_packages[@]}"; then
             if (( steamos_readonly_toggled )); then
-                sudo steamos-readonly enable || warn "Failed to restore SteamOS read-only mode after package installation failure"
+                sudo_ steamos-readonly enable || warn "Failed to restore SteamOS read-only mode after package installation failure"
             fi
             die "Failed to install SteamOS make build dependencies"
         fi
 
         if (( steamos_readonly_toggled )); then
-            sudo steamos-readonly enable || die "Failed to restore SteamOS read-only mode"
+            sudo_ steamos-readonly enable || die "Failed to restore SteamOS read-only mode"
             steamos_readonly_toggled=0
         fi
     else
         if ! command -v make >/dev/null 2>&1; then
-            askpass
-            pkg_install make
+                        pkg_install --ostreecheck make
         fi
         if (( ! uninstall && ${#build_dependencies[@]} > 0 )); then
-            askpass
-            pkg_install --ignore-appends "${build_dependencies[@]}"
+                        pkg_install --ostreecheck --ignore-appends "${build_dependencies[@]}"
         fi
     fi
 
@@ -1287,29 +1284,31 @@ pkg_remove () {
     [[ ${#pkg_found[@]} -eq 0 ]] && return 0
     local to_remove="${pkg_found[*]}"
 
+    # Manjaro uses pamac directly here; other native removals escalate.
+    is_manjaro || askpass
     runner_lock "package-transaction"
 
     if is_debian || is_ubuntu; then
-        sudo apt-get remove -y --allow-unauthenticated "${pkg_found[@]}" \
+        sudo_ apt-get remove -y --allow-unauthenticated "${pkg_found[@]}" \
             || fatal "Failed to remove packages: $to_remove"
     elif { is_arch || is_cachy; } && ! is_manjaro; then
         pacman_lock_guard
-        sudo pacman -Rsn --noconfirm "${pkg_found[@]}" \
+        sudo_ pacman -Rsn --noconfirm "${pkg_found[@]}" \
             || fatal "Failed to remove packages: $to_remove"
     elif is_manjaro; then
         pamac remove --no-confirm "${pkg_found[@]}" \
             || fatal "Failed to remove packages: $to_remove"
     elif is_ostree; then
-        sudo rpm-ostree uninstall "${pkg_found[@]}" \
+        sudo_ rpm-ostree uninstall "${pkg_found[@]}" \
             || fatal "Failed to remove packages: $to_remove"
     elif is_fedora || is_rhel; then
-        sudo dnf remove -y "${pkg_found[@]}" \
+        sudo_ dnf remove -y "${pkg_found[@]}" \
             || fatal "Failed to remove packages: $to_remove"
     elif is_suse; then
-        sudo zypper rm -y "${pkg_found[@]}" \
+        sudo_ zypper rm -y "${pkg_found[@]}" \
             || fatal "Failed to remove packages: $to_remove"
     elif is_solus; then
-        sudo eopkg rmf -y "${pkg_found[@]}" \
+        sudo_ eopkg rmf -y "${pkg_found[@]}" \
             || fatal "Failed to remove packages: $to_remove"
     fi
 
@@ -1318,6 +1317,27 @@ pkg_remove () {
     _append_transmap "pkg rm $to_remove"
 }
 pkg_rm () { pkg_remove "$@"; }
+
+_pkg_appimage_gearlever_previous () {
+    local app_name="${LINUXTOYS_APP_NAME:-}"
+    [[ -n "$app_name" ]] || return 0
+
+    flatpak run it.mijorus.gearlever --list-installed 2>/dev/null |
+        awk -v target="$app_name" '
+        {
+            # Gear Lever ends each record with the absolute AppImage path.
+            path = $NF
+
+            # Everything preceding " (" at the beginning is the app name.
+            line = $0
+            sub(/[[:space:]]+\([^)]*\).*/, "", line)
+
+            if (line == target) {
+                print path
+                exit
+            }
+        }'
+}
 
 _pkg_appimage_previous () {
     python3 - "${LINUXTOYS_SCRIPT_NAME:-}" <<'PY'
@@ -1378,21 +1398,37 @@ pkg_appimage () {
     done
     set -- "${appimage_inputs[@]}"
     previous_appimage=$(_pkg_appimage_previous) || die "Failed to identify installed AppImage"
+    # No LinuxToys-owned copy: look for an existing Gear Lever installation.
+    if [[ -z "$previous_appimage" && -n "${LINUXTOYS_APP_NAME:-}" ]] && is_systemd; then
+        local gearlever_path
+        gearlever_path=$(_pkg_appimage_gearlever_previous) || die "Failed to query Gear Lever AppImages"
+        if [[ -n "$gearlever_path" ]]; then
+            case "$gearlever_path" in
+                "$HOME/AppImages/"*) previous_appimage="${gearlever_path##*/}" ;;
+                *) die "Gear Lever returned an unexpected AppImage path: $gearlever_path" ;;
+            esac
+        fi
+    fi
     if [[ -n "$previous_appimage" ]]; then
         [[ $# -eq 1 ]] || die "Cannot map multiple new AppImages to one installed AppImage"
         [[ "$1" != "$(realpath -- "$HOME/AppImages/$previous_appimage")" ]] || die "Update input is the installed AppImage itself"
         pkg_appimage_rm --skip-appends "$previous_appimage" || die "Failed to remove previous AppImage: $previous_appimage"
     fi
 
-    ( is_ubuntu || is_debian ) && {
+    { is_ubuntu || is_debian; } && {
         if [ "$VERSION_CODENAME" = "bookworm" ]; then
-            pkg_install libfuse2  # workaround for debian 12
+            pkg_exists libfuse2
+            [[ ! ${#pkg_notfound[@]} -eq 0 ]] && {
+                pkg_install libfuse2  # workaround for debian 12
+            }
         else
-            if ! apt-cache --no-all-versions show libfuse2t64 >/dev/null 2>&1; then # probably forky/testing
-                sudo mkdir -p /etc/apt/preferences.d /etc/apt/sources.list.d # ensure directories exist
-                prep_create "/etc/apt/sources.list.d/linuxtoys-trixie-fuse.list" "/etc/apt/preferences.d/linuxtoys-trixie-fuse"
-                echo 'deb https://deb.debian.org/debian trixie main' | sudo tee /etc/apt/sources.list.d/linuxtoys-trixie-fuse.list >/dev/null
-                sudo tee /etc/apt/preferences.d/linuxtoys-trixie-fuse >/dev/null <<'EOF'
+            pkg_exists libfuse2
+            [[ ! ${#pkg_notfound[@]} -eq 0 ]] && {
+                                if ! apt-cache --no-all-versions show libfuse2t64 >/dev/null 2>&1; then # probably forky/testing
+                    sudo_ mkdir -p /etc/apt/preferences.d /etc/apt/sources.list.d # ensure directories exist
+                    prep_create "/etc/apt/sources.list.d/linuxtoys-trixie-fuse.list" "/etc/apt/preferences.d/linuxtoys-trixie-fuse"
+                    echo 'deb https://deb.debian.org/debian trixie main' | sudo_ tee /etc/apt/sources.list.d/linuxtoys-trixie-fuse.list >/dev/null
+                    sudo_ tee /etc/apt/preferences.d/linuxtoys-trixie-fuse >/dev/null <<'EOF'
 Package: *
 Pin: release n=trixie
 Pin-Priority: -1
@@ -1401,18 +1437,29 @@ Package: libfuse2t64
 Pin: release n=trixie
 Pin-Priority: 990
 EOF
-            fi
-            pkg_install libfuse2t64;
+                fi
+                pkg_install libfuse2t64;
+            }
         fi
     }
-    { ( is_fedora || is_ostree || is_rhel ) && pkg_install fuse; }
-    { ( is_arch || is_cachy || is_solus ) && pkg_install fuse2; }
+    { is_fedora || is_ostree || is_rhel; } && {
+        pkg_exists fuse
+        [[ ! ${#pkg_notfound[@]} -eq 0 ]] && {
+            pkg_install --ostreecheck fuse;
+        }
+    }
+    { is_arch || is_cachy || is_solus; } && {
+        pkg_exists fuse
+        [[ ! ${#pkg_notfound[@]} -eq 0 ]] && {
+            pkg_install fuse2;
+        }
+    }
     prep_dir "$HOME/AppImages"
 
     # Prefer Gear Lever on systemd systems. If it cannot inspect/integrate an
     # otherwise valid AppImage, fall back to LinuxToys' own simple integration.
     if is_systemd; then
-        if ! flatpak list | grep "it.mijorus.gearlever"; then
+        if ! flatpak list | grep -q "it.mijorus.gearlever"; then
             info "$gearlevermsg"
             call_script GEAR_LEVER
         fi
@@ -1497,7 +1544,6 @@ pkg_appimage_rm () {
 
 pkg_npm () {
     if ! command -v npm &>/dev/null; then
-        sudo_rq
         { ( is_ubuntu || is_debian || is_suse ) && pkg_install npm; }
         { ( is_fedora || is_ostree ) && pkg_install nodejs-npm; }
         { ( is_rhel ) && rpmfusion_chk && pkg_install nodejs-npm; }
@@ -1538,7 +1584,7 @@ pkg_npm () {
     done
     for pkg in "${packages[@]}"; do
         if ! npm list -g "$pkg" &>/dev/null; then
-            { npm install -g "${flags[@]}" "$pkg" 2>/dev/null || ( sudo_rq && sudo npm install -g "${flags[@]}" "$pkg" ) } || fatal "Failed to install npm package $pkg"
+            { npm install -g "${flags[@]}" "$pkg" 2>/dev/null || sudo_ npm install -g "${flags[@]}" "$pkg"; } || fatal "Failed to install npm package $pkg"
             _append_transmap "npm $pkg"
         fi
     done
@@ -1546,7 +1592,6 @@ pkg_npm () {
 
 pkg_bun () {
     if ! command -v bun &>/dev/null; then
-        sudo_rq
         { curl -fsSL https://bun.sh/install | bash; } || fatal "Failed to install bun"
     else
         bun upgrade

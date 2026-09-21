@@ -170,6 +170,14 @@ askpass() {
     esac
 }
 
+
+# Privileged command wrapper. Library helpers should use sudo_ instead of calling
+# askpass directly: authentication is validated immediately before escalation.
+sudo_() {
+    askpass sudo || return $?
+    command sudo "$@"
+}
+
 # Unified message handler
 _msg() {
     local type="$1"
@@ -406,7 +414,7 @@ call_script () {
 
     if [[ -n "$found_script" && -f "$found_script" ]]; then
         python3 "$SCRIPT_DIR/app/compat.py" --check-script "$found_script" || {
-            echo "W: call_script: Script '$script_name' is not compatible with this host, skipping."
+            echo "'$script_name' is not compatible with this host, skipping. This is not an error."
             return 2
         }
 

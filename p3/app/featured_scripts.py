@@ -1,3 +1,5 @@
+import json
+import os
 import random
 
 from .gtk_common import Gdk, GLib
@@ -12,6 +14,140 @@ class FeaturedCtl:
     FEATURED_MAX_ROWS = 10
     FEATURED_RESIZE_DEBOUNCE_MS = 150
     FEATURED_SWAP_ANIMATION_MS = 180
+
+    SENSE_HISTORY_LIMIT = 2
+    SENSE_PERSONALIZED_PERCENT = 80
+
+    @staticmethod
+    def _sense_file_path():
+        return os.path.expanduser("~/.cache/linuxtoys/sense")
+
+    def _load_featured_sense(self):
+        """Load the previous session's most recently entered categories."""
+        self._featured_sensed_categories = []
+        try:
+            with open(self._sense_file_path(), "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, ValueError, TypeError):
+            return
+
+        if not isinstance(data, list):
+            return
+
+        seen = set()
+        for value in data:
+            value = str(value or "").strip()
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            self._featured_sensed_categories.append(value)
+            if len(self._featured_sensed_categories) >= self.SENSE_HISTORY_LIMIT:
+                break
+
+    def _record_featured_category(self, category_info):
+        """Remember a category in RAM; persistence happens only during shutdown."""
+        if not category_info or category_info.get("is_script"):
+            return
+        category_path = str(category_info.get("path", "") or "").strip()
+        if not category_path:
+            return
+        category_path = os.path.abspath(category_path)
+
+        history = list(getattr(self, "_featured_sensed_categories", ()))
+        history = [path for path in history if path != category_path]
+        history.insert(0, category_path)
+        self._featured_sensed_categories = history[: self.SENSE_HISTORY_LIMIT]
+
+    def _save_featured_sense(self):
+        """Persist category sense once, when LinuxToys is closing."""
+        history = list(getattr(self, "_featured_sensed_categories", ()))[: self.SENSE_HISTORY_LIMIT]
+        path = self._sense_file_path()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(history, handle, ensure_ascii=False)
+                handle.write("\n")
+        except OSError as error:
+            print(f"Warning: Could not save Featured sense data: {error}")
+
+    def _personalized_featured_category_paths(self):
+        """Return recent + strongest installed categories, without duplicates."""
+        category_cache = getattr(self, "category_cache", None)
+        if category_cache is None:
+            return []
+
+        paths = []
+        seen = set()
+
+        # Recency contributes at most the last two categories entered.
+        for category_path in getattr(self, "_featured_sensed_categories", ()):
+            category_path = os.path.abspath(str(category_path or "").strip())
+            if not category_path or category_path in seen:
+                continue
+            seen.add(category_path)
+            paths.append(category_path)
+            if len(paths) >= self.SENSE_HISTORY_LIMIT:
+                break
+
+        # Rank categories by how many of their apps are currently removable. This
+        # reuses the same installed-state source as the rest of the UI, so AppStream
+        # and LinuxToys entries are treated consistently.
+        installed_counts = []
+        try:
+            categories = category_cache.get_categories()
+        except Exception:
+            categories = ()
+
+        for category in categories or ():
+            if category.get("is_script"):
+                continue
+            category_path = str(category.get("path", "") or "").strip()
+            if not category_path:
+                continue
+            category_path = os.path.abspath(category_path)
+            try:
+                scripts = category_cache.get_scripts_for_category(category_path)
+            except Exception:
+                continue
+
+            installed_count = sum(
+                1
+                for script in scripts or ()
+                if script.get("is_script", False)
+                and not script.get("is_create_script", False)
+                and self._is_script_removable(script)
+            )
+            if installed_count > 0:
+                installed_counts.append((installed_count, category_path))
+
+        # Stable path tie-break makes equal-count ordering deterministic. Categories
+        # already supplied by recency simply consume one of the possible categories;
+        # do not backfill with a third/fourth installed category when they coincide.
+        installed_counts.sort(key=lambda item: (-item[0], item[1]))
+        for _count, category_path in installed_counts[:2]:
+            if category_path in seen:
+                continue
+            seen.add(category_path)
+            paths.append(category_path)
+
+        return paths
+
+    def _sensed_featured_keys(self):
+        """Return eligible identities from the main menu's personalized categories."""
+        category_cache = getattr(self, "category_cache", None)
+        if category_cache is None:
+            return set()
+
+        keys = set()
+        for category_path in self._personalized_featured_category_paths():
+            try:
+                scripts = category_cache.get_scripts_for_category(category_path)
+            except Exception:
+                continue
+            for script in scripts or ():
+                if script.get("is_script", False) and not script.get("is_create_script", False):
+                    keys.add(self._featured_script_key(script))
+        return keys
 
     def _collect_all_scripts(self):
         """Collect direct top-level scripts, preferring already parsed cache data."""
@@ -96,13 +232,11 @@ class FeaturedCtl:
             return widget.get_allocated_width()
 
     def _get_featured_card_size(self):
-        """
-        Measure a representative script card.
+        """Return the stable representative Featured card measurement."""
+        cached = getattr(self, "_featured_card_size_cache", None)
+        if cached is not None:
+            return cached
 
-        Existing category cards are preferred because they are already realized.
-        A featured card is created temporarily only when no existing card can be
-        measured yet.
-        """
         sample = None
         temporary_sample = False
 
@@ -120,8 +254,16 @@ class FeaturedCtl:
         if temporary_sample:
             sample.destroy()
 
-        # Safe fallbacks for the first allocation cycle.
-        return max(1, card_width or 120), max(1, card_height or 64)
+        # Safe fallbacks for the first allocation cycle. Cache only a real
+        # measurement; fallback geometry is intentionally retried later.
+        result = (max(1, card_width or 120), max(1, card_height or 64))
+        if card_width > 0 and card_height > 0:
+            self._featured_card_size_cache = result
+        return result
+
+    def _invalidate_featured_measurements(self):
+        """Invalidate stable measurements after content/theme/language rebuilds."""
+        self._featured_card_size_cache = None
 
     def _calculate_featured_columns(self):
         """Mirror the main menu's *actual* currently allocated column count."""
@@ -156,6 +298,78 @@ class FeaturedCtl:
         columns = max(1, int(columns))
 
         return columns
+
+    def calculate_featured_capacity(
+        self,
+        viewport_height,
+        used_height,
+        *,
+        fixed_height=0,
+        row_spacing=None,
+        bottom_padding=0,
+        max_rows=None,
+    ):
+        """
+        Calculate Featured rows/columns from the same geometry used by the main menu.
+
+        ``used_height`` is the bottom edge already occupied by normal content in
+        the viewport. Callers supply only their context-specific fixed section
+        overhead; card size and effective columns remain shared with the main menu.
+        """
+        viewport_height = int(viewport_height or 0)
+        used_height = int(used_height or 0)
+        fixed_height = max(0, int(fixed_height or 0))
+        bottom_padding = max(0, int(bottom_padding or 0))
+
+        if viewport_height <= 1 or used_height < 0:
+            return None
+
+        _card_width, card_height = self._get_featured_card_size()
+        if row_spacing is None:
+            row_spacing = self.random_scripts_flowbox.get_row_spacing()
+        row_spacing = max(0, int(row_spacing or 0))
+
+        available_rows_height = (
+            viewport_height - used_height - fixed_height - bottom_padding
+        )
+        if available_rows_height < card_height:
+            return None
+
+        rows = 1 + (
+            available_rows_height - card_height
+        ) // (card_height + row_spacing)
+
+        if max_rows is not None:
+            rows = min(int(max_rows), int(rows))
+        rows = max(0, int(rows))
+        if rows <= 0:
+            return None
+
+        columns = self._calculate_featured_columns()
+        if columns <= 0:
+            return None
+
+        return {
+            "rows": rows,
+            "columns": columns,
+            "card_height": card_height,
+            "row_spacing": row_spacing,
+            "available_rows_height": available_rows_height,
+        }
+
+    @staticmethod
+    def _calculate_featured_large_count(rows, columns, eligible_count):
+        """Return the large-card allowance shared by main-menu and app-page Featured."""
+        rows = max(0, int(rows or 0))
+        columns = max(0, int(columns or 0))
+        eligible_count = max(0, int(eligible_count or 0))
+        if rows >= 9:
+            max_large_cards = max(3, columns)
+        else:
+            max_large_cards = min(3, rows // 3)
+        if rows > 6:
+            max_large_cards += columns // 2
+        return min(max_large_cards, eligible_count)
 
     def _calculate_random_scripts_count(self):
         """Calculate Featured geometry and the number of actual app cards shown."""
@@ -193,48 +407,34 @@ class FeaturedCtl:
             + label_height
             + section_spacing
         )
-        available_rows_height = (
-            viewport_height - categories_height - fixed_featured_height
+        capacity = self.calculate_featured_capacity(
+            viewport_height,
+            categories_height,
+            fixed_height=fixed_featured_height,
+            row_spacing=self.random_scripts_flowbox.get_row_spacing(),
+            max_rows=self.FEATURED_MAX_ROWS,
         )
-
-        _card_width, card_height = self._get_featured_card_size()
-        row_spacing = self.random_scripts_flowbox.get_row_spacing()
-        if available_rows_height < card_height:
+        if capacity is None:
             self._featured_layout_metrics = None
             return 0
 
-        rows = 1 + (
-            available_rows_height - card_height
-        ) // (card_height + row_spacing)
-        rows = min(self.FEATURED_MAX_ROWS, int(rows))
-        columns = self._calculate_featured_columns()
+        rows = capacity["rows"]
+        columns = capacity["columns"]
+        card_height = capacity["card_height"]
+        row_spacing = capacity["row_spacing"]
 
         eligible_count = len(self._eligible_featured_scripts())
         if eligible_count <= 0:
             self._featured_layout_metrics = None
             return 0
 
-        # One three-row card at 3-5 rows, two at 6-8, and three at 9+.
-        # Once the maximum-height layout is available (9+ rows), scale the large
-        # card allowance with width as well: keep the base three, then add one
-        # more for every column beyond three (4 columns -> 4 large cards,
-        # 5 columns -> 5 large cards, and so on).
-        #
         # A large card occupies three normal grid cells, so every one reduces the
         # number of distinct apps that fit by two while preserving exactly the
-        # same overall Featured height and column count.
-        if rows >= 9:
-            max_large_cards = max(3, columns)
-        else:
-            max_large_cards = min(3, rows // 3)
-
-        # With more than six rows available, use the extra vertical room to
-        # scale the richer cards further with width: add one large card for
-        # every two columns, on top of the existing row/column allowance.
-        if rows > 6:
-            max_large_cards += columns // 2
-
-        large_count = min(max_large_cards, eligible_count)
+        # same overall Featured height and column count. The allowance itself is
+        # shared with app-page Featured.
+        large_count = self._calculate_featured_large_count(
+            rows, columns, eligible_count
+        )
         slot_count = rows * columns
         item_capacity = max(0, slot_count - (2 * large_count))
         item_count = min(eligible_count, item_capacity)
@@ -263,12 +463,51 @@ class FeaturedCtl:
             script.get("repo", ""),
         )
 
+    @staticmethod
+    def _featured_rating_weight(script):
+        """Return the Featured selection weight for an eligible candidate.
+
+        LinuxToys-curated entries keep the historical baseline weight. AppStream
+        entries require at least 3.5 stars (70 on the ODRS 0-100 scale); their weight
+        then rises linearly from 1.0 at 70 to 2.0 at 90 (4.5 stars) and remains
+        capped there.
+        """
+        if not script.get("is_appstream_entry", False):
+            return 1.0
+
+        try:
+            rating = float(script.get("review_rating"))
+        except (TypeError, ValueError):
+            return 0.0
+
+        if rating < 70.0:
+            return 0.0
+        return min(2.0, 1.0 + ((rating - 70.0) / 20.0))
+
+    @classmethod
+    def _weighted_featured_sample(cls, candidates, count):
+        """Sample Featured candidates without replacement using rating weights."""
+        pool = list(candidates)
+        selected = []
+        count = min(max(0, int(count or 0)), len(pool))
+
+        for _ in range(count):
+            weights = [cls._featured_rating_weight(script) for script in pool]
+            total = sum(weights)
+            if total <= 0:
+                break
+            index = random.choices(range(len(pool)), weights=weights, k=1)[0]
+            selected.append(pool.pop(index))
+
+        return selected
+
     def _eligible_featured_scripts(self):
         """Return scripts that may currently appear in Featured."""
         return [
             script
             for script in self.all_scripts
             if not self._is_script_removable(script)
+            and self._featured_rating_weight(script) > 0
         ]
 
     @staticmethod
@@ -280,8 +519,13 @@ class FeaturedCtl:
             return 2
         return 1
 
+    @staticmethod
+    def _is_linuxtoys_curated_featured(script):
+        """Return whether a Featured candidate comes from LinuxToys itself."""
+        return not script.get("is_appstream_entry", False)
+
     def _select_random_scripts(self, count):
-        """Select a fresh Featured set while avoiding recently displayed cards."""
+        """Select Featured cards, biasing 80% toward personalized categories."""
         if not self.all_scripts or count <= 0:
             return []
 
@@ -294,14 +538,12 @@ class FeaturedCtl:
         history_limit = self._featured_history_limit(count)
         history = history[-history_limit:]
 
-        # Prefer excluding every retained set. If that would leave too few cards to
-        # fill the current layout, forget the oldest set(s) one at a time. This keeps
-        # the strongest possible no-repeat window without shrinking Featured.
+        # Preserve the existing no-repeat window, relaxing only as much as needed
+        # to keep the current Featured layout full.
         while True:
             excluded = set().union(*history) if history else set()
             candidates = [
-                script
-                for script in eligible
+                script for script in eligible
                 if self._featured_script_key(script) not in excluded
             ]
             if len(candidates) >= count or not history:
@@ -309,10 +551,192 @@ class FeaturedCtl:
             history.pop(0)
 
         self._featured_history = history
-        return random.sample(candidates, min(count, len(candidates)))
+
+        sensed_keys = self._sensed_featured_keys()
+        sensed_candidates = [
+            script for script in candidates
+            if self._featured_script_key(script) in sensed_keys
+        ]
+        sensed_target = (count * self.SENSE_PERSONALIZED_PERCENT) // 100
+        sensed_count = min(sensed_target, len(sensed_candidates), count)
+        selected = self._weighted_featured_sample(sensed_candidates, sensed_count)
+        selected_keys = {self._featured_script_key(script) for script in selected}
+
+        # The remaining share keeps the previous global random discovery behavior.
+        remaining_candidates = [
+            script for script in candidates
+            if self._featured_script_key(script) not in selected_keys
+        ]
+        remaining_count = count - len(selected)
+        if remaining_count > 0:
+            selected.extend(
+                self._weighted_featured_sample(
+                    remaining_candidates,
+                    min(remaining_count, len(remaining_candidates)),
+                )
+            )
+
+        # Preserve the existing LinuxToys-curated minimum. Prefer satisfying it by
+        # replacing globally-random cards so the personalized 80% remains intact
+        # whenever the candidate pool allows it.
+        curated_required = min(
+            max(1, count // 5),
+            sum(self._is_linuxtoys_curated_featured(script) for script in candidates),
+            count,
+        )
+        curated_have = sum(self._is_linuxtoys_curated_featured(script) for script in selected)
+        if curated_have < curated_required:
+            selected_keys = {self._featured_script_key(script) for script in selected}
+            curated_pool = [
+                script for script in candidates
+                if self._is_linuxtoys_curated_featured(script)
+                and self._featured_script_key(script) not in selected_keys
+            ]
+            random.shuffle(curated_pool)
+            replacements_needed = min(curated_required - curated_have, len(curated_pool))
+
+            replaceable = [
+                index for index, script in enumerate(selected)
+                if not self._is_linuxtoys_curated_featured(script)
+                and self._featured_script_key(script) not in sensed_keys
+            ]
+            replaceable += [
+                index for index, script in enumerate(selected)
+                if not self._is_linuxtoys_curated_featured(script)
+                and self._featured_script_key(script) in sensed_keys
+                and index not in replaceable
+            ]
+            for index, replacement in zip(replaceable, curated_pool[:replacements_needed]):
+                selected[index] = replacement
+
+        random.shuffle(selected)
+        return selected
+
+    def select_featured_scripts_for_app_page(
+        self, count, exclude_keys=(), category=None
+    ):
+        """
+        Select one stable Featured set for spare app-page space.
+
+        Prefer the app's exact category, including nested subcategories. If that
+        category cannot fill the available slots, backfill from the same
+        personalized/global pool used by main-menu Featured without touching its
+        history or refresh timer.
+        """
+        if count <= 0:
+            return []
+
+        excluded = set(exclude_keys or ())
+        category = str(category or "").strip().replace("\\", "/").strip("/")
+        category_folded = category.casefold()
+
+        eligible = [
+            script
+            for script in self._eligible_featured_scripts()
+            if self._featured_script_key(script) not in excluded
+        ]
+        if not eligible:
+            return []
+
+        count = min(int(count), len(eligible))
+
+        def same_category(script):
+            if not category_folded:
+                return True
+            script_category = (
+                str(script.get("category", "") or "")
+                .strip()
+                .replace("\\", "/")
+                .strip("/")
+                .casefold()
+            )
+            return script_category == category_folded
+
+        # ``all_scripts`` is intentionally built from top-level categories for the
+        # main-menu Featured pool. Nested subcategory entries therefore may not be
+        # present in it at all. Pull the exact category directly from CategoryCache
+        # as well so app-page recommendations work for e.g. Gaming/Emulators.
+        category_candidates = [script for script in eligible if same_category(script)]
+        if category:
+            category_cache = getattr(self, "category_cache", None)
+            if category_cache is not None:
+                category_path = os.path.join(
+                    parser.SCRIPTS_DIR, *[part for part in category.split("/") if part]
+                )
+                try:
+                    direct_scripts = category_cache.get_scripts_for_category(category_path)
+                except Exception:
+                    direct_scripts = ()
+
+                known_keys = {
+                    self._featured_script_key(script) for script in category_candidates
+                }
+                for script in direct_scripts or ():
+                    key = self._featured_script_key(script)
+                    if (
+                        key in excluded
+                        or key in known_keys
+                        or not script.get("is_script", False)
+                        or script.get("is_create_script", False)
+                        or self._is_script_removable(script)
+                        or self._featured_rating_weight(script) <= 0
+                        or not same_category(script)
+                    ):
+                        continue
+                    known_keys.add(key)
+                    category_candidates.append(script)
+
+        selected = self._weighted_featured_sample(
+            category_candidates, min(count, len(category_candidates))
+        )
+        selected_keys = {self._featured_script_key(script) for script in selected}
+
+        # Only spare slots are backfilled. A category that can fill the page remains
+        # entirely category-local; sparse categories retain all of their own picks
+        # and receive main-menu-style recommendations for the remainder.
+        remaining_count = count - len(selected)
+        if remaining_count > 0:
+            remaining = [
+                script for script in eligible
+                if self._featured_script_key(script) not in selected_keys
+            ]
+            sensed_keys = self._sensed_featured_keys()
+            sensed_candidates = [
+                script for script in remaining
+                if self._featured_script_key(script) in sensed_keys
+            ]
+            sensed_target = (
+                remaining_count * self.SENSE_PERSONALIZED_PERCENT
+            ) // 100
+            sensed_count = min(
+                sensed_target, len(sensed_candidates), remaining_count
+            )
+            backfill = self._weighted_featured_sample(
+                sensed_candidates, sensed_count
+            )
+            backfill_keys = {
+                self._featured_script_key(script) for script in backfill
+            }
+
+            global_candidates = [
+                script for script in remaining
+                if self._featured_script_key(script) not in backfill_keys
+            ]
+            still_needed = remaining_count - len(backfill)
+            if still_needed > 0:
+                backfill.extend(
+                    self._weighted_featured_sample(
+                        global_candidates, min(still_needed, len(global_candidates))
+                    )
+                )
+            selected.extend(backfill)
+
+        random.shuffle(selected)
+        return selected
+
 
     def _choose_featured_large_positions(self, rows, columns, count):
-        """Pick non-overlapping three-row spans, avoiding last positions if possible."""
+        """Pick moved large spans while minimizing ordinary-card replacement."""
         if count <= 0 or rows < 3 or columns <= 0:
             self._featured_large_positions = set()
             return []
@@ -330,12 +754,11 @@ class FeaturedCtl:
 
             def overlaps(position, chosen):
                 column, row = position
-                for other_column, other_row in chosen:
-                    if column != other_column:
-                        continue
-                    if not (row + 2 < other_row or other_row + 2 < row):
-                        return True
-                return False
+                return any(
+                    column == other_column
+                    and not (row + 2 < other_row or other_row + 2 < row)
+                    for other_column, other_row in chosen
+                )
 
             def search(index, chosen):
                 if len(chosen) == count:
@@ -353,12 +776,40 @@ class FeaturedCtl:
 
             return search(0, [])
 
-        # Strong preference: none of the large cards uses the exact same top-left
-        # slot as the previous rotation. If current geometry makes that impossible
-        # (for example one column with exactly six rows and two large cards), fall
-        # back to the best valid non-overlapping layout instead of dropping cards.
+        # Preserve the existing rule that large cards should move. Generate several
+        # valid moved layouts, then choose the one that changes the fewest occupied
+        # cells. This directly maximizes the number of ordinary cards we can rebind.
         fresh_positions = [pos for pos in all_positions if pos not in previous]
-        chosen = find_layout(fresh_positions) or find_layout(all_positions) or []
+        candidates = []
+        for _ in range(32):
+            layout = find_layout(fresh_positions)
+            if layout is not None:
+                candidates.append(layout)
+
+        if not candidates:
+            # Geometry can make a completely fresh set impossible.
+            for _ in range(32):
+                layout = find_layout(all_positions)
+                if layout is not None:
+                    candidates.append(layout)
+
+        if not candidates:
+            self._featured_large_positions = set()
+            return []
+
+        previous_cells = set()
+        for position in previous:
+            previous_cells.update(self._featured_occupied_cells(position))
+
+        def changed_cells(layout):
+            new_cells = set()
+            for position in layout:
+                new_cells.update(self._featured_occupied_cells(position))
+            return len(previous_cells.symmetric_difference(new_cells))
+
+        best_cost = min(changed_cells(layout) for layout in candidates)
+        best = [layout for layout in candidates if changed_cells(layout) == best_cost]
+        chosen = random.choice(best)
         self._featured_large_positions = set(chosen)
         return chosen
 
@@ -393,8 +844,27 @@ class FeaturedCtl:
         self._stop_random_scripts_refresh_timer()
         self._hide_featured_section(discard=True)
 
+    def _reveal_initial_featured_layout(self):
+        """Reveal the first Featured set after GTK has negotiated its final size."""
+        if (
+            not self.all_scripts
+            or self.current_category_info is not None
+            or self.main_stack.get_visible_child_name() != "categories"
+        ):
+            return False
+
+        self.featured_scripts_revealer.set_reveal_child(True)
+        self.random_scripts_revealer.set_reveal_child(True)
+        return False
+
     def _populate_random_scripts(self, scripts, count, layout):
-        """Replace hidden Featured cards, including true three-row variants."""
+        """
+        Replace Featured content.
+
+        Geometry changes deliberately use the original full redraw. When geometry
+        is unchanged, ordinary cards whose cells remain ordinary are rebound in
+        place; only large cards and cells whose role changes are rebuilt.
+        """
         self._featured_swap_timer = None
         self._featured_swap_required_by_layout = False
 
@@ -413,22 +883,58 @@ class FeaturedCtl:
         if rows <= 0 or columns <= 0:
             return False
 
-        self._clear_random_scripts()
+        new_signature = (rows, columns, large_count, count)
+        previous_signature = getattr(self, "_featured_last_layout", None)
+        existing_children = list(self.random_scripts_flowbox.get_children())
+        same_geometry = bool(existing_children) and previous_signature == new_signature
 
+        # A resize/maximize/restore that changes rows, columns, large allowance or
+        # item count intentionally falls back to the proven original behavior.
+        if not same_geometry:
+            self._clear_random_scripts()
+            existing_children = []
+            # A new geometry has no meaningful large-card placement to preserve.
+            self._featured_large_positions = set()
+
+        previous_large_positions = set(
+            getattr(self, "_featured_large_positions", set())
+        )
         large_positions = self._choose_featured_large_positions(
             rows, columns, large_count
         )
         large_count = min(large_count, len(large_positions))
 
-        # Choose which apps get the richer presentation independently from where
-        # those cards land. This keeps both the content and placement randomized.
-        shuffled_scripts = list(scripts)
-        random.shuffle(shuffled_scripts)
-        large_scripts = shuffled_scripts[:large_count]
-        normal_scripts = shuffled_scripts[large_count:]
+        localized_scripts = [
+            script for script in scripts
+            if script.get("description_localized", False)
+        ]
+        other_scripts = [
+            script for script in scripts
+            if not script.get("description_localized", False)
+        ]
+        random.shuffle(localized_scripts)
+        random.shuffle(other_scripts)
+
+        if len(localized_scripts) >= large_count:
+            large_scripts = localized_scripts[:large_count]
+            normal_scripts = localized_scripts[large_count:] + other_scripts
+        else:
+            needed = large_count - len(localized_scripts)
+            large_scripts = localized_scripts + other_scripts[:needed]
+            normal_scripts = other_scripts[needed:]
+
+        random.shuffle(large_scripts)
+        random.shuffle(normal_scripts)
         random.shuffle(large_positions)
 
         occupied = set()
+        for position in large_positions:
+            occupied.update(self._featured_occupied_cells(position))
+
+        previous_occupied = set()
+        for position in previous_large_positions:
+            previous_occupied.update(self._featured_occupied_cells(position))
+
         large_height = (3 * card_height) + (2 * row_spacing)
 
         def prepare_widget(script_info, *, large=False):
@@ -437,6 +943,7 @@ class FeaturedCtl:
                 featured_large=large,
                 featured_height=large_height if large else 0,
             )
+            widget._featured_grid_large = large
             description = script_info.get("description", "")
             widget.set_tooltip_text(description or None)
             widget.set_can_focus(True)
@@ -449,9 +956,27 @@ class FeaturedCtl:
             widget.connect("leave-notify-event", self._on_featured_card_leave)
             return widget
 
+        reusable_normals = {}
+        if same_geometry:
+            # Read positions from Gtk.Grid itself. Stable ordinary cells remain
+            # parented throughout the swap; large cards and role-changing cells do not.
+            for widget in existing_children:
+                left = self.random_scripts_flowbox.child_get_property(widget, "left-attach")
+                top = self.random_scripts_flowbox.child_get_property(widget, "top-attach")
+                width = self.random_scripts_flowbox.child_get_property(widget, "width")
+                height = self.random_scripts_flowbox.child_get_property(widget, "height")
+                position = (int(left), int(top))
+
+                if int(width) == 1 and int(height) == 1 and position not in occupied:
+                    reusable_normals[position] = widget
+                else:
+                    widget.destroy()
+
+        # Large cards are intentionally cheap structural churn. We do not try to
+        # preserve/reparent them; the placement algorithm instead minimizes how many
+        # ordinary cells have to be sacrificed when the large spans move.
         for script_info, position in zip(large_scripts, large_positions):
             column, row = position
-            occupied.update(self._featured_occupied_cells(position))
             widget = prepare_widget(script_info, large=True)
             self.random_scripts_flowbox.attach(widget, column, row, 1, 3)
 
@@ -461,14 +986,23 @@ class FeaturedCtl:
             for column in range(columns)
             if (column, row) not in occupied
         ]
-        for script_info, (column, row) in zip(normal_scripts, free_cells):
-            widget = prepare_widget(script_info, large=False)
-            self.random_scripts_flowbox.attach(widget, column, row, 1, 1)
+
+        for script_info, position in zip(normal_scripts, free_cells):
+            widget = reusable_normals.pop(position, None)
+            if widget is not None:
+                self.update_featured_normal_widget(widget, script_info)
+            else:
+                widget = prepare_widget(script_info, large=False)
+                column, row = position
+                self.random_scripts_flowbox.attach(widget, column, row, 1, 1)
+
+        # Defensive cleanup if selection/capacity ever leaves an old normal card
+        # without a corresponding new item.
+        for widget in reusable_normals.values():
+            widget.destroy()
 
         self._featured_last_count = count
-        self._featured_last_layout = (
-            rows, columns, large_count, count
-        )
+        self._featured_last_layout = new_signature
 
         displayed_keys = {
             self._featured_script_key(script_info)
@@ -480,8 +1014,33 @@ class FeaturedCtl:
         self._featured_history = history[-history_limit:]
 
         self.featured_scripts_revealer.show_all()
-        self.featured_scripts_revealer.set_reveal_child(True)
-        self.random_scripts_revealer.set_reveal_child(True)
+
+        # On the very first Featured draw GTK may still be propagating the new
+        # Gtk.Grid requisition through the nested revealer/container hierarchy.
+        # This is especially easy to hit on the fast startup path where the
+        # AppStream runtime pickle is already available. Revealing immediately
+        # can therefore expose one transient allocation with excess space above
+        # the grid.
+        #
+        # Let the newly populated grid request its final geometry first, then
+        # reveal it from the next main-loop iteration. Later redraws already have
+        # established geometry and can be revealed immediately.
+        if not getattr(self, "_featured_first_layout_committed", False):
+            self._featured_first_layout_committed = True
+
+            self.random_scripts_revealer.set_reveal_child(False)
+            self.featured_scripts_revealer.set_reveal_child(False)
+
+            self.random_scripts_flowbox.queue_resize()
+            self.random_scripts_revealer.queue_resize()
+            self.featured_scripts_container.queue_resize()
+            self.featured_scripts_revealer.queue_resize()
+
+            GLib.idle_add(self._reveal_initial_featured_layout)
+        else:
+            self.featured_scripts_revealer.set_reveal_child(True)
+            self.random_scripts_revealer.set_reveal_child(True)
+
         return False
 
     def _refresh_random_scripts_display(self, force=False):
@@ -537,11 +1096,11 @@ class FeaturedCtl:
             GLib.source_remove(self._featured_swap_timer)
             self._featured_swap_timer = None
 
-        if current_children:
-            # Hover is allowed to cancel a cosmetic timed rotation, but a resize
-            # that changes the grid geometry must complete. Window maximization can
-            # synthesize pointer enter events while GTK reallocates the cards.
-            self._featured_swap_required_by_layout = layout_changed
+        if current_children and not layout_changed:
+            # Timed content rotations keep the cosmetic cross-fade. Their geometry
+            # is unchanged, so hiding/revealing the inner revealer cannot disturb
+            # the section's vertical allocation.
+            self._featured_swap_required_by_layout = False
             self.random_scripts_revealer.set_reveal_child(False)
             self._featured_swap_timer = GLib.timeout_add(
                 self.FEATURED_SWAP_ANIMATION_MS,
@@ -551,8 +1110,16 @@ class FeaturedCtl:
                 layout,
             )
         else:
+            # A settled resize that changes rows/columns is structural, not a
+            # cosmetic card swap. Rebuilding through a hidden Gtk.Revealer left its
+            # previous allocation in the surrounding vertical box for one layout
+            # cycle, which is what produced the one-off title/card gap on the second
+            # draw. Apply the final geometry immediately instead.
             self._featured_swap_required_by_layout = False
             self._populate_random_scripts(scripts, count, layout)
+            if layout_changed:
+                self.random_scripts_flowbox.queue_resize()
+                self.featured_scripts_container.queue_resize()
 
         return True
 
@@ -569,13 +1136,14 @@ class FeaturedCtl:
         if self.main_stack.get_visible_child_name() != "categories":
             return
 
-        if getattr(self, "_featured_resize_timer", None):
-            GLib.source_remove(self._featured_resize_timer)
-
-        self._featured_resize_timer = GLib.timeout_add(
-            self.FEATURED_RESIZE_DEBOUNCE_MS,
-            self._apply_featured_resize,
-        )
+        # Window owns the only responsive debounce timer. This signal is still
+        # important for navigation back to the main menu, where the window itself
+        # may not have changed size.
+        request_settle = getattr(self, "_request_window_resize_settle", None)
+        if request_settle is not None:
+            request_settle()
+        else:
+            self._apply_featured_resize()
 
     def _apply_featured_resize(self):
         """Apply the resize-triggered featured-section update using settled geometry."""

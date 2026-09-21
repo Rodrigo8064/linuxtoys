@@ -1,0 +1,47 @@
+#!/bin/bash
+# name: Nvidia Drivers (v580)
+# description: nv580_desc
+# icon: nvidia.svg
+# nocontainer
+# gpu: Nvidia
+# compat: arch, !cachy, fedora, rhel, suse, ubuntu, solus
+# reboot: yes
+
+# --- Start of the script code ---
+source "$SCRIPT_DIR/libs/helpers.lib"
+_lang_
+sudo_rq
+if is_arch || is_cachy; then
+    pkg_remove nvidia-open nvidia-open-dkms nvidia-open-lts nvidia-settings nvidia-utils
+    pkg_install nvidia-580xx-dkms nvidia-580xx-utils nvidia-580xx-settings
+    initramfs_upd
+elif is_fedora || is_rhel; then
+    rpmfusion_chk
+    secureboot_check
+    pkg_install --allowerasing akmod-nvidia-580xx xorg-x11-drv-nvidia-580xx-cuda
+    initramfs_upd
+    bootloader_upd
+elif is_ubuntu; then
+    sudo apt update
+    pkg_install nvidia-driver-580
+    secureboot_check
+elif is_suse; then
+    case "$ID" in
+        opensuse-tumbleweed|opensuse-slowroll) REPO_URL="https://download.nvidia.com/opensuse/tumbleweed" ;;
+        opensuse-leap) REPO_URL='https://download.nvidia.com/opensuse/leap/$releasever' ;;
+        *) die "Unsupported OpenSUSE variant: $ID" ;;
+    esac
+    sudo_rq
+    if ! zypper lr | grep -q "^nvidia\s"; then
+        sudo zypper ar -f "$REPO_URL" "nvidia"
+    fi
+    pkg_install x11-video-nvidiaG06 nvidia-computeG06
+    initramfs_upd
+    bootloader_upd
+elif is_solus; then
+    pkg_install nvidia-580-glx-driver-current
+    bootloader_upd
+else
+    fatal "$msg077"
+fi
+zeninf "$msg036"

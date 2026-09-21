@@ -131,18 +131,25 @@ class NavCtl:
     def open_app_page(self, info, preserve_previous=False):
         """Open a repository entry's optional details page without altering checklist state."""
         old_page = self.main_stack.get_child_by_name("app_page")
-        if old_page is not None:
-            self.main_stack.remove(old_page)
-            old_page.destroy()
+        visible_child = self.main_stack.get_visible_child()
+        chaining_from_app_page = old_page is not None and visible_child is old_page
 
-        if not preserve_previous:
+        # Capture the origin before touching the current app page. When Featured
+        # opens another app page, keep the origin of the whole chain (search,
+        # category, or root) instead of replacing it with whatever Gtk.Stack makes
+        # visible after the old app page is removed.
+        if not preserve_previous and not chaining_from_app_page:
             self._app_page_prev = {
-                "child": self.main_stack.get_visible_child(),
+                "child": visible_child,
                 "header_visible": self.header_widget.get_visible(),
                 "title": self.header_bar.props.title,
                 "footer_revealed": self.reveal.get_reveal_child(),
                 "back_visible": self.back_button.get_visible(),
             }
+
+        if old_page is not None:
+            self.main_stack.remove(old_page)
+            old_page.destroy()
 
         page = app_page.AppPageView(
             info,
@@ -337,15 +344,18 @@ class NavCtl:
     def on_back_button_clicked(self, widget):
         """Handles the back button click."""
 
-        if self.main_stack.get_visible_child_name() == "app_page":
-            child = self.main_stack.get_child_by_name("app_page")
-            prev = getattr(self, "_app_page_prev", None)
-
-            if child is not None:
-                self.main_stack.remove(child)
-                child.destroy()
-
+        # Header utility views preserve the exact view they were opened from.
+        utility_name = self.main_stack.get_visible_child_name()
+        if utility_name in ("installed_features", "appstream_queue"):
+            attr = (
+                "_installed_features_prev"
+                if utility_name == "installed_features"
+                else "_appstream_queue_prev"
+            )
+            prev = getattr(self, attr, None)
+            child = self.main_stack.get_child_by_name(utility_name)
             if prev and prev.get("child") is not None:
+                self.main_stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
                 self.main_stack.set_visible_child(prev["child"])
                 self.header_bar.props.title = prev.get("title") or "LinuxToys"
                 if prev.get("header_visible"):
@@ -353,14 +363,111 @@ class NavCtl:
                 else:
                     self.header_widget.hide()
                 self.reveal.set_reveal_child(bool(prev.get("footer_revealed")))
-            elif self.current_category_info:
+                if prev.get("back_visible"):
+                    self.back_button.show()
+                else:
+                    self.back_button.hide()
+            else:
+                self.show_categories_view()
+
+            setattr(self, attr, None)
+            if child is not None:
+                def cleanup_utility_view():
+                    try:
+                        if child.get_parent() is self.main_stack:
+                            self.main_stack.remove(child)
+                    except (AttributeError, TypeError):
+                        pass
+                    try:
+                        child.destroy()
+                    except (AttributeError, TypeError):
+                        pass
+                    return False
+                GLib.timeout_add(max(1, int(self.main_stack.get_transition_duration())), cleanup_utility_view)
+            return
+
+        if self.main_stack.get_visible_child_name() == "app_page":
+            child = self.main_stack.get_child_by_name("app_page")
+            prev = getattr(self, "_app_page_prev", None)
+
+            # App pages remember the exact view from which the app-page chain
+            # started. This includes generated search results, category views and
+            # the main menu. Opening another app from an app page's Featured
+            # section replaces the page but leaves that root origin intact.
+            if prev and prev.get("child") is not None:
+                self.main_stack.set_transition_type(
+                    Gtk.StackTransitionType.SLIDE_LEFT_RIGHT
+                )
+                self.main_stack.set_visible_child(prev["child"])
+                self.header_bar.props.title = prev.get("title") or "LinuxToys"
+
+                if prev.get("header_visible"):
+                    self.header_widget.show()
+                else:
+                    self.header_widget.hide()
+                self.reveal.set_reveal_child(bool(prev.get("footer_revealed")))
+
+                if prev.get("back_visible"):
+                    self.back_button.show()
+                else:
+                    self.back_button.hide()
+
+                if self.current_category_info and self._is_local_scripts_category(
+                    self.current_category_info
+                ):
+                    self._enable_drag_and_drop()
+                else:
+                    self._disable_drag_and_drop()
+            elif self.current_category_info and self.scripts_view is not None:
+                # Defensive fallback for app pages created before origin state was
+                # captured or for callers that deliberately omit it.
+                self.main_stack.set_transition_type(
+                    Gtk.StackTransitionType.SLIDE_LEFT_RIGHT
+                )
                 self.main_stack.set_visible_child(self.scripts_view)
                 self.header_widget.show()
                 self._update_header(self.current_category_info)
+                category_name = self.current_category_info.get("name", "Unknown")
+                self.header_bar.props.title = f"LinuxToys: {category_name}"
+                self.back_button.show()
+
+                if self._is_local_scripts_category(self.current_category_info):
+                    self._enable_drag_and_drop()
+                else:
+                    self._disable_drag_and_drop()
+
+                if (
+                    self.current_category_info.get("display_mode", "menu")
+                    == "checklist"
+                ):
+                    self.reveal.set_reveal_child(len(self.check_buttons) >= 2)
+                else:
+                    self.reveal.set_reveal_child(False)
             else:
                 self.show_categories_view()
 
             self._app_page_prev = None
+
+            # Keep the departing app page alive for the reverse stack transition,
+            # just as terminal/category navigation does.
+            if child is not None:
+                transition_delay = max(
+                    1, int(self.main_stack.get_transition_duration())
+                )
+
+                def cleanup_app_page():
+                    try:
+                        if child.get_parent() is self.main_stack:
+                            self.main_stack.remove(child)
+                    except (AttributeError, TypeError):
+                        pass
+                    try:
+                        child.destroy()
+                    except (AttributeError, TypeError):
+                        pass
+                    return False
+
+                GLib.timeout_add(transition_delay, cleanup_app_page)
             return
 
         # Handle leaving the terminal before normal search navigation.
@@ -442,6 +549,8 @@ class NavCtl:
                 )
                 self.main_stack.set_visible_child(prev["child"])
                 self.header_bar.props.title = prev.get("title") or "LinuxToys"
+                if hasattr(prev["child"], "refresh"):
+                    prev["child"].refresh()
 
                 if prev.get("header_visible"):
                     self.header_widget.show()
@@ -659,6 +768,13 @@ class NavCtl:
             self.navigation_stack.append(self.current_category_info)
 
         self.current_category_info = category_info
+        # Specials is a virtual curated browser, not part of the user's normal
+        # category-browsing history used to bias main-menu Featured suggestions.
+        if not (
+            category_info.get("is_linuxtoys_specials")
+            or category_info.get("is_linuxtoys_specials_category")
+        ):
+            self._record_featured_category(category_info)
 
         # Switch to the current scripts view (which may be a new one created for subcategories)
         current_child = self.main_stack.get_visible_child()

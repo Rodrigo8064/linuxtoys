@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import shutil
@@ -7,6 +8,12 @@ import sys
 
 from . import (
     action_registry,
+    appstream_cache,
+    appstream_parser,
+    appstream_queue,
+    appstream_runner,
+    installed_features,
+    installed_packages,
     compat,
     deepin_immutable_helper,
     dev_mode,
@@ -22,9 +29,11 @@ from . import (
     search_helper,
     skills_view,
     repo_parser,
+    uri_parser,
     git_scripts_manager
 )
 from .gtk_common import Gdk, GLib, Gtk, GdkPixbuf
+from gi.repository import Gio
 from .window_items import ItemWidgetFactory
 from .window_search import SearchCtl
 from .window_nav import NavCtl
@@ -50,7 +59,9 @@ class AppWindow(
         self.translations = translations
 
         self.set_title("LinuxToys")
-        self.set_default_size(920, 800)  ##
+        self._default_window_size = (920, 630)
+        self._last_normal_window_size = self._default_window_size
+        self.set_default_size(*self._default_window_size)
         # self.set_resizable(False) ## Desabilita o redimensionamento da janela
 
         # Set window icon for proper GNOME integration
@@ -65,6 +76,10 @@ class AppWindow(
         self._category_view_cache = {}
         self.view_counter = 0  # Counter for unique view names
         self._scripts_sync_started = False
+        self._appstream_cache_started = False
+        self._installed_packages_refresh_started = False
+        self._installed_packages_refresh_pending = False
+        self._appstream_runner = appstream_runner.AppStreamRunner(self)
 
         # Initialize search functionality with cache
         self.script_cache = search_helper.ScriptCache()
@@ -85,12 +100,22 @@ class AppWindow(
         self.featured_scripts_container = None  # Container for the featured section
         self.should_start_random_timer = False  # Flag to start timer when scripts are ready
         self._featured_resize_timer = None
+        # One debounce authority for all expensive application-level responsive
+        # work. GTK may continue allocating live while the user drags the window;
+        # LinuxToys only recalculates custom layouts after geometry settles.
+        self._window_resize_settle_timer = None
+        self._window_resize_pending = False
+        self._window_resize_settling = False
+        self._pending_window_size = self._default_window_size
+        self._last_settled_window_size = None
         self._featured_last_count = None
         self._featured_swap_timer = None
         self._featured_hovered = False
         self._featured_last_layout = None
         self._featured_large_positions = set()
         self._featured_history = []
+        self._featured_sensed_categories = []
+        self._load_featured_sense()
         self.featured_scripts_revealer = None
         self.random_scripts_revealer = None
 
@@ -104,6 +129,23 @@ class AppWindow(
         self.automatic_updates_enabled = get_automatic_updates()
         self._background_update_started = False
         self._update_state = "checking" if self.automatic_updates_enabled else "disabled"
+        self._appstream_state = "hidden"
+        # Only the bootstrap case blocks the main menu. Once both artifacts exist,
+        # future AppStream refreshes remain fully background operations.
+        self._appstream_pickle_missing_at_startup = (
+            not appstream_parser.RUNTIME_CACHE_PATH.is_file()
+        )
+        self._appstream_initial_build_pending = (
+            not appstream_cache.CATALOG_PATH.is_file()
+            or self._appstream_pickle_missing_at_startup
+        )
+        self._categories_loading_hide_source = None
+        self._categories_loading_hide_started_us = None
+        self._categories_loading_watermarks_flushed = False
+        self._categories_loading_fade_source = None
+        self._categories_loading_fade_started_us = None
+        self._categories_loading_fade_duration_ms = 220
+        self._categories_startup_transition_complete = False
 
         # --- UI Structure ---
         main_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
@@ -149,14 +191,39 @@ class AppWindow(
         )
         self.header_bar.pack_end(self.menu_button)
 
-        # Automatic update status indicator, shown only while automatic updates
-        # are enabled (or while an installed update is waiting for restart).
+        # Shared background-status indicator. Automatic updater states have
+        # priority; while the updater is idle/up-to-date, AppStream may borrow the
+        # same indicator while its catalog is synchronizing.
         self.update_indicator = Gtk.Button()
         self.update_indicator.set_relief(Gtk.ReliefStyle.NONE)
         self.update_indicator.get_style_context().add_class("update-indicator")
         self.update_indicator.connect("clicked", self._on_update_indicator_clicked)
         self.header_bar.pack_end(self.update_indicator)
-        self._set_update_state(self._update_state)
+        self._refresh_status_indicator()
+
+        # Installed features library. pack_end() ordering is right-to-left here,
+        # so this sits immediately to the left of the shared LinuxToys state button.
+        self.installed_features_button = Gtk.Button.new_from_icon_name(
+            "view-list-symbolic", Gtk.IconSize.BUTTON
+        )
+        self.installed_features_button.set_relief(Gtk.ReliefStyle.NONE)
+        self.installed_features_button.set_tooltip_text(
+            self.translations.get("installed_features", "Installed Features")
+        )
+        self.installed_features_button.connect("clicked", self._open_installed_features)
+        self.header_bar.pack_end(self.installed_features_button)
+
+        # Session AppStream queue. It becomes part of the header only after the
+        # persistent PTY has actually been requested for the first time.
+        self.appstream_queue_button = Gtk.Button.new_from_icon_name(
+            "folder-download-symbolic", Gtk.IconSize.BUTTON
+        )
+        self.appstream_queue_button.set_relief(Gtk.ReliefStyle.NONE)
+        self.appstream_queue_button.get_style_context().add_class("appstream-queue-indicator")
+        self.appstream_queue_button.set_tooltip_text("Application installation queue")
+        self.appstream_queue_button.connect("clicked", self._open_appstream_queue)
+        self.header_bar.pack_end(self.appstream_queue_button)
+        self.appstream_queue_button.hide()
 
         self.main_stack = Gtk.Stack()
         self.main_stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
@@ -239,8 +306,60 @@ class AppWindow(
         )
 
         self.categories_view = Gtk.ScrolledWindow()
+        # This page is horizontally responsive: category cards reflow and Featured
+        # mirrors their effective column count. Never let an old natural width
+        # become a horizontal scrollable area after a window resize/state change.
+        self.categories_view.set_policy(
+            Gtk.PolicyType.AUTOMATIC,
+            Gtk.PolicyType.AUTOMATIC,
+        )
         self.categories_view.add(categories_container)
-        self.main_stack.add_named(self.categories_view, "categories")
+        # Keep the real menu in the widget/layout tree so category allocations and
+        # watermark rendering can complete behind the startup roller, but do not let
+        # the unfinished menu flash on screen.
+        self.categories_view.set_opacity(0.0)
+
+        # The parser-backed menu is populated asynchronously. Keep the already-open
+        # window visually responsive while the first usable category snapshot is
+        # prepared instead of presenting an unexplained blank page.
+        self.categories_loading_overlay = Gtk.Overlay()
+        self.categories_loading_overlay.add(self.categories_view)
+
+        self.categories_loading_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=10,
+        )
+        self.categories_loading_box.set_halign(Gtk.Align.CENTER)
+        self.categories_loading_box.set_valign(Gtk.Align.CENTER)
+
+        self.categories_loading_spinner = Gtk.Spinner()
+        self.categories_loading_spinner.set_size_request(64, 64)
+        self.categories_loading_spinner.start()
+        self.categories_loading_box.pack_start(
+            self.categories_loading_spinner, False, False, 0
+        )
+
+        self.categories_loading_label = Gtk.Label()
+        loading_text = self.translations.get(
+            "appstream_initial_building",
+            "Building initial AppStream catalog.\nThis may take a few seconds...",
+        )
+        self.categories_loading_label.set_markup(
+            f'<span weight="bold" size="large">{GLib.markup_escape_text(loading_text)}</span>'
+        )
+        self.categories_loading_label.set_line_wrap(True)
+        self.categories_loading_label.set_justify(Gtk.Justification.CENTER)
+        self.categories_loading_label.set_max_width_chars(56)
+        # The window calls show_all() later during startup. Without no-show-all,
+        # that recursively makes this label visible again even when the pickle
+        # already existed and set_visible(False) was used here.
+        self.categories_loading_label.set_no_show_all(True)
+        self.categories_loading_box.pack_start(
+            self.categories_loading_label, False, False, 0
+        )
+
+        self.categories_loading_overlay.add_overlay(self.categories_loading_box)
+        self.main_stack.add_named(self.categories_loading_overlay, "categories")
 
         self.scripts_flowbox = self.create_flowbox()
         self.scripts_view = Gtk.ScrolledWindow()
@@ -264,8 +383,23 @@ class AppWindow(
         # --- Check for pending ostree deployments ---
         self._check_ostree_deployments_on_startup()
 
-        # --- Show the Window ---
+        # --- Restore and show the Window ---
+        self._restore_window_state()
+        self.connect("configure-event", self._on_window_configure)
+        self.connect("window-state-event", self._on_window_state_changed)
         self.show_all()
+
+        # no-show-all keeps the first-run message out of recursive show_all().
+        # Explicitly restore its intended startup state afterwards.
+        if self._appstream_pickle_missing_at_startup:
+            self.categories_loading_label.show()
+        else:
+            self.categories_loading_label.hide()
+
+        # show_all() recursively reveals header children, including the queue
+        # button that was intentionally hidden when it was created. Re-apply
+        # queue visibility from the actual session queue after the initial show.
+        self._on_appstream_queue_changed()
         self.show_categories_view()  # Call this after show_all to ensure proper visibility state
 
         # Connect focus events to enable/disable tooltips
@@ -273,6 +407,7 @@ class AppWindow(
         self.connect("focus-out-event", self._on_focus_out)
 
         self.connect("key-press-event", self._on_key_press)
+        self.connect("delete-event", self._on_close_requested)
 
         self.categories_view.connect(
             "size-allocate",
@@ -293,10 +428,118 @@ class AppWindow(
         # Prioritize parser-backed startup data. Git synchronization begins as
         # soon as top-level scripts (and therefore Featured Scripts) are ready.
         GLib.idle_add(self._populate_runtime_caches)
+        GLib.idle_add(self._refresh_installed_packages_async)
         GLib.idle_add(self._show_ostree_package_deployment_info_on_startup)
         GLib.idle_add(self._check_updates)
         GLib.idle_add(self._start_file_watcher)
         GLib.idle_add(self._check_deepin_immutability_on_startup)
+
+    def _set_appstream_state(self, state):
+        """Record AppStream state and refresh the shared header indicator."""
+        self._appstream_state = state
+        return self._refresh_status_indicator()
+
+    def _start_appstream_cache(self):
+        """Refresh AppStream metadata after the first usable UI is queued."""
+        if self._appstream_cache_started:
+            return False
+        self._appstream_cache_started = True
+        def report_state(state):
+            GLib.idle_add(self._set_appstream_state, state)
+
+        def worker():
+            initial_build = self._appstream_initial_build_pending
+            result = appstream_cache.refresh_cache(status_callback=report_state)
+            if not result.get("success"):
+                logger.warning(
+                    "AppStream catalog refresh failed: %s",
+                    result.get("error", "unknown error"),
+                )
+                if initial_build:
+                    # Never strand a first launch behind the roller. LinuxToys can
+                    # still operate with curated entries and retry AppStream later.
+                    GLib.idle_add(self._finish_initial_appstream_build, False, False)
+                return
+
+            changed = bool(result.get("changed"))
+            prepared = True
+
+            # A first launch must have the derived pickle before the menu is
+            # revealed, even if a catalog happened to appear before this worker ran.
+            # For later refreshes, prewarm only when a new catalog was published.
+            if initial_build or changed:
+                prepared = appstream_parser.prepare_runtime_cache()
+                if not prepared:
+                    logger.warning(
+                        "Could not prewarm AppStream runtime cache; "
+                        "the normal parser path will rebuild it."
+                    )
+
+            if initial_build:
+                GLib.idle_add(
+                    self._finish_initial_appstream_build,
+                    changed,
+                    prepared,
+                )
+            elif changed:
+                GLib.idle_add(self._apply_appstream_catalog)
+
+        threading.Thread(
+            target=worker,
+            daemon=True,
+            name="linuxtoys-appstream-cache",
+        ).start()
+        return False
+
+    def _finish_initial_appstream_build(self, catalog_changed, prepared):
+        """Release first-run startup after AppStream catalog/pickle preparation."""
+        self._appstream_initial_build_pending = False
+        if hasattr(self, "categories_loading_label"):
+            self.categories_loading_label.hide()
+
+        if catalog_changed:
+            # Rebuild parser/UI caches against the newly published catalog. The
+            # ordinary startup loading gate will then wait for the final category
+            # watermarks before revealing the menu.
+            return self._apply_appstream_catalog()
+
+        # If the catalog was already current, preparation only needed to create the
+        # missing derived pickle. The existing in-memory UI data is already valid.
+        # If preparation failed, release startup anyway rather than trapping the UI.
+        self._hide_categories_loading_indicator()
+        return False
+
+    def _apply_appstream_catalog(self):
+        """Publish a newly completed AppStream catalog through normal UI caches."""
+        appstream_parser.clear_runtime_cache()
+        self._discard_retained_category_views()
+
+        # Replace rather than invalidate in place: an older parser worker can then
+        # finish harmlessly while generation guards prevent it from publishing.
+        self.script_cache = search_helper.ScriptCache()
+        self.category_cache = search_helper.CategoryCache()
+        self.search_engine.set_cache(self.script_cache)
+        self.all_scripts = []
+
+        self.load_categories()
+        if self.current_category_info is not None:
+            self.load_scripts(self.current_category_info)
+
+        self._populate_runtime_caches()
+
+        if self.main_stack.get_visible_child_name() == "search":
+            query = self.search_entry.get_text()
+
+            def refresh_search_when_ready():
+                if not self.script_cache.is_populated:
+                    return True
+                if query and self.search_entry.get_text() == query:
+                    self.search_entry.emit("changed")
+                return False
+
+            GLib.timeout_add(100, refresh_search_when_ready)
+
+        return False
 
     def _populate_runtime_caches(self):
         """Build parser caches while progressively publishing startup-ready data."""
@@ -342,8 +585,13 @@ class AppWindow(
                 return False
 
             self._render_categories(categories)
+            self._hide_categories_loading_indicator()
             self.all_scripts = featured
-            if self.should_start_random_timer and featured:
+            if (
+                self.should_start_random_timer
+                and featured
+                and self._categories_startup_transition_complete
+            ):
                 self._deferred_start_random_scripts_refresh_timer()
             return False
 
@@ -355,6 +603,9 @@ class AppWindow(
 
             featured = collect_featured(categories, scripts_by_category)
             GLib.idle_add(publish_bootstrap, categories, featured)
+            # AppStream is supplemental. Do not let even its freshness check/catalog
+            # decode contend with the parser before the first usable UI is queued.
+            GLib.idle_add(self._start_appstream_cache)
 
             # Network/git work is lower startup priority than getting the first
             # usable Featured pool ready, but need not wait for recursive caches.
@@ -364,7 +615,11 @@ class AppWindow(
             if self.category_cache is not category_cache:
                 return False
             self.all_scripts = featured
-            if self.should_start_random_timer and featured:
+            if (
+                self.should_start_random_timer
+                and featured
+                and self._categories_startup_transition_complete
+            ):
                 self._deferred_start_random_scripts_refresh_timer()
             return False
 
@@ -388,6 +643,7 @@ class AppWindow(
                 GLib.idle_add(publish_full_featured, full_featured)
 
                 script_cache.populate_from_category_cache(category_cache)
+                GLib.idle_add(self._refresh_installed_features_view)
             except Exception as e:
                 print(f"Error populating runtime caches: {e}")
             finally:
@@ -585,9 +841,13 @@ class AppWindow(
         value = create_translator()(key)
         return fallback if value == key else value
 
-    def _set_update_state(self, state):
-        """Update the header indicator. Must only be called on the GTK thread."""
-        self._update_state = state
+    def _refresh_status_indicator(self):
+        """Render updater/AppStream state through the single header indicator.
+
+        Active updater states always win. The passive up-to-date/disabled states
+        yield to an AppStream synchronization or failure; once AppStream reaches
+        ready, the normal updater state becomes visible again.
+        """
         if not hasattr(self, "update_indicator"):
             return False
 
@@ -596,36 +856,93 @@ class AppWindow(
         context.remove_class("update-restart-ready")
         self.update_indicator.set_sensitive(False)
 
-        if state == "disabled":
-            self.update_indicator.hide()
-            return False
+        # Updating LinuxToys itself is always the highest-priority information.
+        updater_active = self._update_state in (
+            "checking",
+            "updating",
+            "restart-ready",
+            "error",
+        )
 
-        self.update_indicator.show()
-        if state == "checking":
-            image = Gtk.Image.new_from_icon_name("view-refresh-symbolic", Gtk.IconSize.BUTTON)
-            tooltip = self._tr_update("update_status_checking", "Checking for updates…")
-        elif state == "up-to-date":
-            image = Gtk.Image.new_from_icon_name("emblem-ok-symbolic", Gtk.IconSize.BUTTON)
-            tooltip = self._tr_update("update_status_up_to_date", "LinuxToys is up to date.")
-        elif state == "updating":
-            spinner = Gtk.Spinner()
-            spinner.start()
-            image = spinner
-            tooltip = self._tr_update("update_status_updating", "Updating LinuxToys…")
-        elif state == "restart-ready":
-            image = Gtk.Image.new_from_icon_name("software-update-available-symbolic", Gtk.IconSize.BUTTON)
-            tooltip = self._tr_update("update_status_restart", "Update installed. Restart LinuxToys.")
-            self.update_indicator.set_sensitive(True)
-            context.add_class("suggested-action")
-            context.add_class("update-restart-ready")
+        if updater_active:
+            state = self._update_state
+            source = "updater"
+        elif self._appstream_state in ("building", "failed"):
+            state = self._appstream_state
+            source = "appstream"
         else:
-            image = Gtk.Image.new_from_icon_name("dialog-warning-symbolic", Gtk.IconSize.BUTTON)
-            tooltip = self._tr_update("update_status_failed", "Automatic update failed.")
+            state = self._update_state
+            source = "updater"
+
+        if source == "appstream":
+            if state == "building":
+                spinner = Gtk.Spinner()
+                spinner.start()
+                image = spinner
+                tooltip = self.translations.get(
+                    "appstream_status_building",
+                    "Building application catalog…",
+                )
+            else:
+                image = Gtk.Image.new_from_icon_name(
+                    "dialog-warning-symbolic", Gtk.IconSize.BUTTON
+                )
+                tooltip = self.translations.get(
+                    "appstream_status_failed",
+                    "Application catalog refresh failed. The previous catalog will be used.",
+                )
+        else:
+            if state == "disabled":
+                self.update_indicator.hide()
+                return False
+            if state == "checking":
+                image = Gtk.Image.new_from_icon_name(
+                    "view-refresh-symbolic", Gtk.IconSize.BUTTON
+                )
+                tooltip = self._tr_update(
+                    "update_status_checking", "Checking for updates…"
+                )
+            elif state == "up-to-date":
+                image = Gtk.Image.new_from_icon_name(
+                    "emblem-ok-symbolic", Gtk.IconSize.BUTTON
+                )
+                tooltip = self._tr_update(
+                    "update_status_up_to_date", "LinuxToys is up to date."
+                )
+            elif state == "updating":
+                spinner = Gtk.Spinner()
+                spinner.start()
+                image = spinner
+                tooltip = self._tr_update(
+                    "update_status_updating", "Updating LinuxToys…"
+                )
+            elif state == "restart-ready":
+                image = Gtk.Image.new_from_icon_name(
+                    "software-update-available-symbolic", Gtk.IconSize.BUTTON
+                )
+                tooltip = self._tr_update(
+                    "update_status_restart", "Update installed. Restart LinuxToys."
+                )
+                self.update_indicator.set_sensitive(True)
+                context.add_class("suggested-action")
+                context.add_class("update-restart-ready")
+            else:
+                image = Gtk.Image.new_from_icon_name(
+                    "dialog-warning-symbolic", Gtk.IconSize.BUTTON
+                )
+                tooltip = self._tr_update(
+                    "update_status_failed", "Automatic update failed."
+                )
 
         self.update_indicator.set_image(image)
         self.update_indicator.set_tooltip_text(tooltip)
         self.update_indicator.show_all()
         return False
+
+    def _set_update_state(self, state):
+        """Record updater state and refresh the shared header indicator."""
+        self._update_state = state
+        return self._refresh_status_indicator()
 
     def set_automatic_updates_enabled(self, enabled):
         self.automatic_updates_enabled = bool(enabled)
@@ -643,6 +960,249 @@ class AppWindow(
         if self._update_state != "restart-ready":
             return
         os.execv(sys.executable, [sys.executable, *sys.argv])
+
+    def _refresh_installed_packages_async(self, force=False):
+        """Refresh observed native/Flatpak installations without blocking GTK."""
+        if self._installed_packages_refresh_started:
+            if force:
+                self._installed_packages_refresh_pending = True
+            return False
+        self._installed_packages_refresh_started = True
+        self._installed_packages_refresh_pending = False
+
+        def worker():
+            try:
+                installed_packages.refresh()
+            except Exception as exc:
+                logger.warning("Installed package refresh failed: %s", exc)
+            finally:
+                self._installed_packages_refresh_started = False
+                rerun = self._installed_packages_refresh_pending
+                self._installed_packages_refresh_pending = False
+                GLib.idle_add(self._on_installed_packages_changed)
+                if rerun:
+                    GLib.idle_add(self._refresh_installed_packages_async, True)
+
+        threading.Thread(
+            target=worker, daemon=True, name="linuxtoys-installed-packages"
+        ).start()
+        return False
+
+    def _refresh_installed_features_view(self):
+        view = self.main_stack.get_child_by_name("installed_features")
+        if view is not None and hasattr(view, "refresh"):
+            view.refresh()
+        return False
+
+    def _on_installed_packages_changed(self):
+        # Observed AppStream state participates in ScriptCache removability.
+        if self.script_cache.is_populated:
+            self.script_cache.refresh_removable_cache()
+
+        app_page = self.main_stack.get_child_by_name("app_page")
+        if app_page is not None and hasattr(app_page, "refresh_install_state"):
+            app_page.refresh_install_state()
+
+        installed_view = self.main_stack.get_child_by_name("installed_features")
+        if installed_view is not None and hasattr(installed_view, "refresh"):
+            installed_view.refresh()
+        return False
+
+    def _appstream_registry_managed(self, info):
+        registry_data = action_registry.parse_registry_file()
+        candidates = (
+            str(info.get("appstream_id", "") or "").strip(),
+            str(info.get("name", "") or "").strip(),
+            str(info.get("appstream_canonical_name", "") or "").strip(),
+        )
+        return any(candidate and candidate in registry_data for candidate in candidates)
+
+    def _on_item_remove_clicked(self, button, info):
+        """Use observed package state when AppStream was installed outside LinuxToys."""
+        if not info.get("is_appstream_entry") or self._appstream_registry_managed(info):
+            return ItemWidgetFactory._on_item_remove_clicked(self, button, info)
+
+        observed = installed_packages.match(info)
+        if observed is None:
+            return ItemWidgetFactory._on_item_remove_clicked(self, button, info)
+
+        remove_info = installed_packages.build_external_removal(
+            info, observed, self.translations
+        )
+        if remove_info is None:
+            return
+        record_id = info.get("_appstream_queue_record_id")
+        self._appstream_runner.enqueue_removal(info, remove_info, record_id=record_id)
+        app_page = self.main_stack.get_child_by_name("app_page")
+        if app_page is not None and hasattr(app_page, "refresh_install_state"):
+            app_page.refresh_install_state()
+
+    @staticmethod
+    def _appstream_desktop_app(info):
+        """Resolve an installed AppStream entry to a desktop application."""
+        if not info or not info.get("is_appstream_entry"):
+            return None
+        desktop_id = str(info.get("appstream_launchable", "") or "").strip()
+        if not desktop_id:
+            return None
+        try:
+            return Gio.DesktopAppInfo.new(desktop_id)
+        except (TypeError, AttributeError):
+            return None
+
+    def _can_launch_appstream_app(self, info):
+        return self._appstream_desktop_app(info) is not None
+
+    def _launch_appstream_app(self, info):
+        """Launch an AppStream application's installed desktop entry."""
+        app = self._appstream_desktop_app(info)
+        if app is None:
+            return False
+        try:
+            app.launch([], None)
+            return True
+        except GLib.Error as exc:
+            logger.warning(
+                "Unable to launch AppStream application %s: %s",
+                info.get("appstream_id") or info.get("name") or "",
+                exc,
+            )
+            return False
+
+    def _get_appstream_install_state(self, info):
+        """Resolve AppStream page state from this session first, then the registry."""
+        appstream_id = str(info.get("appstream_id", "") or "").strip()
+        if not appstream_id:
+            return "available"
+
+        session_state = self._appstream_runner.status_for_appstream_id(appstream_id)
+        if session_state is not None:
+            return session_state
+
+        registry_data = action_registry.parse_registry_file()
+        # appstream_id is the stable identity used by new background installs.
+        # Keep display/canonical-name fallbacks for entries installed by older builds.
+        registry_candidates = (
+            appstream_id,
+            str(info.get("name", "") or "").strip(),
+            str(info.get("appstream_canonical_name", "") or "").strip(),
+        )
+        if any(candidate and candidate in registry_data for candidate in registry_candidates):
+            return "installed"
+        if installed_packages.match(info) is not None:
+            return "installed"
+        return "available"
+
+    def _on_appstream_queue_changed(self):
+        """Refresh the session queue button and the queue view, if visible."""
+        records = self._appstream_runner.snapshot()
+
+        # Always refresh the visible AppStream page before handling the empty
+        # queue case. A successful removal retires its session record, so the
+        # queue can become empty here; returning before this refresh would leave
+        # the page stuck in the transient "removing" state. The resolver can
+        # now fall through to the registry, where the reverted install
+        # transaction has already been removed, and render the Install state.
+        app_page = self.main_stack.get_child_by_name("app_page")
+        if app_page is not None and hasattr(app_page, "refresh_install_state"):
+            app_page.refresh_install_state()
+
+        context = self.appstream_queue_button.get_style_context()
+        if not records:
+            context.remove_class("suggested-action")
+            context.remove_class("appstream-queue-error")
+            self.appstream_queue_button.hide()
+            queue_view = self.main_stack.get_child_by_name("appstream_queue")
+            if queue_view is not None and hasattr(queue_view, "refresh"):
+                queue_view.refresh()
+            return False
+
+        self.appstream_queue_button.show_all()
+        context.remove_class("suggested-action")
+        context.remove_class("appstream-queue-error")
+
+        active = any(record["status"] in ("queued", "running") for record in records)
+        failed = any(record["status"] == "failed" for record in records)
+        if active:
+            context.add_class("suggested-action")
+            self.appstream_queue_button.set_tooltip_text("Application installations in progress")
+        elif failed:
+            context.add_class("appstream-queue-error")
+            self.appstream_queue_button.set_tooltip_text("One or more application installations failed")
+        else:
+            self.appstream_queue_button.set_tooltip_text("Application installation queue")
+
+        queue_view = self.main_stack.get_child_by_name("appstream_queue")
+        if queue_view is not None and hasattr(queue_view, "refresh"):
+            queue_view.refresh()
+
+        return False
+
+    def _open_installed_features(self, _button=None):
+        """Open the system-wide list of features LinuxToys can currently remove."""
+        if self.main_stack.get_visible_child_name() == "installed_features":
+            return
+
+        old = self.main_stack.get_child_by_name("installed_features")
+        if old is not None:
+            self.main_stack.remove(old)
+            old.destroy()
+
+        # Installed Features and Queue are sibling utility views, not navigation
+        # levels. Switching between them must preserve the original non-utility
+        # origin instead of making one utility view the parent of the other.
+        if self.main_stack.get_visible_child_name() == "appstream_queue":
+            self._installed_features_prev = getattr(self, "_appstream_queue_prev", None)
+        else:
+            self._installed_features_prev = {
+                "child": self.main_stack.get_visible_child(),
+                "header_visible": self.header_widget.get_visible(),
+                "title": self.header_bar.props.title,
+                "footer_revealed": self.reveal.get_reveal_child(),
+                "back_visible": self.back_button.get_visible(),
+            }
+        view = installed_features.InstalledFeaturesView(self)
+        self.main_stack.add_named(view, "installed_features")
+        view.show_all()
+        self.header_widget.hide()
+        self.reveal.set_reveal_child(False)
+        self.back_button.show()
+        title = self.translations.get("installed_features", "Installed Features")
+        self.header_bar.props.title = f"LinuxToys: {title}"
+        self.main_stack.set_visible_child_name("installed_features")
+
+    def _open_appstream_queue(self, _button=None):
+        """Open the session history/queue attached to the persistent AppStream PTY."""
+        if self.main_stack.get_visible_child_name() == "appstream_queue":
+            return
+
+        old = self.main_stack.get_child_by_name("appstream_queue")
+        if old is not None:
+            self.main_stack.remove(old)
+            old.destroy()
+
+        # Installed Features and Queue are sibling utility views, not navigation
+        # levels. Switching between them must preserve the original non-utility
+        # origin instead of making one utility view the parent of the other.
+        if self.main_stack.get_visible_child_name() == "installed_features":
+            self._appstream_queue_prev = getattr(self, "_installed_features_prev", None)
+        else:
+            self._appstream_queue_prev = {
+                "child": self.main_stack.get_visible_child(),
+                "header_visible": self.header_widget.get_visible(),
+                "title": self.header_bar.props.title,
+                "footer_revealed": self.reveal.get_reveal_child(),
+                "back_visible": self.back_button.get_visible(),
+            }
+        view = appstream_queue.AppStreamQueueView(self)
+        self.main_stack.add_named(view, "appstream_queue")
+        view.show_all()
+        self.header_widget.hide()
+        self.reveal.set_reveal_child(False)
+        self.back_button.show()
+        title = self.translations.get("installation_queue", "Installation Queue")
+        self.header_bar.props.title = f"LinuxToys: {title}"
+        self.main_stack.set_visible_child_name("appstream_queue")
 
     def _check_updates(self):
         if self.automatic_updates_enabled:
@@ -1024,6 +1584,146 @@ class AppWindow(
         self.reveal.support.hide()
         self.reveal.set_reveal_child(len(self.check_buttons) >= 2)
 
+    def _categories_watermarks_ready(self):
+        """Return True once every rendered category watermark has a real pixbuf."""
+        flowbox = getattr(self, "categories_flowbox", None)
+        if flowbox is None or not flowbox.get_children():
+            return False
+
+        watermark_surfaces = []
+        stack = [flowbox]
+        while stack:
+            widget = stack.pop()
+            if hasattr(widget, "_linuxtoys_apply_pending_watermark"):
+                watermark_surfaces.append(widget)
+            try:
+                stack.extend(widget.get_children())
+            except (AttributeError, RuntimeError):
+                pass
+
+        # Category cards without a watermark are valid, but if no watermark surface
+        # has even been constructed yet GTK has not reached the state we are waiting
+        # for.
+        if not watermark_surfaces:
+            return False
+
+        for surface in watermark_surfaces:
+            # The size-allocate callback creates this attribute.  None means its
+            # pending final size has already been rendered successfully.
+            if not hasattr(surface, "_linuxtoys_pending_watermark_size"):
+                return False
+            if surface._linuxtoys_pending_watermark_size is not None:
+                return False
+
+        return True
+
+    def _finish_categories_loading_when_ready(self):
+        """Keep the startup roller visible until category watermarks are painted."""
+        if not hasattr(self, "categories_loading_box"):
+            self._categories_loading_hide_source = None
+            return False
+
+        # This callback runs every 16 ms while startup is waiting. It must remain
+        # inspection-only: watermark rendering is comparatively expensive GTK work
+        # and should never be repeated from the polling loop.
+        if self._categories_watermarks_ready():
+            self._categories_loading_hide_source = None
+            self._categories_loading_hide_started_us = None
+            self._start_categories_loading_fade()
+            return False
+
+        # Never strand the application behind the roller if an icon is malformed or
+        # a theme/backend never produces the expected allocation callback.
+        started = self._categories_loading_hide_started_us
+        if started is not None and GLib.get_monotonic_time() - started >= 2_000_000:
+            self._categories_loading_hide_source = None
+            self._categories_loading_hide_started_us = None
+            self.categories_view.set_opacity(1.0)
+            self.categories_loading_spinner.stop()
+            self.categories_loading_box.hide()
+            self._categories_startup_transition_complete = True
+            if self.should_start_random_timer and self.all_scripts:
+                GLib.idle_add(self._deferred_start_random_scripts_refresh_timer)
+            return False
+
+        return True
+
+    def _start_categories_loading_fade(self):
+        """Cross-fade the completed main menu in while the startup roller fades out."""
+        if self._categories_loading_fade_source is not None:
+            return False
+        if not hasattr(self, "categories_view"):
+            return False
+
+        self._categories_loading_fade_started_us = GLib.get_monotonic_time()
+        self.categories_view.set_opacity(0.0)
+        self.categories_loading_box.set_opacity(1.0)
+        self._categories_loading_fade_source = GLib.timeout_add(
+            16,
+            self._step_categories_loading_fade,
+        )
+        return False
+
+    def _step_categories_loading_fade(self):
+        """Advance the startup cross-fade without removing either widget from layout."""
+        started = self._categories_loading_fade_started_us
+        if started is None:
+            self._categories_loading_fade_source = None
+            return False
+
+        elapsed_ms = (GLib.get_monotonic_time() - started) / 1000.0
+        duration = max(1, self._categories_loading_fade_duration_ms)
+        progress = min(1.0, elapsed_ms / duration)
+
+        self.categories_view.set_opacity(progress)
+        self.categories_loading_box.set_opacity(1.0 - progress)
+
+        if progress < 1.0:
+            return True
+
+        self._categories_loading_fade_source = None
+        self._categories_loading_fade_started_us = None
+        self.categories_view.set_opacity(1.0)
+        self.categories_loading_box.set_opacity(1.0)
+        self.categories_loading_spinner.stop()
+        self.categories_loading_box.hide()
+
+        # Featured creation/animation is intentionally held back during startup so
+        # its GTK work cannot contend with the opacity crossfade. Release it only
+        # after the final crossfade frame has been committed.
+        self._categories_startup_transition_complete = True
+        if self.should_start_random_timer and self.all_scripts:
+            GLib.idle_add(self._deferred_start_random_scripts_refresh_timer)
+        return False
+
+    def _hide_categories_loading_indicator(self):
+        """Hide startup loading only after bootstrap data and watermarks are ready."""
+        if not hasattr(self, "categories_loading_box"):
+            return False
+        if self._appstream_initial_build_pending:
+            return False
+        if not self.categories_loading_box.get_visible():
+            return False
+        if self._categories_loading_hide_source is not None:
+            return False
+
+        self._categories_loading_hide_started_us = GLib.get_monotonic_time()
+
+        # Give any deferred startup watermark allocations one explicit chance to
+        # render before polling. After this, the 16 ms readiness callback only
+        # observes state; normal allocation/resize machinery owns further renders.
+        if not self._categories_loading_watermarks_flushed:
+            flush = getattr(self, "_flush_deferred_category_watermarks", None)
+            if flush is not None:
+                flush()
+            self._categories_loading_watermarks_flushed = True
+
+        self._categories_loading_hide_source = GLib.timeout_add(
+            16,
+            self._finish_categories_loading_when_ready,
+        )
+        return False
+
     def _render_categories(self, categories):
         """Render an already parsed category snapshot on the GTK thread."""
         # Store current category info and temporarily set to None for proper bold formatting.
@@ -1033,7 +1733,27 @@ class AppWindow(
         self.categories_flowbox.foreach(
             lambda widget: self.categories_flowbox.remove(widget)
         )
-        for cat in categories:
+
+        # Specials is a virtual top-level category backed by the curated category
+        # cache. Keep it first so the LinuxToys-curated catalog is the leading
+        # main-menu option. Its visible strings come from the normal translation
+        # dictionary, just like the parser-backed categories.
+        specials_category = {
+            "name": self.translations.get("specials", "Specials"),
+            "description": self.translations.get(
+                "specials_desc",
+                "LinuxToys-curated software and scripts.",
+            ),
+            "icon": "linuxtoys.svg",
+            "path": "specials://root",
+            "type": "category",
+            "is_script": False,
+            "is_subcategory": False,
+            "is_linuxtoys_specials": True,
+        }
+        rendered_categories = [specials_category, *categories]
+
+        for cat in rendered_categories:
             widget = self.create_item_widget(cat)
             description = cat.get("description", "")
             widget.set_tooltip_text(description or None)
@@ -1050,6 +1770,7 @@ class AppWindow(
         if not categories:
             categories = parser.get_categories(self.translations)
         self._render_categories(categories)
+        self._hide_categories_loading_indicator()
 
     def _load_scripts_into_flowbox(
         self,
@@ -1060,11 +1781,12 @@ class AppWindow(
         animate_initial=True,
     ):
         """
-        Populate a category without blocking navigation on every card.
+        Populate category cards lazily.
 
-        Navigation may defer the entire lookup/construction pass until after the
-        Gtk.Stack slide completes. This is important for cache misses and nested
-        categories too: even parser work should not compete with the transition.
+        Only a small viewport-sized buffer is materialized initially. More cards
+        are appended when the user reaches 75% of the currently materialized
+        content. The complete category remains lightweight Python data until its
+        cards are actually needed.
         """
         if defer_initial:
             scheduled_generation = (
@@ -1094,16 +1816,55 @@ class AppWindow(
                 priority=GLib.PRIORITY_LOW,
             )
             return
+
         for child in flowbox.get_children():
             flowbox.remove(child)
 
-        # Invalidate an older deferred population targeting this same FlowBox.
+        # Invalidate every deferred/timed population targeting this FlowBox.
         generation = getattr(flowbox, "_linuxtoys_population_generation", 0) + 1
         flowbox._linuxtoys_population_generation = generation
+        flowbox._linuxtoys_lazy_state = None
 
         category_path = category_info["path"]
 
-        if self.category_cache.is_populated:
+        # Specials depends on the complete recursive CategoryCache. The main menu
+        # is published from the top-level bootstrap before that cache has finished.
+        if (
+            category_info.get("is_linuxtoys_specials")
+            or category_info.get("is_linuxtoys_specials_category")
+        ) and not self.category_cache.is_populated:
+            expected_cache = self.category_cache
+
+            def populate_specials_when_ready():
+                if (
+                    getattr(flowbox, "_linuxtoys_population_generation", None)
+                    != generation
+                ):
+                    return False
+                if self.category_cache is not expected_cache:
+                    self._load_scripts_into_flowbox(
+                        flowbox, category_info, defer_initial=False
+                    )
+                    return False
+                if not expected_cache.is_populated:
+                    return True
+                self._load_scripts_into_flowbox(
+                    flowbox, category_info, defer_initial=False
+                )
+                return False
+
+            GLib.timeout_add(100, populate_specials_when_ready)
+            return
+
+        if category_info.get("is_linuxtoys_specials"):
+            scripts = self.category_cache.get_linuxtoys_special_categories(
+                self.translations
+            )
+        elif category_info.get("is_linuxtoys_specials_category"):
+            scripts = self.category_cache.get_linuxtoys_special_scripts(
+                category_info.get("specials_category_path", "")
+            )
+        elif self.category_cache.is_populated:
             scripts = self.category_cache.get_scripts_for_category(category_path)
             if not scripts:
                 scripts = parser.get_scripts_for_category(
@@ -1114,16 +1875,83 @@ class AppWindow(
                 category_path, self.translations
             )
 
+        scripts = list(scripts)
         checklist_mode = category_info.get("display_mode", "menu") == "checklist"
         allow_drag = self._is_local_scripts_category(category_info)
 
-        # Around three rows at the normal five-column layout. This bounds the
-        # click-to-first-frame work independently of category size.
-        initial_batch_size = 10
-        # Keep FlowBox mutation frame-sized after the first screenful. Two cards
-        # per frame avoids the ten-widget layout bursts that made large categories
-        # visibly hitch while still filling them at roughly 120 cards/second.
         frame_batch_size = 2
+        frame_interval_ms = 20
+        scroll_trigger = 0.75
+
+        def find_scrolled_window():
+            widget = flowbox
+            while widget is not None:
+                if isinstance(widget, Gtk.ScrolledWindow):
+                    return widget
+                try:
+                    widget = widget.get_parent()
+                except (AttributeError, RuntimeError):
+                    return None
+            return None
+
+        def viewport_capacity():
+            """
+            Estimate one visible viewport of cards from the live allocation.
+
+            Card content has a 128x52 minimum request. Account for FlowBox margins,
+            card badge-edge space and row/column spacing. Once GTK has real child
+            allocations, prefer those measurements over the fallback constants.
+            """
+            scrolled = find_scrolled_window()
+            if scrolled is not None:
+                allocation = scrolled.get_allocation()
+                viewport_width = max(1, int(allocation.width))
+                viewport_height = max(1, int(allocation.height))
+            else:
+                allocation = flowbox.get_allocation()
+                viewport_width = max(1, int(allocation.width))
+                viewport_height = max(1, int(allocation.height))
+
+            card_width = 132
+            card_height = 56
+            children = flowbox.get_children()
+            if children:
+                child_allocation = children[0].get_allocation()
+                if child_allocation.width > 1:
+                    card_width = int(child_allocation.width)
+                if child_allocation.height > 1:
+                    card_height = int(child_allocation.height)
+
+            horizontal_space = max(1, viewport_width - 64)
+            columns = max(
+                1,
+                min(
+                    5,
+                    int((horizontal_space + 16) // max(1, card_width + 16)),
+                ),
+            )
+            visible_rows = max(
+                1,
+                int((viewport_height + 12 + card_height - 1) // (card_height + 12)),
+            )
+            return max(1, columns * visible_rows)
+
+        state = {
+            "scripts": scripts,
+            "next_index": 0,
+            "target_index": 0,
+            "timer_id": None,
+            "generation": generation,
+            "initial_complete": False,
+        }
+        flowbox._linuxtoys_lazy_state = state
+
+        def state_is_current():
+            return (
+                getattr(flowbox, "_linuxtoys_population_generation", None)
+                == generation
+                and getattr(flowbox, "_linuxtoys_lazy_state", None) is state
+            )
 
         def add_card(script_info):
             widget = self.create_item_widget(
@@ -1133,114 +1961,190 @@ class AppWindow(
             )
             description = script_info.get("description", "")
             widget.set_tooltip_text(description or None)
-            # Opacity must be zero before the widget becomes visible; otherwise
-            # GTK may paint one fully-opaque frame before the fade scheduler runs.
             widget.set_opacity(0.0)
             flowbox.add(widget)
             return widget
 
-        initial_count = min(len(scripts), initial_batch_size)
-        remaining = iter(scripts[initial_count:])
-        frame_interval_ms = 20
-
         def populate_timed_batch():
-            if (
-                getattr(flowbox, "_linuxtoys_population_generation", None)
-                != generation
-            ):
+            if not state_is_current():
+                state["timer_id"] = None
                 return False
 
-            added = 0
-            batch_widgets = []
-            exhausted = False
-            while added < frame_batch_size:
-                try:
-                    script_info = next(remaining)
-                except StopIteration:
-                    exhausted = True
-                    break
+            target = min(state["target_index"], len(scripts))
+            if state["next_index"] >= target:
+                state["timer_id"] = None
+                return False
 
-                widget = add_card(script_info)
+            batch_widgets = []
+            stop = min(target, state["next_index"] + frame_batch_size)
+            while state["next_index"] < stop:
+                widget = add_card(scripts[state["next_index"]])
+                state["next_index"] += 1
                 widget.show_all()
                 batch_widgets.append(widget)
-                added += 1
 
             self.animate_item_batch(
                 batch_widgets,
                 duration_ms=110,
                 stagger_ms=5,
             )
-            return not exhausted
+
+            if state["next_index"] >= target:
+                state["timer_id"] = None
+                return False
+            return True
+
+        def ensure_population_timer(delay_ms=frame_interval_ms):
+            if not state_is_current():
+                return
+            if state["next_index"] >= state["target_index"]:
+                return
+            if state["timer_id"] is not None:
+                return
+
+            def start_or_continue():
+                if not state_is_current():
+                    state["timer_id"] = None
+                    return False
+                return populate_timed_batch()
+
+            state["timer_id"] = GLib.timeout_add(
+                max(1, int(delay_ms)),
+                start_or_continue,
+                priority=GLib.PRIORITY_LOW,
+            )
+
+        def request_more(viewports=1):
+            if not state_is_current() or state["next_index"] >= len(scripts):
+                return
+
+            capacity = viewport_capacity()
+            extra = max(1, capacity * max(1, int(viewports)))
+            state["target_index"] = min(
+                len(scripts),
+                max(state["target_index"], state["next_index"] + extra),
+            )
+            ensure_population_timer()
+
+        def on_scroll_position_changed(adjustment):
+            if not state_is_current() or not state["initial_complete"]:
+                return
+            if state["target_index"] >= len(scripts):
+                return
+
+            upper = float(adjustment.get_upper())
+            page_size = float(adjustment.get_page_size())
+            if upper <= 0.0:
+                return
+
+            progress = (float(adjustment.get_value()) + page_size) / upper
+            if progress >= scroll_trigger:
+                request_more(1)
+
+        def on_flowbox_size_allocate(_widget, _allocation):
+            if not state_is_current() or not state["initial_complete"]:
+                return
+
+            # A resize can expose substantially more room without producing a
+            # scroll event. Keep at least two viewports materialized ahead of an
+            # enlarged viewport, but never discard cards when the window shrinks.
+            capacity = viewport_capacity()
+            desired = min(len(scripts), max(capacity * 2, state["next_index"]))
+            if desired > state["target_index"]:
+                state["target_index"] = desired
+                ensure_population_timer()
+
+        # Connect the scrolling/resize observers once per FlowBox. Their callbacks
+        # always consult the FlowBox's current lazy state, so retained category
+        # views and later generations do not accumulate active population logic.
+        scrolled = find_scrolled_window()
+        if scrolled is not None:
+            adjustment = scrolled.get_vadjustment()
+            if not getattr(flowbox, "_linuxtoys_lazy_scroll_connected", False):
+                def lazy_scroll_dispatch(adj, target_flowbox=flowbox):
+                    current = getattr(
+                        target_flowbox, "_linuxtoys_lazy_scroll_callback", None
+                    )
+                    if current is not None:
+                        current(adj)
+
+                adjustment.connect("value-changed", lazy_scroll_dispatch)
+                flowbox._linuxtoys_lazy_scroll_connected = True
+            flowbox._linuxtoys_lazy_scroll_callback = on_scroll_position_changed
+
+        if not getattr(flowbox, "_linuxtoys_lazy_resize_connected", False):
+            def lazy_resize_dispatch(widget, allocation, target_flowbox=flowbox):
+                current = getattr(
+                    target_flowbox, "_linuxtoys_lazy_resize_callback", None
+                )
+                if current is not None:
+                    current(widget, allocation)
+
+            flowbox.connect("size-allocate", lazy_resize_dispatch)
+            flowbox._linuxtoys_lazy_resize_connected = True
+        flowbox._linuxtoys_lazy_resize_callback = on_flowbox_size_allocate
 
         def populate_initial_batch():
-            if (
-                getattr(flowbox, "_linuxtoys_population_generation", None)
-                != generation
-            ):
+            if not state_is_current():
                 return False
 
-            initial_widgets = []
-            for script_info in scripts[:initial_count]:
-                widget = add_card(script_info)
+            # Put a small seed batch on screen immediately. This deliberately
+            # happens before asking GTK for the real viewport/card geometry, so
+            # entering a category never presents an empty page while allocations
+            # settle. The seed also gives viewport_capacity() a real card
+            # allocation to measure on the following main-loop turn.
+            seed_count = min(len(scripts), 6)
+            seed_widgets = []
+            while state["next_index"] < seed_count:
+                widget = add_card(scripts[state["next_index"]])
+                state["next_index"] += 1
                 widget.show_all()
-                initial_widgets.append(widget)
+                seed_widgets.append(widget)
 
             if animate_initial:
                 self.animate_item_batch(
-                    initial_widgets,
-                    duration_ms=120,
-                    stagger_ms=8,
+                    seed_widgets,
+                    duration_ms=90,
+                    stagger_ms=5,
                 )
             else:
-                # Terminal-return refreshes happen behind the still-visible VTE.
-                # Make the first screenful fully ready immediately so no per-card
-                # fade animation competes with the Gtk.Stack reverse transition.
-                for widget in initial_widgets:
+                for widget in seed_widgets:
                     widget.set_opacity(1.0)
 
             self._configure_local_scripts_interaction(flowbox, category_info)
             if checklist_mode:
                 self.reveal.set_reveal_child(len(self.check_buttons) >= 2)
 
-            if initial_count < len(scripts):
-                pause_ms = int(pause_after_initial_ms)
-                if pause_ms > frame_interval_ms:
-                    # The terminal-return pause is only a one-shot hold before
-                    # progressive population resumes.  Do not use it as the
-                    # repeating timeout interval: populate_timed_batch() returns
-                    # True while work remains, so GLib would otherwise repeat
-                    # every ~stack-transition duration instead of every frame.
-                    def resume_timed_population():
-                        if (
-                            getattr(
-                                flowbox,
-                                "_linuxtoys_population_generation",
-                                None,
-                            )
-                            != generation
-                        ):
-                            return False
+            def finish_initial_sizing():
+                if not state_is_current():
+                    return False
 
-                        has_more = populate_timed_batch()
-                        if has_more:
-                            GLib.timeout_add(
-                                frame_interval_ms,
-                                populate_timed_batch,
-                                priority=GLib.PRIORITY_LOW,
-                            )
-                        return False
+                capacity = viewport_capacity()
+                # Small windows get more scrolling headroom; large windows already
+                # expose many cards, so two viewports are enough.
+                multiplier = 3 if capacity <= 20 else 2
+                state["target_index"] = min(
+                    len(scripts),
+                    max(state["next_index"], capacity * multiplier),
+                )
+                state["initial_complete"] = True
 
-                    GLib.timeout_add(
-                        pause_ms,
-                        resume_timed_population,
-                        priority=GLib.PRIORITY_LOW,
+                if state["next_index"] < state["target_index"]:
+                    pause_ms = max(0, int(pause_after_initial_ms))
+                    ensure_population_timer(
+                        pause_ms
+                        if pause_ms > frame_interval_ms
+                        else frame_interval_ms
                     )
-                else:
-                    GLib.timeout_add(
-                        frame_interval_ms,
-                        populate_timed_batch,
-                        priority=GLib.PRIORITY_LOW,
-                    )
+                return False
+
+            # Let GTK paint/allocate the seed cards first. The expensive-looking
+            # part of entering the category is therefore overlapped with the first
+            # visible frame instead of preceding it.
+            GLib.idle_add(
+                finish_initial_sizing,
+                priority=GLib.PRIORITY_LOW,
+            )
             return False
 
         populate_initial_batch()
@@ -1338,7 +2242,7 @@ class AppWindow(
         if self.reboot_required and not self._show_reboot_warning_dialog():
             return
 
-        script_info = manifest_helper.find_script_by_id(target_id, self.translations)
+        script_info = uri_parser.resolve_install_target(target_id, self.translations)
         if script_info is None:
             self.show_external_install_error(
                 self.translations.get(
@@ -1377,6 +2281,15 @@ class AppWindow(
         """Run the normal single-entry confirmation and terminal-view flow."""
         deps = asyncio.run(self._process_needed_scripts([info]))
         if not deps:
+            return
+
+        if info.get("is_appstream_entry"):
+            # AppStream installs stay on the app page. Queue state owns the button
+            # until the background operation succeeds, fails, or is cancelled.
+            self._appstream_runner.enqueue(deps)
+            app_page = self.main_stack.get_child_by_name("app_page")
+            if app_page is not None and hasattr(app_page, "refresh_install_state"):
+                app_page.refresh_install_state()
             return
 
         script_name = info.get("name", "")
@@ -1512,8 +2425,285 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
         # Return True if user clicked "Cancel Script" (YES), False otherwise
         return response == Gtk.ResponseType.YES
 
+    def _on_close_requested(self, _widget, _event):
+        """Guard application shutdown while AppStream work is still active."""
+        runner = getattr(self, "_appstream_runner", None)
+        if runner is not None and runner.has_pending_operations():
+            if not self._show_queue_close_warning_dialog():
+                return True
+
+        self._close_application()
+        return True
+
+    def _show_queue_close_warning_dialog(self):
+        """Warn before closing while queued or running operations remain."""
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            flags=0,
+            message_type=Gtk.MessageType.WARNING,
+            buttons=Gtk.ButtonsType.NONE,
+            text=self.translations.get(
+                "queue_close_title",
+                "Operations Are Still Running",
+            ),
+        )
+
+        dialog.format_secondary_text(
+            self.translations.get(
+                "queue_close_message",
+                "Closing LinuxToys will stop all queued and running operations. "
+                "Interrupting an operation while it is in progress may cause "
+                "problems with your system. Are you sure you want to close?",
+            )
+        )
+
+        dialog.add_button(
+            self.translations.get(
+                "queue_close_continue_btn",
+                "Keep LinuxToys Open",
+            ),
+            Gtk.ResponseType.NO,
+        )
+        close_button = dialog.add_button(
+            self.translations.get(
+                "queue_close_close_btn",
+                "Close Anyway",
+            ),
+            Gtk.ResponseType.YES,
+        )
+        close_button.get_style_context().add_class("destructive-action")
+        dialog.set_default_response(Gtk.ResponseType.NO)
+
+        response = dialog.run()
+        dialog.destroy()
+        return response == Gtk.ResponseType.YES
+
+
+    def _window_state_path(self):
+        """Return the per-environment cache path used for window geometry."""
+        try:
+            cache_dir = compat.get_linuxtoys_cache_dir()
+        except (AttributeError, TypeError):
+            cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "linuxtoys")
+        return os.path.join(cache_dir, "window-state.json")
+
+    def _primary_monitor_workarea(self):
+        """Return the primary monitor's usable (non-panel) width and height."""
+        display = Gdk.Display.get_default()
+        if display is not None and hasattr(display, "get_primary_monitor"):
+            monitor = display.get_primary_monitor()
+            if monitor is not None:
+                area = monitor.get_workarea()
+                return area.width, area.height
+
+        screen = Gdk.Screen.get_default()
+        if screen is not None:
+            monitor_index = screen.get_primary_monitor()
+            area = screen.get_monitor_workarea(monitor_index)
+            return area.width, area.height
+        return None
+
+    def _restore_window_state(self):
+        """Restore the last usable size/maximized state for the current display."""
+        default_width, default_height = self._default_window_size
+        workarea = self._primary_monitor_workarea()
+
+        state = {}
+        try:
+            with open(self._window_state_path(), "r", encoding="utf-8") as state_file:
+                state = json.load(state_file)
+            if not isinstance(state, dict):
+                state = {}
+        except (OSError, ValueError, TypeError):
+            state = {}
+
+        if state.get("maximized") is True:
+            self.maximize()
+            return
+
+        try:
+            width = int(state.get("width", default_width))
+            height = int(state.get("height", default_height))
+        except (TypeError, ValueError):
+            width, height = default_width, default_height
+
+        # Reject nonsensical/corrupt geometry as well as geometry that no longer
+        # fits the current monitor. In either case, retry with the app default.
+        saved_size_valid = width > 0 and height > 0
+        if workarea is not None:
+            saved_size_valid = (
+                saved_size_valid
+                and width <= workarea[0]
+                and height <= workarea[1]
+            )
+
+        if not saved_size_valid:
+            width, height = default_width, default_height
+
+        if workarea is not None and (width > workarea[0] or height > workarea[1]):
+            self.maximize()
+            return
+
+        self._last_normal_window_size = (width, height)
+        self.set_default_size(width, height)
+
+    def _on_window_state_changed(self, _widget, event):
+        """Keep Featured out of width negotiation while leaving maximized state."""
+        changed = bool(event.changed_mask & Gdk.WindowState.MAXIMIZED)
+        maximized = bool(event.new_window_state & Gdk.WindowState.MAXIMIZED)
+        if not changed or maximized:
+            return False
+
+        if (
+            hasattr(self, "main_stack")
+            and self.main_stack.get_visible_child_name() == "categories"
+            and getattr(self, "random_scripts_flowbox", None) is not None
+        ):
+            # Do not destroy/reselect cards here. Hiding the fixed-column grid is
+            # enough to stop its maximized natural width influencing the restored
+            # top-level size, while preserving Featured state and history.
+            self.random_scripts_flowbox.hide()
+            self.categories_view.queue_resize()
+            self.categories_flowbox.queue_resize()
+
+            if getattr(self, "_featured_unmaximize_timer", None):
+                GLib.source_remove(self._featured_unmaximize_timer)
+
+            self._featured_unmaximize_timer = GLib.timeout_add(
+                self.FEATURED_RESIZE_DEBOUNCE_MS,
+                self._finish_featured_unmaximize,
+            )
+
+        return False
+
+    def _finish_featured_unmaximize(self):
+        """Re-enable Featured after the restored window geometry has settled."""
+        self._featured_unmaximize_timer = None
+
+        if self.main_stack.get_visible_child_name() != "categories":
+            self.random_scripts_flowbox.show()
+            return False
+
+        # At this point the category FlowBox has the restored viewport width, so the
+        # existing Featured geometry calculation can safely mirror its real columns.
+        self._featured_last_layout = None
+        self._featured_layout_metrics = None
+        self._refresh_random_scripts_display(force=False)
+        self.random_scripts_flowbox.show()
+        self.categories_view.queue_resize()
+        return False
+
+    def _request_window_resize_settle(self, *_args):
+        """Restart the single debounce used by responsive LinuxToys UI work."""
+        if getattr(self, "_window_resize_settling", False):
+            return False
+
+        width, height = self.get_size()
+        if width > 0 and height > 0:
+            self._pending_window_size = (int(width), int(height))
+
+        self._window_resize_pending = True
+        if self._window_resize_settle_timer is not None:
+            GLib.source_remove(self._window_resize_settle_timer)
+
+        self._window_resize_settle_timer = GLib.timeout_add(
+            self.FEATURED_RESIZE_DEBOUNCE_MS,
+            self._apply_window_resize_settled,
+        )
+        return False
+
+    def _apply_window_resize_settled(self):
+        """Run expensive responsive calculations once after resizing goes quiet."""
+        self._window_resize_settle_timer = None
+        self._window_resize_pending = False
+        self._window_resize_settling = True
+
+        try:
+            size = tuple(getattr(self, "_pending_window_size", self.get_size()))
+            size_changed = size != self._last_settled_window_size
+            self._last_settled_window_size = size
+
+            # Allocation-sized category watermarks are intentionally not regenerated
+            # while an interactive resize is in progress. Render them once at the
+            # final settled allocation instead.
+            flush_watermarks = getattr(self, "_flush_deferred_category_watermarks", None)
+            if flush_watermarks is not None:
+                flush_watermarks()
+
+            # Main-menu Featured already compares its final rows/columns against
+            # the previous layout, so this is cheap when no breakpoint changed.
+            if (
+                self.should_start_random_timer
+                and self.all_scripts
+                and self._categories_startup_transition_complete
+                and self.main_stack.get_visible_child_name() == "categories"
+            ):
+                self._apply_featured_resize()
+
+            # App pages own several width-dependent operations (description height,
+            # screenshot source choice and Featured geometry). Let the page consume
+            # the same final window geometry in one pass.
+            if self.main_stack.get_visible_child_name() == "app_page":
+                page = self.main_stack.get_child_by_name("app_page")
+                if page is not None and hasattr(page, "on_window_resize_settled"):
+                    page.on_window_resize_settled(size_changed=size_changed)
+        finally:
+            self._window_resize_settling = False
+
+        return False
+
+    def _on_window_configure(self, _widget, _event):
+        """Remember normal size and debounce expensive responsive recalculation."""
+        self._request_window_resize_settle()
+
+        gdk_window = self.get_window()
+        if gdk_window is None:
+            return False
+        if gdk_window.get_state() & Gdk.WindowState.MAXIMIZED:
+            return False
+
+        width, height = self.get_size()
+        if width > 0 and height > 0:
+            self._last_normal_window_size = (width, height)
+        return False
+
+    def _save_window_state(self):
+        """Persist the last normal size plus the current maximized state."""
+        maximized = False
+        gdk_window = self.get_window()
+        if gdk_window is not None:
+            maximized = bool(gdk_window.get_state() & Gdk.WindowState.MAXIMIZED)
+
+        width, height = self._last_normal_window_size
+        state = {
+            "width": int(width),
+            "height": int(height),
+            "maximized": maximized,
+        }
+
+        state_path = self._window_state_path()
+        try:
+            os.makedirs(os.path.dirname(state_path), exist_ok=True)
+            temporary_path = f"{state_path}.tmp"
+            with open(temporary_path, "w", encoding="utf-8") as state_file:
+                json.dump(state, state_file)
+            os.replace(temporary_path, state_path)
+        except OSError as exc:
+            logger.warning("Could not save window state: %s", exc)
+
     def _close_application(self):
         """Closes the application gracefully and performs cleanup."""
+        if getattr(self, "_featured_unmaximize_timer", None):
+            GLib.source_remove(self._featured_unmaximize_timer)
+            self._featured_unmaximize_timer = None
+        # Persist UI state once per session, at shutdown.
+        self._save_window_state()
+        self._save_featured_sense()
+
+        # Stop the persistent AppStream PTY before deleting its temporary state.
+        if getattr(self, "_appstream_runner", None) is not None:
+            self._appstream_runner.shutdown()
+
         # Clean up temporary directory
         tmp_linuxtoys_path = "/tmp/linuxtoys"
         try:
@@ -1583,6 +2773,9 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
         # Refresh the dropdown menu with new translations
         if hasattr(self, "menu_button"):
             self.menu_button.refresh_menu_translations()
+
+        # Refresh the shared updater/AppStream indicator tooltip in the new language.
+        self._refresh_status_indicator()
 
         # Always reload categories with new translations (so they're ready when user navigates back)
         self.load_categories()
