@@ -77,13 +77,13 @@ class DescButton(Button):
 
     def on_mount(self) -> None:
         if self.is_installed:
-            self.styles.border = ("heavy", "red")
+            self.styles.border = ("tall", "red")
             self.label = f"{self.script_name} "
         elif self.is_new:
-            self.styles.border = ("heavy", "yellow")
+            self.styles.border = ("tall", "yellow")
 
 
-class HistoryListItem(ListItem):
+class RegistryListItem(ListItem):
     def __init__(self, script_name: str) -> None:
         super().__init__(Label(script_name))
         self.script_name = script_name
