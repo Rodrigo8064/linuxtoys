@@ -2,10 +2,11 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.timer import Timer
-from textual.widgets import Button, DirectoryTree, Input, Static
+from textual.widgets import Button, DirectoryTree, Footer, Input, Static
 
 from .helper import translations
 
@@ -70,8 +71,7 @@ class FilteredDirectoryTree(DirectoryTree):
 
 class ManifestDialog(ModalScreen[str | None]):
     BINDINGS = [
-        ("escape", "cancel", "Cancelar"),
-        ("w", "app.pop_screen", "Voltar"),
+        Binding("escape", "cancel", translations.get("script_runner_close"))
     ]
 
     def compose(self) -> ComposeResult:
@@ -103,6 +103,7 @@ class ManifestDialog(ModalScreen[str | None]):
             yield FilteredDirectoryTree(
                 Path("~").expanduser(), id="manifest-tree"
             )
+        yield Footer()
 
     def on_mount(self):
         self._search_timer: Timer | None = None
