@@ -14,13 +14,13 @@ from textual.widgets import (
 from app.registry_utils import parse_registry_file, search_registry_entries
 
 from .helper import translations
-from .my_widgets import FocusableLabel, HistoryListItem
+from .my_widgets import FocusableLabel, RegistryListItem
 
 
-class HistoryScreen(Screen):
+class RegistryScreen(Screen):
     BINDINGS = [
         Binding(
-            "escape", "close_history", translations.get("script_runner_close")
+            "escape", "close_registry", translations.get("script_runner_close")
         ),
     ]
 
@@ -39,15 +39,15 @@ class HistoryScreen(Screen):
                 with Vertical(id="left-panel"):
                     script_name = sorted(self.registry_data.keys())
                     yield ListView(
-                        *[HistoryListItem(name) for name in script_name],
-                        id="history-list",
+                        *[RegistryListItem(name) for name in script_name],
+                        id="registry-list",
                     )
             with Vertical(id="right-panel"):
                 yield Static(
                     "Selecione um script à esquerda para ver os detalhes"
                     if self.registry_data
                     else "Nenhum script foi executado ainda.",
-                    id="history-details",
+                    id="registry-details",
                 )
         with Horizontal(classes="home-links"):
             yield Link(" Wiki", url="https://linux.toys/knowledgebase.html")
@@ -74,16 +74,16 @@ class HistoryScreen(Screen):
             "registry_details_label"
         )
 
-        list_view = self.query_one("#history-list", ListView)
+        list_view = self.query_one("#registry-list", ListView)
         list_view.focus()
         if self.registry_data:
             list_view.index = 0
-            first_item = list_view.query(HistoryListItem).first()
+            first_item = list_view.query(RegistryListItem).first()
             self._display_script_details(first_item.script_name)
 
     def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
         item = event.item
-        if isinstance(item, HistoryListItem):
+        if isinstance(item, RegistryListItem):
             self._display_script_details(item.script_name)
 
     async def on_input_changed(self, event: Input.Changed) -> None:
@@ -94,11 +94,11 @@ class HistoryScreen(Screen):
     async def _filter_history(self, query: str) -> None:
         filtered_data = search_registry_entries(self.registry_data, query)
         filtered_names = sorted(filtered_data.keys())
-        list_view = self.query_one("#history-list", ListView)
+        list_view = self.query_one("#registry-list", ListView)
         await list_view.clear()
         for name in filtered_names:
-            await list_view.append(HistoryListItem(name))
-        details = self.query_one("#history-details", Static)
+            await list_view.append(RegistryListItem(name))
+        details = self.query_one("#registry-details", Static)
         if filtered_names:
             list_view.index = 0
             self._display_script_details(filtered_names[0])
@@ -122,12 +122,18 @@ class HistoryScreen(Screen):
                 lines.append("Operações: (nenhuma)\n")
             lines.append("\n" + "-" * 60 + "\n\n")
 
-        self.query_one("#history-details", Static).update("".join(lines))
+        self.query_one("#registry-details", Static).update("".join(lines))
 
-    def action_close_history(self) -> None:
+    def action_close_registry(self) -> None:
         self.app.pop_screen()
 
+    def action_clean_registry(self) -> None:
+        pass
 
-class HistoryOpenerMixin:
+    def actiob_export_registry(self) -> None:
+        pass
+
+
+class RegistryOpenerMixin:
     def action_open_history(self) -> None:
-        self.app.push_screen(HistoryScreen())
+        self.app.push_screen(RegistryScreen())
