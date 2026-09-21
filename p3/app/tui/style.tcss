@@ -1,8 +1,171 @@
 Screen {
   align: center middle;
 }
+/* --------------------- HOME CSS -------------------------------*/
+#body-home {
+  height: 1fr;
+}
 
+#left-column-home {
+  width: 1fr;
+  height: 1fr;
+}
+
+#search-input {
+  margin-bottom: 1;
+}
+
+#left-panel-home {
+  width: 100%;
+  height: 1fr;
+  border: round $primary;
+  border-title-color: $text;
+  padding: 1 2;
+  background: transparent;
+}
+
+#menu-panel {
+  width: 2fr;
+  height: 1fr;
+  border: round $accent;
+  padding: 1 2;
+  align: center middle;
+}
+
+#logo {
+  width: 100%;
+  height: auto;
+  content-align: center middle;
+  background: transparent;
+}
+
+#menu-panel #logo {
+  width: 100%;
+  height: auto;
+  content-align: center middle;
+}
+
+#home-menu {
+  background: transparent;
+  width: 100%;
+  height: auto;
+  margin-top: 2;
+}
+
+#home-menu Label {
+  width: 100%;
+  content-align: center middle;
+}
+
+.home-links > *{
+  width: auto;
+  height: 1;
+  margin: 0 2;
+  text-align: center;
+  color: $accent;
+}
+
+.home-links {
+  dock: bottom;
+  width: 100%;
+  height: 3;
+  align: center middle;
+  padding: 1 0;
+}
+
+.link-sep {
+    margin: 0 1;
+    color: $text-muted;
+}
+/* --------------------- END -------------------------------*/
+
+/* --------------------- ABOUT CSS -------------------------------*/
+AboutScreen {
+    align: center middle;
+}
+
+#about-container {
+    max-width: 60%;
+    height: 60%;
+    background: transparent;
+    border: round $primary;
+    content-align: center middle;
+}
+
+#license-scroll {
+    max-width: 100%;
+    height: 1fr;
+    align: center middle;
+}
+
+.about-scroll {
+  width: 100%;
+  max-width: 100%;
+  height: 1fr;
+  align: center middle;
+}
+
+.profile-text {
+    width: 100%;
+    height: 3;
+    align: center middle;
+}
+
+.profile-text Static {
+    width: 100%;
+    text-align: center;
+}
+
+.section-title {
+    width: 100%;
+    height: auto;
+    content-align: center middle;
+}
+
+.section-title Static {
+    width: 100%;
+    text-align: center;
+}
+
+.contributors-grid {
+    layout: grid;
+    grid-size: 3;
+    grid-columns: 1fr 1fr 1fr;
+    grid-gutter: 1 0;
+    padding: 1 0;
+    width: 100%;
+    height: auto;
+}
+
+.contributors-grid Static {
+    content-align: center middle;
+    text-align: center;
+    width: 100%;
+}
+
+.license-text {
+  width: 100%;
+  height: auto;
+  content-align: center middle;
+}
+/* ------------------------------ END -------------------- */
+
+/* ------------------------------ REGISTRY CSS -------------------- */
 #body {
+  height: 1fr;
+}
+
+#right-panel {
+  width: 2fr;
+  height: 1fr;
+  border: round $accent;
+  padding: 1 2;
+  border-title-color: $text;
+  background: transparent;
+}
+
+#left-column {
+  width: 1fr;
   height: 1fr;
 }
 
@@ -15,21 +178,16 @@ Screen {
   background: transparent;
 }
 
-#right-panel {
-  width: 2fr;
-  height: 1fr;
-  border: round $accent;
-  padding: 1 2;
-  border-title-color: $text;
-  background: transparent;
+#search-registry {
+  margin-bottom: 1;
 }
 
-#history-list {
+#registry-list {
   height: 1fr;
   background: transparent;
 }
 
-#history-details {
+#registry-details {
   height: 100%;
   # border: round $accent;
   padding: 1 2;
@@ -37,14 +195,54 @@ Screen {
   background: transparent;
   overflow-y: auto;
 }
+/* ------------------------------ END -------------------- */
 
-DescButton {
-  width: 1fr;
-  margin-bottom: 1;
-  border: round $primary;
-  background: transparent;
+/* ------------------------------ MANIFEST CSS -------------------- */
+ManifestDialog {
+    align: center middle;
 }
 
+#manifest-container {
+    width: 90%;
+    height: 90%;
+    background: $surface;
+    border: round $primary;
+    padding: 1 2;
+}
+
+#manifest-header {
+    height: 3;
+    align-vertical: middle;
+    margin-bottom: 1;
+}
+
+#manifest-title {
+    width: 1fr;
+    height: 3;
+    content-align: center middle;
+    text-style: bold;
+    color: $text-muted;
+}
+
+#manifest-search {
+    width: 30;
+    margin-right: 1;
+}
+
+#cancel-btn-manifest, #execute-btn-manifest {
+    min-width: 16;
+}
+
+#manifest-tree {
+    height: 1fr;
+    background: $boost;
+    border: solid $panel;
+    padding: 1;
+}
+/* ------------------------------ END -------------------- */
+
+
+/* ------------------------------ DIALOG CSS -------------------- */
 ConfirmScriptScreen {
   align: center middle;
 }
@@ -94,201 +292,12 @@ ConfirmScriptScreen {
 #sudo-password-input {
   margin-bottom: 1;
 }
+/* ------------------------------ END -------------------- */
 
-#logo {
-  width: 100%;
-  height: auto;
-  content-align: center middle;
-  background: transparent;
-}
-
-.home {    
-  width: 58;
-  max-width: 100%;
-  height: auto;
-  align: center middle;
-}
-
-.home Button {
-  width: 30;
-  margin: 1 1;
-}
-
-#home-menu {
-  background: transparent;
-  width: 100%;
-  height: auto;
-  margin-top: 2;
-}
-
-#home-menu Label {
-  width: 100%;
-  content-align: center middle;
-}
-
-.hello {
-  width: 100%;
-  height: auto;
-  content-align: center middle;
-}
-
-.contributors-grid {
-  layout: grid;
-  grid-size: 3 2;
-  grid-columns: 16;
-  grid-gutter: 1 0;
-  padding: 1 0;
-  width: auto;
-  height: auto;
-}
-
-.contributors-grid Static {
-  content-align: center middle;
-  width: 100%;
-}
-
-.home-links Link {
-  margin: 0 2;
-  color: $accent;
-}
-
-.home-links {
-  dock: bottom;
-  width: 100%;
-  max-width: 100%;
-  height: auto;
-  align: center middle;
-  padding: 1 0;
-}
-
-#left-column {
-  width: 1fr;
-  height: 1fr;
-}
-
-#search-input {
-  margin-bottom: 1;
-}
-
-#search-registry {
-  margin-bottom: 1;
-}
-
-#menu-panel {
-  width: 2fr;
-  height: 1fr;
-  border: round $accent;
-  padding: 1 2;
-  align: center middle;
-}
-
-#menu-panel #logo {
-  width: 100%;
-  height: auto;
-  content-align: center middle;
-}
-
-#terminal-conteiner {
-  width: 2fr;
-  height: 1fr;
-}
-
-Terminal {
-  width: 100%;
-  height: 100%;
-}
-
-.report-bug {
-    color: $accent;
-}
-
-.report-bug:hover {
-    color: $accent-lighten-2;
-}
-
-.report-bug:focus {
-  text-style: reverse;
-}
-
-ReportBugDialog {
-    align: center middle;
-}
-
-/* Container principal da Modal */
-#dialog-container {
-    width: 76;
-    height: auto;
-    padding: 1 2;
-    background: $surface;
-    border: round $primary;
-}
-
-/* Linha superior (Aplicativo + Seleção) */
-.form-row {
-    height: auto;
-    align-vertical: middle;
-    margin-bottom: 1;
-}
-
-.label-inline {
-    width: 1fr;
-    content-align: left middle;
-    height: 3;
-}
-
-/* Rótulos de campo */
-.field-label {
-    margin-bottom: 1;
-}
-
-/* Área de texto */
-TextArea#bug-description {
-    height: 8;
-    margin-bottom: 1;
-    background: $boost;
-    border: none;
-}
-
-/* Informações do sistema */
-#system-info-text {
-    color: $text-muted;
-    height: auto;
-    margin-bottom: 1;
-}
-
-/* Container dos botões alinhado à direita */
-#buttons-aligh-right {
-    height: 3;
-    align-horizontal: right;
-}
-
-#confirm-buttons Button {
-    margin-left: 1;
-    min-width: 12;
-}
-
-#cancel-btn {
-    background: transparent;
-    border: round $error;
-}
-
-#execute-btn {
-    border: round $primary;
-}
-
-#select-app {
-    width: 32;
-    height: 3;
-}
-
-.field-label {
-  margin-top: 1;
-  margin-bottom: 1;
-}
-
+/* ------------------------------ LANGUAGE CSS -------------------- */
 #lang-dialog-container {
-    width: 60;
-    height: 30;
+    max-width: 60%;
+    height: 60%;
     padding: 1 2;
     background: $surface;
     border: round $primary;
@@ -323,52 +332,107 @@ LanguageListItem Label {
   width: 1fr;
   text-overflow: ellipsis;
 }
+/* ------------------------------ END -------------------- */
 
-/* Fundo escurecido da Modal */
-ManifestDialog {
-    align: center middle;
-}
-
-/* Container principal simulando uma janela grande */
-#manifest-container {
-    width: 90%;
-    height: 90%;
+/* ------------------------------ REPORT BUG -------------------- */
+#dialog-container {
+    width: 76;
+    height: auto;
+    padding: 1 2;
     background: $surface;
     border: round $primary;
-    padding: 1 2;
 }
 
-/* Barra superior (Header) */
-#manifest-header {
-    height: 3;
+.form-row {
+    height: auto;
     align-vertical: middle;
     margin-bottom: 1;
 }
 
-/* O título age como um espaçador expansível */
-#manifest-title {
+.label-inline {
     width: 1fr;
+    content-align: left middle;
     height: 3;
-    content-align: center middle;
-    text-style: bold;
-    color: $text-muted;
 }
 
-/* Campo de busca menor e ao lado do botão Selecionar */
-#manifest-search {
-    width: 30;
-    margin-right: 1;
+.field-label {
+    margin-bottom: 1;
 }
 
-/* Botões do cabeçalho */
-#cancel-btn-manifest, #execute-btn-manifest {
-    min-width: 16;
-}
-
-/* Área da árvore de diretórios */
-#manifest-tree {
-    height: 1fr;
+TextArea#bug-description {
+    height: 8;
+    margin-bottom: 1;
     background: $boost;
-    border: solid $panel;
-    padding: 1;
+    border: none;
 }
+
+#system-info-text {
+    color: $text-muted;
+    height: auto;
+    margin-bottom: 1;
+}
+
+#buttons-aligh-right {
+    height: 3;
+    align-horizontal: right;
+}
+
+#confirm-buttons Button {
+    margin-left: 1;
+    min-width: 12;
+}
+
+#cancel-btn {
+    background: transparent;
+    border: round $error;
+}
+
+#execute-btn {
+    border: round $primary;
+}
+
+#select-app {
+    width: 32;
+    height: 3;
+}
+
+.field-label {
+  margin-top: 1;
+  margin-bottom: 1;
+}
+/* ------------------------------ END -------------------- */
+
+/* ------------------------------ MY_WIDGETS CSS -------------------- */
+#terminal-conteiner {
+  width: 2fr;
+  height: 1fr;
+}
+
+Terminal {
+  width: 100%;
+  height: 100%;
+}
+
+.report-bug {
+    color: $accent;
+}
+
+.report-bug:hover {
+    color: $accent-lighten-2;
+}
+
+.report-bug:focus {
+  text-style: reverse;
+}
+
+ReportBugDialog {
+    align: center middle;
+}
+
+DescButton {
+  width: 1fr;
+  margin-bottom: 1;
+  border: round $primary;
+  background: transparent;
+}
+/* ------------------------------ END -------------------- */
