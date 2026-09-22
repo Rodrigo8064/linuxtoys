@@ -11,7 +11,11 @@ from textual.widgets import (
     Static,
 )
 
-from app.action_registry import _find_backup_files_for_script
+from app.action_registry import (
+    _find_backup_files_for_script,
+    _remove_backup_files,
+    _remove_script_from_registry,
+)
 from app.registry_utils import parse_registry_file, search_registry_entries
 
 from .dialog_screen import ConfirmCleanupDialog
@@ -137,22 +141,20 @@ class RegistryScreen(Screen):
 
     def action_cleanup_registry(self) -> None:
         list_view = self.query_one("#registry-list", ListView)
-        selected_item = list_view.highlighted_child
-        backup_files = _find_backup_files_for_script(
-            selected_item, self.registry_data
-        )
+        self.selected_item = list_view.highlighted_child
+        if not isinstance(self.selected_item, RegistryListItem):
+            return
 
+        script_display = self.selected_item.script_name
+
+        backup_files = _find_backup_files_for_script(
+            script_display, self.registry_data
+        )
         backup_count = len(backup_files)
 
-        script_display = getattr(
-            self,
-            "current_script_display",
-            selected_item,
-        )
-
-        def handle_dialog_result(confirmed: bool | None) -> None:
+        async def handle_dialog_result(confirmed: bool | None) -> None:
             if confirmed:
-                self._execute_cleanup()
+                await self._execute_cleanup()
             else:
                 pass
 
@@ -162,9 +164,53 @@ class RegistryScreen(Screen):
             callback=handle_dialog_result,
         )
 
-    def _execute_cleanup(self) -> None:
-        """Sua lógica de exclusão do registro aqui."""
-        self.notify("Registro removido com sucesso!")
+    async def _execute_cleanup(self) -> None:
+        list_view = self.query_one("#registry-list", ListView)
+        self.selected_item = list_view.highlighted_child
+        if not isinstance(self.selected_item, RegistryListItem):
+            return
+
+        script_display = self.selected_item.script_name
+        # Find backup files
+        backup_files = _find_backup_files_for_script(
+            script_display, self.registry_data
+        )
+
+        # Remove script from registry
+        registry_removed = _remove_script_from_registry(script_display)
+
+        # Remove backup files
+        success_count, failed_paths = _remove_backup_files(backup_files)
+        if registry_removed:
+            if failed_paths:
+                self.notify(
+                    f"Registry entry removed. {success_count} backup file(s) deleted, "
+                    f"but {len(failed_paths)} could not be removed (may require elevated permissions)."
+                )
+            else:
+                self.notify(
+                    f"Registry entry and {len(backup_files)} backup file(s) successfully removed."
+                )
+                await self._refresh_page()
+        else:
+            self.notify(
+                translations.get("registry_cleanup_failed", "Cleanup Failed")
+            )
+
+    async def _refresh_page(self):
+        self.registry_data = parse_registry_file()
+        script_names = sorted(self.registry_data.keys())
+        list_view = self.query_one("#registry-list", ListView)
+        await list_view.remove_children()
+        await list_view.mount(
+            *[RegistryListItem(name) for name in script_names]
+        )
+        details_widget = self.query_one("#registry-details", Static)
+        if script_names:
+            list_view.index = 0
+            self._display_script_details(script_names[0])
+        else:
+            details_widget.update("Nenhum script foi executado ainda.")
 
     def actiob_export_registry(self) -> None:
         pass

@@ -376,7 +376,7 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
         )
 
 
-class LinuxToys(ScriptRunnerMixin, RegistryOpenerMixin, App):
+class LinuxToys(App):
     """enter for linuxtoys TUI"""
 
     CSS_PATH = "style.tcss"

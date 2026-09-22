@@ -91,11 +91,18 @@ class ConfirmCleanupDialog(ModalScreen[bool]):
             yield Static(secondary_text, id="dialog-message")
 
             with Horizontal(id="dialog-buttons"):
-                yield Button("Cancelar", variant="default", id="cancel-btn")
-                yield Button("Remover", variant="error", id="remove-btn")
+                yield Button(
+                    translations.get("cancel_btn_label", "Cancel"),
+                    variant="default",
+                    id="cancel-btn",
+                )
+                yield Button(
+                    translations.get("term_view_remove", "Remove"),
+                    variant="error",
+                    id="remove-btn",
+                )
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        # Se clicar no botão Remover, o dismiss passa True; caso contrário, False
         if event.button.id == "remove-btn":
             self.dismiss(True)
         else:
