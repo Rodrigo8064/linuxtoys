@@ -11,8 +11,10 @@ from textual.widgets import (
     Static,
 )
 
+from app.action_registry import _find_backup_files_for_script
 from app.registry_utils import parse_registry_file, search_registry_entries
 
+from .dialog_screen import ConfirmCleanupDialog
 from .helper import translations
 from .my_widgets import FocusableLabel, RegistryListItem
 
@@ -21,6 +23,12 @@ class RegistryScreen(Screen):
     BINDINGS = [
         Binding(
             "escape", "close_registry", translations.get("script_runner_close")
+        ),
+        Binding("e", "export_registry", translations.get("export", "Export")),
+        Binding(
+            "c",
+            "cleanup_registry",
+            translations.get("registry_cleanup_label", "Cleanup"),
         ),
     ]
 
@@ -127,8 +135,36 @@ class RegistryScreen(Screen):
     def action_close_registry(self) -> None:
         self.app.pop_screen()
 
-    def action_clean_registry(self) -> None:
-        pass
+    def action_cleanup_registry(self) -> None:
+        list_view = self.query_one("#registry-list", ListView)
+        selected_item = list_view.highlighted_child
+        backup_files = _find_backup_files_for_script(
+            selected_item, self.registry_data
+        )
+
+        backup_count = len(backup_files)
+
+        script_display = getattr(
+            self,
+            "current_script_display",
+            selected_item,
+        )
+
+        def handle_dialog_result(confirmed: bool | None) -> None:
+            if confirmed:
+                self._execute_cleanup()
+            else:
+                pass
+
+        # Exibe o modal e aguarda a resposta
+        self.app.push_screen(
+            ConfirmCleanupDialog(script_display, backup_count),
+            callback=handle_dialog_result,
+        )
+
+    def _execute_cleanup(self) -> None:
+        """Sua lógica de exclusão do registro aqui."""
+        self.notify("Registro removido com sucesso!")
 
     def actiob_export_registry(self) -> None:
         pass

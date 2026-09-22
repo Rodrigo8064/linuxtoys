@@ -63,6 +63,45 @@ class ConfirmScriptScreen(ModalScreen[bool]):
         self.dismiss(False)
 
 
+class ConfirmCleanupDialog(ModalScreen[bool]):
+    """Diálogo modal de confirmação para remoção de registro."""
+
+    def __init__(
+        self,
+        script_name: str,
+        backup_count: int = 0,
+        name: str | None = None,
+        id: str | None = None,
+        classes: str | None = None,
+    ) -> None:
+        super().__init__(name=name, id=id, classes=classes)
+        self.script_name = script_name
+        self.backup_count = backup_count
+
+    def compose(self) -> ComposeResult:
+        secondary_text = (
+            f"This will remove the registry entry for '{self.script_name}' and delete "
+            f"{self.backup_count} backup file(s). After removal, you will no longer be able "
+            "to undo the operations from this script using the app.\n\n"
+            "This action cannot be undone."
+        )
+
+        with Vertical(id="confirm-dialog"):
+            yield Static("Remover entrada do registro?", id="dialog-title")
+            yield Static(secondary_text, id="dialog-message")
+
+            with Horizontal(id="dialog-buttons"):
+                yield Button("Cancelar", variant="default", id="cancel-btn")
+                yield Button("Remover", variant="error", id="remove-btn")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        # Se clicar no botão Remover, o dismiss passa True; caso contrário, False
+        if event.button.id == "remove-btn":
+            self.dismiss(True)
+        else:
+            self.dismiss(False)
+
+
 class RemoveScriptScreen(ModalScreen[bool]):
     """Modal exibido antes de rodar um script, com a descrição e
     dois botões: Cancelar e Executar. Retorna True/False via dismiss()."""
