@@ -12,7 +12,6 @@ from app.easy_cli import (
     resolve_script_dir,
 )
 from app.library_loader import script_command
-from app.parser import get_scripts_for_category
 from app.registry_utils import parse_registry_file
 from app.repo_parser import materialize_repo_script
 from app.revert_helper import build_uninstall_script_entry
@@ -26,6 +25,7 @@ from .dialog_screen import (
     SudoPasswordScreen,
 )
 from .helper import (
+    get_scripts_for_category_cached,
     make_widget_id,
     translations,
 )
@@ -93,9 +93,7 @@ class ScriptRunnerMixin:
             self.run_uninstall(button)
 
     async def _navigate_to_category(self, button: DescButton) -> None:
-        items = get_scripts_for_category(
-            button.path, translations=translations
-        )
+        items = get_scripts_for_category_cached(button.path)
         left_panel = self.query_one("#left-panel-home", VerticalScroll)
         await left_panel.remove_children()
         registry_data = parse_registry_file()

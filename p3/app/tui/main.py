@@ -13,7 +13,6 @@ from textual.widgets import (
     Link,
     ListItem,
     ListView,
-    Rule,
     Static,
 )
 
@@ -32,6 +31,7 @@ from .helper import (
     make_widget_id,
     search_scripts,
     translations,
+    warm_category_cache,
 )
 from .manifest_dialog import ManifestDialog
 from .my_widgets import (
@@ -161,6 +161,12 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
             exclusive=False,
             name="warm_search_index",
         )
+        self.run_worker(
+            warm_category_cache,
+            thread=True,
+            exclusive=False,
+            name="warm_category_cache",
+        )
 
     @on(FocusableLabel.Pressed, "#report-bug")
     def handle_report_bug(self) -> None:
@@ -271,6 +277,7 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
             import app.tui.helper as helper_module
 
             helper_module._search_index_cache = None
+            helper_module._category_scripts_cache = {}
             # e recarrega a home, já que categorias podem ter mudado
             self.run_worker(self.action_reset_to_home())
         else:
@@ -295,6 +302,7 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
         from . import helper as helper_module
 
         helper_module._search_index_cache = None  # invalida a busca
+        helper_module._category_scripts_cache = {}
 
         await self.action_reset_to_home()
         await self._refresh_fixed_ui_labels()

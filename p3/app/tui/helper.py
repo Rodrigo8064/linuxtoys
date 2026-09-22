@@ -1,10 +1,15 @@
 import re
 
 from app.lang_utils import load_translations
-from app.parser import get_all_scripts_recursive, get_categories
+from app.parser import (
+    get_all_scripts_recursive,
+    get_categories,
+    get_scripts_for_category,
+)
 
 translations = load_translations()  # Auto-detect language from lang_utils
 _search_index_cache: list[dict] | None = None
+_category_scripts_cache: dict[str, list[dict]] = {}
 
 
 def load_categories(translations) -> list[dict]:
@@ -49,3 +54,23 @@ def search_scripts(query: str) -> list[dict]:
     return [
         item for item in get_search_index() if query in item["name"].lower()
     ]
+
+
+def get_scripts_for_category_cached(category_path: str) -> list[dict]:
+    """Versão cacheada de get_scripts_for_category — calculada uma vez
+    por categoria e reaproveitada. Evita revarrer o disco toda vez que
+    o usuário entra na mesma categoria."""
+    if category_path not in _category_scripts_cache:
+        _category_scripts_cache[category_path] = get_scripts_for_category(
+            category_path, translations=translations
+        )
+    return _category_scripts_cache[category_path]
+
+
+def warm_category_cache() -> None:
+    """Pré-computa os scripts de TODAS as categorias de topo em
+    background — assim, entrar em qualquer uma delas (mesmo a de 40
+    scripts) já está pronto quando o usuário chegar lá."""
+    categories = load_categories(translations)
+    for category in categories:
+        get_scripts_for_category_cached(category["path"])
