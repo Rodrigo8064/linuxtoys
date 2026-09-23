@@ -85,7 +85,7 @@ AboutScreen {
 }
 
 #about-container {
-    max-width: 60%;
+    max-width: 40%;
     height: 60%;
     background: transparent;
     border: round $primary;
@@ -105,15 +105,26 @@ AboutScreen {
   align: center middle;
 }
 
+#header-row, #leader-row {
+    height: auto;
+    margin-bottom: 1;
+}
+
+#header-row > Static, #leader-row > Static {
+    width: auto;
+    height: auto;
+    margin-right: 2;
+}
+
 .profile-text {
-    width: 100%;
-    height: 3;
-    align: center middle;
+    width: 1fr;
+    height: 100%;
+    align: left middle;
 }
 
 .profile-text Static {
     width: 100%;
-    text-align: center;
+    text-align: left;
 }
 
 .section-title {

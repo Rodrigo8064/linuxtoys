@@ -1,8 +1,11 @@
+from pathlib import Path
+
 import requests
+from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import (
     Footer,
@@ -18,6 +21,18 @@ from app.updater import __version__
 
 from .helper import translations
 
+CURRENT_DIR = Path(__file__).parent
+ICONS_DIR = CURRENT_DIR.parent / "icons" / "old"
+
+
+def load_ansi_art(filename: str) -> Text:
+    file_path = ICONS_DIR / filename
+    try:
+        ansi_content = file_path.read_text(encoding="utf-8")
+        return Text.from_ansi(ansi_content)
+    except FileNotFoundError:
+        return Text(f"Arte não encontrada: {filename}", style="bold red")
+
 
 class AboutScreen(ModalScreen[None]):
     BINDINGS = [
@@ -27,6 +42,8 @@ class AboutScreen(ModalScreen[None]):
     ]
 
     def compose(self) -> ComposeResult:
+        psyicon_art = load_ansi_art("psyicon.ansi")
+        linuxtoys_art = load_ansi_art("linuxtoys.ansi")
         compat_display = self._get_compat_display_string()
 
         with Vertical(id="about-container"):
@@ -37,29 +54,33 @@ class AboutScreen(ModalScreen[None]):
                 ):
                     with VerticalScroll(classes="about-scroll"):
                         # logo and info
-                        with Vertical(classes="profile-text"):
-                            yield Static(
-                                "[bold]LinuxToys[/bold]",
-                            )
-                            yield Static(compat_display)
-                            yield Static(
-                                translations.get(
-                                    "subtitle",
-                                    "A collection of tools for Linux in a user-friendly way.",
-                                ),
-                            )
+                        with Horizontal(id="header-row"):
+                            yield Static(linuxtoys_art)
+                            with Vertical(classes="profile-text"):
+                                yield Static(
+                                    "[bold]LinuxToys[/bold]",
+                                )
+                                yield Static(compat_display)
+                                yield Static(
+                                    translations.get(
+                                        "subtitle",
+                                        "A collection of tools for Linux in a user-friendly way.",
+                                    ),
+                                )
 
                         yield Rule()
                         # Autor
-                        with Vertical(classes="profile-text"):
-                            yield Static(
-                                "[bold]Victor 'psygreg' Gregory[/bold]"
-                            )
-                            yield Static(
-                                translations.get(
-                                    "project_lead", "Project Lead"
+                        with Horizontal(id="leader-row"):
+                            yield Static(psyicon_art)
+                            with Vertical(classes="profile-text"):
+                                yield Static(
+                                    "[bold]Victor 'psygreg' Gregory[/bold]"
                                 )
-                            )
+                                yield Static(
+                                    translations.get(
+                                        "project_lead", "Project Lead"
+                                    )
+                                )
 
                         yield Rule()
 
