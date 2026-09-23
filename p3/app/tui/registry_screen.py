@@ -65,16 +65,19 @@ class RegistryScreen(Screen):
                     id="registry-details",
                 )
         with Horizontal(classes="home-links"):
-            yield Link(" Wiki", url="https://linux.toys/knowledgebase.html")
+            yield Link(" Wiki", url="https://linux.toys/documentation.html")
+            yield Static("│", classes="link-sep")
             yield FocusableLabel(
                 f" [u]{translations.get('report_label', 'Report Bug')}[/u]",
                 id="report-bug",
                 classes="report-bug",
             )
+            yield Static("│", classes="link-sep")
             yield Link(
-                f" {translations.get('credits_label', 'Credits')}",
-                url="https://linux.toys/credits.html",
+                f" {translations.get('devportal_label', 'Credits')}",
+                url="https://dev.linux.toys",
             )
+            yield Static("│", classes="link-sep")
             yield Link(
                 f" {translations.get('support_footer', 'Support this project')}",
                 url="https://ko-fi.com/psygreg",
