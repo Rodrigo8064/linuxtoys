@@ -75,7 +75,7 @@ class ScriptRunnerMixin:
                 ),
             )
         else:
-            self.push_screen(
+            self.app.push_screen(
                 RemoveScriptScreen(script_name, button.description),
                 callback=lambda confirmed: self._on_confirm_uninstall(
                     button, confirmed

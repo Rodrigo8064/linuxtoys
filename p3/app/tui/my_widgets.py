@@ -123,7 +123,13 @@ class TerminalPTY:
     def _open_terminal(self) -> int:
         pid, fd = pty.fork()
         if pid == 0:
-            argv = ["bash", "--norc", "--noprofile"]
+            try:
+                attrs = termios.tcgetattr(0)
+                attrs[3] &= ~termios.ECHO  # attrs[3] é a flag lflag
+                termios.tcsetattr(0, termios.TCSANOW, attrs)
+            except termios.error:
+                pass
+            argv = ["bash", "--norc", "--noprofile", "--noediting"]
             lang = os.environ.get("LANG") or "C.UTF-8"
             env = dict(
                 os.environ,
@@ -192,6 +198,7 @@ class PasswordPromptDetected(Message):
 class Terminal(Widget, can_focus=True):
     EXIT_MARKER = "@@LT_EXIT@@:"
     _EXIT_LINE_RE = re.compile(re.escape(EXIT_MARKER) + r"\d+\r?\n?")
+    _START_LINE_RE = re.compile(r"@@LT_START@@:[0-9a-f]+\r?\n?")
     _PASSWORD_RE = re.compile(r"(?i)password.*:\s*$")
 
     def __init__(self, ncol: int = 80, nrow: int = 24, **kwargs) -> None:
@@ -357,7 +364,9 @@ class Terminal(Widget, can_focus=True):
                 chars = message[1]
                 self._check_exit_marker(chars)
                 self._check_password_prompt(chars)
-                self.stream.feed(self._EXIT_LINE_RE.sub("", chars))
+                visible = self._EXIT_LINE_RE.sub("", chars)
+                visible = self._START_LINE_RE.sub("", visible)
+                self.stream.feed(visible)
                 self._render_screen()
             elif cmd == "disconnect":
                 self._awaiting_exit_code = False
