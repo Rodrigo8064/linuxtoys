@@ -49,7 +49,6 @@ class ConfirmScriptScreen(ModalScreen[bool]):
                     variant="error",
                 )
                 yield Button("Executar", id="execute-btn", variant="success")
-            yield Footer()
 
     def on_mount(self) -> None:
         self.query_one("#confirm-description").border_title = "Descrição"
@@ -133,7 +132,6 @@ class RemoveScriptScreen(ModalScreen[bool]):
                     variant="error",
                 )
                 yield Button("Remover", id="execute-btn", variant="success")
-            yield Footer()
 
     def on_mount(self) -> None:
         self.query_one("#confirm-description").border_title = "Descrição"
@@ -164,7 +162,6 @@ class SuccessDialog(ModalScreen[None]):
             yield Label(f"'{self.script_name}' foi {self.action} com sucesso.")
             with Horizontal(id="confirm-buttons"):
                 yield Button("Concluir", id="execute-btn", variant="success")
-            yield Footer()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "execute-btn":
@@ -202,7 +199,6 @@ class ErrorDialog(ModalScreen[bool]):
                 yield Button(
                     "Reportar Bug", id="report-bug", variant="warning"
                 )
-        yield Footer()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(event.button.id == "report-bug")
@@ -247,7 +243,6 @@ class SudoPasswordScreen(ModalScreen[str | None]):
                     variant="error",
                 )
                 yield Button("Confirmar", id="confirm-btn", variant="success")
-        yield Footer()
 
     def on_mount(self) -> None:
         self.query_one("#sudo-password-input", Input).focus()
@@ -293,7 +288,6 @@ class CancelledDialog(ModalScreen[None]):
                     id="execute-btn",
                     variant="primary",
                 )
-        yield Footer()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "execute-btn":

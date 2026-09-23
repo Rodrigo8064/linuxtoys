@@ -1,3 +1,5 @@
+import os
+
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -16,6 +18,7 @@ from app.action_registry import (
     _remove_backup_files,
     _remove_script_from_registry,
 )
+from app.manifest_helper import export_registered_manifest
 from app.registry_utils import parse_registry_file, search_registry_entries
 
 from .dialog_screen import ConfirmCleanupDialog
@@ -158,7 +161,6 @@ class RegistryScreen(Screen):
             else:
                 pass
 
-        # Exibe o modal e aguarda a resposta
         self.app.push_screen(
             ConfirmCleanupDialog(script_display, backup_count),
             callback=handle_dialog_result,
@@ -212,8 +214,32 @@ class RegistryScreen(Screen):
         else:
             details_widget.update("Nenhum script foi executado ainda.")
 
-    def actiob_export_registry(self) -> None:
-        pass
+    def action_export_registry(self) -> None:
+        try:
+            manifest_path, entry_count = export_registered_manifest(
+                registry_data=self.registry_data,
+                translations=translations,
+            )
+            self.notify(
+                translations.get(
+                    "registry_export_success_message",
+                    "Exported {count} registered operation(s) to:\n{path}",
+                ).format(count=entry_count, path=manifest_path)
+            )
+        except OSError as exc:
+            self.notify(
+                translations.get(
+                    "registry_export_error_title", "Manifest export failed"
+                )
+            )
+
+        if os.environ.get("LT_DEBUG") == "1":
+            self.notify(
+                translations.get(
+                    "registry_export_success_message",
+                    "Exported {count} registered operation(s) to:\n{path}",
+                ).format(count=entry_count, path=manifest_path)
+            )
 
 
 class RegistryOpenerMixin:
