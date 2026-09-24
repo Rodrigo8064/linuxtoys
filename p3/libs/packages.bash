@@ -321,10 +321,10 @@ pkg_fromfile () {
     # Use filtered args for the rest of the function
     set -- "${_filtered_args[@]}"
 
-    [[ "$1" == *.flatpak ]] || askpass
+    [[ "$1" == *.flatpak || "$1" == *.flatpakref ]] || askpass
     runner_lock "package-transaction"
 
-    if [[ "$1" == *.flatpak ]]; then
+    if [[ "$1" == *.flatpak || "$1" == *.flatpakref ]]; then
         if ! command -v flatpak &>/dev/null || ! flatpak remote-list | grep -q flathub; then
             summon_helpers
             flatpak_in_lib
@@ -1472,7 +1472,7 @@ EOF
     if is_systemd; then
         if ! flatpak list | grep -q "it.mijorus.gearlever"; then
             info "$gearlevermsg"
-            call_script GEAR_LEVER
+            call_script it.mijorus.gearlever
         fi
         local output
         if output=$(echo "y" | flatpak run it.mijorus.gearlever --integrate "$@" 2>&1); then
