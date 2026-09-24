@@ -319,6 +319,11 @@ class Terminal(Widget, can_focus=True):
                 self.pty.recv_queue.put(["set_size", nrow, ncol, 0, 0])
             )
 
+    @staticmethod
+    def _split_marker(marker: str) -> tuple[str, str]:
+        mid = len(marker) // 2
+        return marker[:mid], marker[mid:]
+
     def run_script(
         self, command: str | list, env: dict[str, str] | None = None
     ) -> None:
@@ -343,12 +348,17 @@ class Terminal(Widget, can_focus=True):
             )
             prefix = f"export {exports}; "
         self._last_run_marker = f"@@LT_START@@:{uuid.uuid4().hex[:8]}"
+        start_left, start_right = self._split_marker(self._last_run_marker)
+        exit_left, exit_right = self._split_marker(self.EXIT_MARKER)
         line = (
-            f"{prefix}echo {self._last_run_marker}; "
+            f"{prefix}"
+            f'_lt_s={shlex.quote(start_left)}; _lt_s="$_lt_s"{shlex.quote(start_right)}; '
+            f'echo "$_lt_s"; '
             f"{quoted_command}; "
             "__lt_code=$?; "
             'read -rp "Pressione ENTER para continuar..." ; '
-            f"echo {self.EXIT_MARKER}$__lt_code\n"
+            f'_lt_e={shlex.quote(exit_left)}; _lt_e="$_lt_e"{shlex.quote(exit_right)}; '
+            f'echo "$_lt_e$__lt_code"\n'
         )
         asyncio.create_task(self.pty.recv_queue.put(["stdin", line]))
 
@@ -379,6 +389,10 @@ class Terminal(Widget, can_focus=True):
         self._exit_scan_buffer += chars
         idx = self._exit_scan_buffer.rfind(self.EXIT_MARKER)
         if idx == -1:
+            keep_from = max(
+                0, len(self._exit_scan_buffer) - (len(self.EXIT_MARKER) - 1)
+            )
+            self._exit_scan_buffer = self._exit_scan_buffer[keep_from:]
             return
         rest = self._exit_scan_buffer[idx + len(self.EXIT_MARKER) :]
         digits = ""
