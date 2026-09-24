@@ -7,7 +7,7 @@ import pickle
 import re
 import threading
 
-from . import appstream_cache
+from . import appstream_cache, repo_parser
 from .compat import get_system_compat_keys
 from .lang_utils import detect_system_language
 
@@ -18,7 +18,7 @@ _RUNTIME_CACHE = {}
 # Persistent acceleration cache for the final LinuxToys-ready AppStream entries.
 # catalog.json remains authoritative; this file is disposable and regenerated
 # whenever any input represented by the runtime cache key changes.
-RUNTIME_CACHE_SCHEMA = 8
+RUNTIME_CACHE_SCHEMA = 10
 RUNTIME_CACHE_PATH = appstream_cache.CACHE_DIR / "runtime-entries.pickle"
 
 # Most recent inputs used to build the live runtime catalog. This is process-local
@@ -49,6 +49,7 @@ APPSTREAM_SOURCE_PREFERENCE = {
 # When active, native and user-scope Flatpak alternatives are intentionally hidden.
 SYSTEM_FLATPAK_ONLY = {
     "io.github.ilya_zlobintsev.LACT",
+    "com.dec05eba.gpu_screen_recorder"
 }
 
 # Developer-facing denylist for AppStream applications that must not be offered
@@ -592,9 +593,9 @@ def _is_verified_flatpak(component):
 
 
 def _host_prefers_native_appstream():
-    """Arch Linux, CachyOS, and Solus prefer native packages over ordinary Flathub."""
+    """Arch Linux, CachyOS, Fedora and Solus prefer native packages over ordinary Flathub."""
     compat_keys = get_system_compat_keys()
-    return bool({"arch", "cachy", "solus"} & compat_keys)
+    return bool({"arch", "cachy", "solus", "fedora"} & compat_keys)
 
 
 def _is_steamos_host():
@@ -1125,13 +1126,26 @@ def _to_repo_entry(component, category, lang_code):
         "path": f"appstream://{source}/{component_id}",
     }
 
+    overlay = component.get("_linuxtoys_overlay")
+    if isinstance(overlay, dict):
+        entry.update(overlay)
+        entry["has_app_page"] = bool(
+            entry.get("has_app_page")
+            or overlay.get("purchase_options")
+            or overlay.get("subscription_options")
+        )
+
     alternatives = component.get("_source_alternatives") or ()
     if alternatives:
         source_options = [dict(entry)]
         for alternate in alternatives:
             try:
                 option_category = category
-                source_options.append(_to_repo_entry(alternate, option_category, lang_code))
+                alternate_for_entry = alternate
+                if isinstance(overlay, dict):
+                    alternate_for_entry = dict(alternate)
+                    alternate_for_entry["_linuxtoys_overlay"] = overlay
+                source_options.append(_to_repo_entry(alternate_for_entry, option_category, lang_code))
             except (KeyError, TypeError, ValueError):
                 continue
         if len(source_options) > 1:
@@ -1149,6 +1163,7 @@ def _persistent_runtime_cache_key(
     scripts_dir,
     catalog_mtime,
     curated_signature,
+    overlay_signature,
     lang_code,
     category_paths,
 ):
@@ -1160,6 +1175,7 @@ def _persistent_runtime_cache_key(
         scripts_dir,
         int(catalog_mtime),
         curated_signature,
+        overlay_signature,
         lang_code,
         category_paths,
     )
@@ -1236,6 +1252,10 @@ def load_entries(scripts_dir, curated_entries=None, category_paths=None):
         catalog_mtime = 0
 
     curated_entries = list(curated_entries or ())
+    appstream_overlays = repo_parser.load_appstream_overlays(scripts_dir)
+    overlay_signature = tuple(
+        sorted((key, repr(value)) for key, value in appstream_overlays.items())
+    )
     lang_code = detect_system_language()
     curated_signature = tuple(
         sorted(
@@ -1255,6 +1275,7 @@ def load_entries(scripts_dir, curated_entries=None, category_paths=None):
         scripts_dir,
         catalog_mtime,
         curated_signature,
+        overlay_signature,
         lang_code,
         category_paths,
     )
@@ -1268,6 +1289,7 @@ def load_entries(scripts_dir, curated_entries=None, category_paths=None):
         scripts_dir,
         catalog_mtime,
         curated_signature,
+        overlay_signature,
         lang_code,
         category_paths,
     )
@@ -1303,8 +1325,15 @@ def load_entries(scripts_dir, curated_entries=None, category_paths=None):
         if not isinstance(packages, list) or not packages:
             continue
 
+        component_for_entry = component
+        overlay_key = repo_parser._normalize_appstream_overlay_id(component.get("id"))
+        overlay = appstream_overlays.get(overlay_key)
+        if overlay:
+            component_for_entry = dict(component)
+            component_for_entry["_linuxtoys_overlay"] = overlay
+
         try:
-            result.append(_to_repo_entry(component, category, lang_code))
+            result.append(_to_repo_entry(component_for_entry, category, lang_code))
         except (KeyError, TypeError, ValueError):
             continue
 
