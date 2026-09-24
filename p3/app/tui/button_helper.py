@@ -15,6 +15,7 @@ from app.library_loader import script_command
 from app.registry_utils import parse_registry_file
 from app.repo_parser import materialize_repo_script
 from app.revert_helper import build_uninstall_script_entry
+from app.updater.update_helper import UpdateHelper
 
 from .dialog_screen import (
     CancelledDialog,
@@ -23,6 +24,8 @@ from .dialog_screen import (
     RemoveScriptScreen,
     SuccessDialog,
     SudoPasswordScreen,
+    UpdateAvailableDialog,
+    UpdateCompleteDialog,
 )
 from .helper import (
     get_scripts_for_category_cached,
@@ -46,6 +49,7 @@ class ScriptRunnerMixin:
     _running_temp_path: str | None = None
     _running_dev_mode: bool = False
     _running_is_uninstall: bool = False
+    _running_is_update: bool = False
     _manifest_queue: list[dict] = []
     _manifest_results: list[dict] = []
     _is_manifest_run: bool = False
@@ -172,7 +176,7 @@ class ScriptRunnerMixin:
 
         names = load_manifest(manifest_path)
         if not names:
-            self.call_from_thread(
+            self.app.call_from_thread(
                 self.notify, "Manifesto vazio ou inválido.", severity="warning"
             )
             return
@@ -222,14 +226,14 @@ class ScriptRunnerMixin:
             )
 
         if not results:
-            self.call_from_thread(
+            self.app.call_from_thread(
                 self.notify,
                 "Nenhum item válido encontrado no manifesto.",
                 severity="warning",
             )
             return
 
-        self.call_from_thread(self._start_manifest_queue, results)
+        self.app.call_from_thread(self._start_manifest_queue, results)
 
     def _build_packages_flatpaks_script(
         self, packages: list[str], flatpaks: list[str]
@@ -321,6 +325,11 @@ class ScriptRunnerMixin:
         menu.display = True
 
     def on_script_finished(self, message: ScriptFinished) -> None:
+        if self._running_is_update:
+            self._running_is_update = False
+            self._finish_update_run(message.exit_code)
+            return
+
         if self._is_manifest_run:
             self._on_manifest_item_finished(message)
             return
@@ -452,6 +461,23 @@ class ScriptRunnerMixin:
         self._running_temp_path = None
         self._running_is_uninstall = False
 
+    def _finish_update_run(self, exit_code: int | None) -> None:
+        if exit_code == 0:
+            self.app.push_screen(
+                UpdateCompleteDialog(), callback=self._restart_app
+            )
+        else:
+            self._hide_terminal()
+            self.notify(
+                "A atualização falhou ou foi cancelada.", severity="error"
+            )
+
+    def _restart_app(self, _result: None = None) -> None:
+        import sys
+
+        self.app.exit()
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
     def _on_error_dialog_closed(
         self,
         wants_report: bool,
@@ -493,31 +519,31 @@ class ScriptRunnerMixin:
             )
             if result:
                 issue_number = result.get("issue_number", "")
-                self.call_from_thread(
+                self.app.call_from_thread(
                     self.notify,
                     f"Bug reportado com sucesso (issue #{issue_number}).",
                     severity="information",
                 )
             else:
-                self.call_from_thread(
+                self.app.call_from_thread(
                     self.notify,
                     "Não foi possível enviar o relatório de bug.",
                     severity="error",
                 )
         except ConnectionError:
-            self.call_from_thread(
+            self.app.call_from_thread(
                 self.notify,
                 "Sem conexão com a internet — não foi possível reportar o bug.",
                 severity="error",
             )
         except Timeout:
-            self.call_from_thread(
+            self.app.call_from_thread(
                 self.notify,
                 "Tempo esgotado ao tentar reportar o bug.",
                 severity="error",
             )
         except Exception as exc:
-            self.call_from_thread(
+            self.app.call_from_thread(
                 self.notify,
                 f"Erro ao reportar bug: {exc}",
                 severity="error",
@@ -546,3 +572,37 @@ class ScriptRunnerMixin:
         else:
             terminal.send_password(password)
         terminal.focus()
+
+    def _check_for_update(self) -> None:
+        """Roda em thread separada — urllib é bloqueante."""
+        helper = UpdateHelper()
+        available = helper._update_available()
+        self.app.call_from_thread(self._on_update_checked, helper, available)
+
+    def _on_update_checked(
+        self, helper: UpdateHelper, available: bool
+    ) -> None:
+        if not available:
+            self.notify("Você já está na última versão.")
+            return
+        tag = helper._latest_ver.get("tag_name", "")
+        body = helper._latest_ver.get("body", "Sem changelog disponível.")
+        self.app.push_screen(
+            UpdateAvailableDialog(tag, body), callback=self._on_update_decision
+        )
+
+    def _on_update_decision(self, wants_update: bool | None) -> None:
+        if not wants_update:
+            return
+
+        self._running_button = None
+        self._running_script_info = None
+        self._running_temp_path = None
+        self._running_dev_mode = False
+        self._running_is_uninstall = False
+        self._running_is_update = True
+        self._show_terminal()
+        terminal = self.query_one("#terminal", Terminal)
+        terminal.run_script(
+            ["sh", "-c", "curl -fsSL https://linux.toys/install.sh | bash"]
+        )

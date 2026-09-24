@@ -498,3 +498,43 @@ DescButton {
   background: transparent;
 }
 /* ------------------------------ END -------------------- */
+
+/* ------------------------------ UPDATE CSSE -------------------- */
+UpdateAvailableDialog { 
+  align: center middle;
+}
+
+UpdateAvailableDialog > Vertical {
+  width: 70; 
+  height: 25; 
+  padding: 1 2;
+  border: solid $primary;
+}
+
+UpdateAvailableDialog #changelog { 
+  height: 1fr; 
+  border: round $primary-darken-1; 
+  margin: 1 0; 
+}
+
+UpdateCompleteDialog { 
+  align: center middle;
+}
+
+UpdateCompleteDialog > Vertical {
+  width: 60;
+  height: auto;
+  padding: 1 2;
+  border: solid $success;
+}
+
+UpdateCompleteDialog Label { 
+  width: 100%; 
+  content-align: center middle; 
+  margin-bottom: 1;
+}
+
+UpdateCompleteDialog Button { 
+  width: 100%;
+}
+/* ------------------------------ END -------------------- */

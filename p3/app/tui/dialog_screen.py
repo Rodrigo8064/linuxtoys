@@ -1,3 +1,6 @@
+import os
+import sys
+
 from textual import on, work
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -490,3 +493,44 @@ class LanguageSelectorDialog(ModalScreen[str | None]):
 
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+
+class UpdateAvailableDialog(ModalScreen[bool]):
+    BINDINGS = [
+        Binding("escape", "cancel", translations.get("script_runner_close"))
+    ]
+
+    def __init__(self, tag: str, changelog: str) -> None:
+        super().__init__()
+        self.tag = tag
+        self.changelog = changelog
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label(f"Nova versão disponível: {self.tag}")
+            with VerticalScroll(id="changelog"):
+                yield Static(self.changelog)
+            with Horizontal():
+                yield Button("Não", id="no", variant="error")
+                yield Button("Atualizar", id="yes", variant="success")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "yes")
+
+
+class UpdateCompleteDialog(ModalScreen[None]):
+    BINDINGS = [
+        Binding("escape", "cancel", translations.get("script_runner_close"))
+    ]
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label("Atualização concluída!")
+            yield Label(
+                "O LinuxToys precisa reiniciar para usar a nova versão."
+            )
+            yield Button("Reiniciar agora", id="restart", variant="success")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "restart":
+            self.dismiss()

@@ -125,6 +125,7 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
                         ),
                         id="scripts_resync",
                     ),
+                    ListItem(Label("update"), id="update"),
                     id="home-menu",
                 )
                 with Vertical(id="terminal-conteiner"):
@@ -195,6 +196,11 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
         if event.item.id == "manifest":
             self.app.push_screen(
                 ManifestDialog(), callback=self.on_manifest_chosen
+            )
+        if event.item.id == "update":
+            self.notify("Verificando atualizações...")
+            self.run_worker(
+                self._check_for_update, thread=True, exclusive=True
             )
 
     async def on_input_changed(self, event: Input.Changed) -> None:
