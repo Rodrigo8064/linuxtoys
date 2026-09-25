@@ -2,10 +2,10 @@ import re
 
 from app.lang_utils import load_translations
 from app.parser import (
-    get_all_scripts_recursive,
     get_categories,
     get_scripts_for_category,
 )
+from app.search_helper import ScriptCache, SearchEngine
 
 translations = load_translations()  # Auto-detect language from lang_utils
 _search_index_cache: list[dict] | None = None
@@ -28,30 +28,25 @@ def make_widget_id(identifier: str) -> str:
     return slug
 
 
-def get_search_index() -> list[dict]:
-    """Achata todos os scripts de todas as categorias (recursivamente)
-    numa lista única, pra busca por nome. Calculado uma vez só e
-    reaproveitado — evita varrer o sistema de arquivos a cada tecla."""
-    global _search_index_cache
-    if _search_index_cache is None:
-        categories = load_categories(translations)
-        _search_index_cache = []
-        for category in categories:
-            _search_index_cache.extend(
-                get_all_scripts_recursive(
-                    category["path"], translations=translations
-                )
-            )
-    return _search_index_cache
+def get_search_index():
+    script_cache = ScriptCache()
+    search_engine = SearchEngine(translations, script_cache)
+    search_index_cache = script_cache.populate(translations)
+
+    return search_engine
 
 
-def search_scripts(query: str) -> list[dict]:
+def search_scripts(query: str):
+    search_engine = get_search_index()
     query = query.strip().lower()
     if not query:
         return []
-    return [
-        item for item in get_search_index() if query in item["name"].lower()
-    ]
+    else:
+        groups = search_engine.search(query)
+        items = [
+            result.item_info for group in groups for result in group["scripts"]
+        ]
+        return items
 
 
 def get_scripts_for_category_cached(category_path: str) -> list[dict]:

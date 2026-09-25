@@ -1,4 +1,3 @@
-from rich.text import Text
 from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -157,10 +156,8 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
         self.query_one("#terminal-conteiner").display = False
         self.query_one("#left-panel-home").border_title = "Categorias/Scripts"
         self.query_one("#menu-panel").border_title = "Menu"
-        self.script_cache = ScriptCache()
-        self.search_engine = SearchEngine(translations, self.script_cache)
         self.run_worker(
-            lambda: self.script_cache.populate(translations),
+            get_search_index,
             thread=True,
             exclusive=False,
             name="warm_search_index",
@@ -217,15 +214,7 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
         left_panel = self.query_one("#left-panel-home", VerticalScroll)
         await left_panel.remove_children()
 
-        if not query:
-            items = categories
-        else:
-            groups = self.search_engine.search(query)
-            items = [
-                result.item_info
-                for group in groups
-                for result in group["scripts"]
-            ]
+        items = categories if not query else search_scripts(query)
 
         registry_data = parse_registry_file()
 
