@@ -4,7 +4,7 @@ import sys
 from textual import on, work
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
@@ -507,12 +507,14 @@ class UpdateAvailableDialog(ModalScreen[bool]):
 
     def compose(self) -> ComposeResult:
         with Vertical():
-            yield Label(f"Nova versão disponível: {self.tag}")
+            yield Label(
+                f"⚡️ A new version {self.tag} of LinuxToys is available."
+            )
             with VerticalScroll(id="changelog"):
                 yield Static(self.changelog)
             with Horizontal():
-                yield Button("Não", id="no", variant="error")
-                yield Button("Atualizar", id="yes", variant="success")
+                yield Button("Ignore", id="no", variant="error")
+                yield Button("Install Update", id="yes", variant="success")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(event.button.id == "yes")

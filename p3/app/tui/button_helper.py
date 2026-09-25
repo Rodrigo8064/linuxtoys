@@ -583,7 +583,7 @@ class ScriptRunnerMixin:
         self, helper: UpdateHelper, available: bool
     ) -> None:
         if not available:
-            self.notify("Você já está na última versão.")
+            self.notify("✓ It's already on the latest available version")
             return
         tag = helper._latest_ver.get("tag_name", "")
         body = helper._latest_ver.get("body", "Sem changelog disponível.")

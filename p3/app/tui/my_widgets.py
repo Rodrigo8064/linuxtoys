@@ -78,7 +78,7 @@ class DescButton(Button):
     def on_mount(self) -> None:
         if self.is_installed:
             self.styles.border = ("tall", "red")
-            self.label = f"{self.script_name} "
+            self.label = self.script_name
         elif self.is_new:
             self.styles.border = ("tall", "yellow")
 

@@ -17,8 +17,6 @@ def load_categories(translations) -> list[dict]:
     return categories
 
 
-# def slugify(texto: str) -> str:
-#     return re.sub(r"[^a-z0-9_-]", "_", texto.lower())
 def make_widget_id(identifier: str) -> str:
     """Gera um id de widget válido e estável a partir de algo que já é
     único e independente de idioma (ex.: o path do script).
@@ -69,8 +67,8 @@ def get_scripts_for_category_cached(category_path: str) -> list[dict]:
 
 def warm_category_cache() -> None:
     """Pré-computa os scripts de TODAS as categorias de topo em
-    background — assim, entrar em qualquer uma delas (mesmo a de 40
-    scripts) já está pronto quando o usuário chegar lá."""
+    background — assim, entrar em qualquer uma delas já está pronto
+    quando o usuário chegar lá."""
     categories = load_categories(translations)
     for category in categories:
         get_scripts_for_category_cached(category["path"])

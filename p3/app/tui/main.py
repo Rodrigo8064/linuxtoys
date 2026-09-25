@@ -20,6 +20,7 @@ from app.easy_cli import (
     is_dev_mode_enabled,
 )
 from app.registry_utils import parse_registry_file
+from app.search_helper import ScriptCache, SearchEngine
 
 from . import logo
 from .about_lt import AboutScreen
@@ -115,6 +116,7 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
                         Label(f"󰲃 {translations.get('action_registry')}"),
                         id="registry",
                     ),
+                    ListItem(Label("󰚰 Update LinuxToys"), id="update"),
                     ListItem(
                         Label(
                             f" {
@@ -125,7 +127,6 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
                         ),
                         id="scripts_resync",
                     ),
-                    ListItem(Label("update"), id="update"),
                     id="home-menu",
                 )
                 with Vertical(id="terminal-conteiner"):
@@ -156,8 +157,10 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
         self.query_one("#terminal-conteiner").display = False
         self.query_one("#left-panel-home").border_title = "Categorias/Scripts"
         self.query_one("#menu-panel").border_title = "Menu"
+        self.script_cache = ScriptCache()
+        self.search_engine = SearchEngine(translations, self.script_cache)
         self.run_worker(
-            get_search_index,
+            lambda: self.script_cache.populate(translations),
             thread=True,
             exclusive=False,
             name="warm_search_index",
@@ -198,7 +201,7 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
                 ManifestDialog(), callback=self.on_manifest_chosen
             )
         if event.item.id == "update":
-            self.notify("Verificando atualizações...")
+            self.notify("LinuxToys Update Checker...")
             self.run_worker(
                 self._check_for_update, thread=True, exclusive=True
             )
@@ -213,7 +216,17 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
         query = query.strip().lower()
         left_panel = self.query_one("#left-panel-home", VerticalScroll)
         await left_panel.remove_children()
-        items = categories if not query else search_scripts(query)
+
+        if not query:
+            items = categories
+        else:
+            groups = self.search_engine.search(query)
+            items = [
+                result.item_info
+                for group in groups
+                for result in group["scripts"]
+            ]
+
         registry_data = parse_registry_file()
 
         for item in items:
