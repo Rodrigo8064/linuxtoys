@@ -19,7 +19,6 @@ from app.easy_cli import (
     is_dev_mode_enabled,
 )
 from app.registry_utils import parse_registry_file
-from app.search_helper import ScriptCache, SearchEngine
 
 from . import logo
 from .about_lt import AboutScreen
@@ -81,6 +80,8 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
                             item["is_script"],
                             item.get("is_new", False),
                             item["name"] in registry_data,
+                            item.get("revert", None),
+                            item.get("reboot", "no"),
                             id=make_widget_id(item["path"]),
                         )
             # right panel widgets
@@ -227,6 +228,8 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
                     item["is_script"],
                     item.get("is_new", False),
                     item["name"] in registry_data,
+                    item.get("revert", None),
+                    item.get("reboot", "no"),
                     id=make_widget_id(item["path"]),
                 )
             )
@@ -245,6 +248,8 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
                     item["is_script"],
                     item.get("is_new", False),
                     item["name"] in registry_data,
+                    item.get("revert", None),
+                    item.get("reboot", "no"),
                     id=make_widget_id(item["path"]),
                 )
             )

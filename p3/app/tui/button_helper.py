@@ -110,6 +110,8 @@ class ScriptRunnerMixin:
                     item["is_script"],
                     item.get("is_new", False),
                     item["name"] in registry_data,
+                    item.get("revert", None),
+                    item.get("reboot", "no"),
                     id=make_widget_id(item["path"]),
                 )
             )
