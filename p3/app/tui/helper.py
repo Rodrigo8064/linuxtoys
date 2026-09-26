@@ -1,20 +1,20 @@
 import re
+import threading
 
 from app.lang_utils import load_translations
-from app.parser import (
-    get_categories,
-    get_scripts_for_category,
+from app.search_helper import (
+    CategoryCache,
+    ScriptCache,
+    SearchEngine,
+    create_search_engine,
 )
-from app.search_helper import ScriptCache, SearchEngine
 
-translations = load_translations()  # Auto-detect language from lang_utils
-_search_index_cache: list[dict] | None = None
-_category_scripts_cache: dict[str, list[dict]] = {}
+translations = load_translations()
 
-
-def load_categories(translations) -> list[dict]:
-    categories = get_categories(translations=translations)
-    return categories
+_category_cache: CategoryCache | None = None
+_script_cache: ScriptCache | None = None
+_search_engine: SearchEngine | None = None
+_cache_lock = threading.Lock()
 
 
 def make_widget_id(identifier: str) -> str:
@@ -28,42 +28,78 @@ def make_widget_id(identifier: str) -> str:
     return slug
 
 
-def get_search_index():
-    script_cache = ScriptCache()
-    search_engine = SearchEngine(translations, script_cache)
-    search_index_cache = script_cache.populate(translations)
-
-    return search_engine
+def is_search_ready() -> bool:
+    return _search_engine is not None and _category_cache is not None
 
 
-def search_scripts(query: str):
-    search_engine = get_search_index()
-    query = query.strip().lower()
-    if not query:
-        return []
-    else:
-        groups = search_engine.search(query)
-        items = [
-            result.item_info for group in groups for result in group["scripts"]
-        ]
-        return items
+def invalidate_search_caches() -> None:
+    """Invalidates cached search and category structures."""
+    global _category_cache, _script_cache, _search_engine
+    with _cache_lock:
+        _category_cache = None
+        _script_cache = None
+        _search_engine = None
+
+
+def warm_search_and_category_index(trans=None) -> SearchEngine:
+    """Populates CategoryCache concurrently, links ScriptCache in memory,
+    and warms the Rust SearchIndex. Thread-safe and reusable.
+    """
+    global _category_cache, _script_cache, _search_engine
+    active_translations = trans or translations
+
+    with _cache_lock:
+        if _search_engine is not None:
+            return _search_engine
+
+        # 1. Parse categories concurrently (ThreadPoolExecutor)
+        cat_cache = CategoryCache()
+        cat_cache.populate(active_translations, max_workers=4)
+
+        # 2. Build script cache directly from category data without re-reading the filesystem
+        scr_cache = ScriptCache()
+        scr_cache.populate_from_category_cache(cat_cache)
+
+        # 3. Create SearchEngine and warm the Rust index
+        engine = create_search_engine(active_translations, scr_cache)
+        engine._ensure_rust_search_index()
+
+        _category_cache = cat_cache
+        _script_cache = scr_cache
+        _search_engine = engine
+
+        return _search_engine
 
 
 def get_scripts_for_category_cached(category_path: str) -> list[dict]:
-    """Versão cacheada de get_scripts_for_category — calculada uma vez
-    por categoria e reaproveitada. Evita revarrer o disco toda vez que
-    o usuário entra na mesma categoria."""
-    if category_path not in _category_scripts_cache:
-        _category_scripts_cache[category_path] = get_scripts_for_category(
-            category_path, translations=translations
-        )
-    return _category_scripts_cache[category_path]
+    """Retrieves scripts from the warmed CategoryCache if available,
+    falling back to parser only if not yet populated.
+    """
+    if _category_cache is not None and _category_cache.is_populated:
+        return _category_cache.get_scripts_for_category(category_path)
+    from app.parser import get_scripts_for_category
+
+    return get_scripts_for_category(category_path, translations=translations)
 
 
-def warm_category_cache() -> None:
-    """Pré-computa os scripts de TODAS as categorias de topo em
-    background — assim, entrar em qualquer uma delas já está pronto
-    quando o usuário chegar lá."""
-    categories = load_categories(translations)
-    for category in categories:
-        get_scripts_for_category_cached(category["path"])
+def search_scripts_fast(query: str) -> list[dict]:
+    """Fast search leveraging the pre-warmed Rust index."""
+    if not query.strip() or _search_engine is None:
+        return []
+
+    groups = _search_engine.search(query.strip())
+    # Flatten items or return grouped
+    return [
+        result.item_info for group in groups for result in group["scripts"]
+    ]
+
+
+def get_categories(trans=None) -> list[dict]:
+    """Retrieves top-level categories.
+    Returns from CategoryCache if populated, otherwise falls back to parser.
+    """
+    if _category_cache is not None and _category_cache.is_populated:
+        return _category_cache.get_categories()
+    from app.parser import get_categories as parser_get_categories
+
+    return parser_get_categories(translations=trans or translations)

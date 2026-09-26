@@ -1,3 +1,5 @@
+import asyncio
+
 from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -25,12 +27,13 @@ from .about_lt import AboutScreen
 from .button_helper import ScriptRunnerMixin
 from .dialog_screen import LanguageSelectorDialog, ReportBugDialog
 from .helper import (
-    get_search_index,
-    load_categories,
+    get_categories,
+    invalidate_search_caches,
+    is_search_ready,
     make_widget_id,
-    search_scripts,
+    search_scripts_fast,
     translations,
-    warm_category_cache,
+    warm_search_and_category_index,
 )
 from .manifest_dialog import ManifestDialog
 from .my_widgets import (
@@ -45,9 +48,10 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
     """main screen for linuxtoys TUI"""
 
     CSS_PATH = "style.tcss"
+    _search_timer: asyncio.TimerHandle | None = None  ####
 
     BINDINGS = [
-        Binding("q", "quit", "Sair"),
+        Binding("q", "app.quit", "Sair"),
         Binding("tab", "app.focus_next", "Navegar"),
         Binding("shift+tab", "app.focus_previous", "Anterior"),
         Binding("h", "reset_to_home", "Home"),
@@ -58,7 +62,7 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
         """Empty action for purely informational captions in the footer."""
 
     def compose(self) -> ComposeResult:
-        categories = load_categories(translations)
+        categories = get_categories(translations)
         yield Header(icon="")
 
         with Horizontal(id="body-home"):
@@ -158,17 +162,33 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
         self.query_one("#left-panel-home").border_title = "Categorias/Scripts"
         self.query_one("#menu-panel").border_title = "Menu"
         self.run_worker(
-            get_search_index,
+            self._warm_search_worker,
             thread=True,
             exclusive=False,
             name="warm_search_index",
         )
-        self.run_worker(
-            warm_category_cache,
-            thread=True,
-            exclusive=False,
-            name="warm_category_cache",
-        )
+
+    def _warm_search_worker(self) -> None:
+        warm_search_and_category_index(translations)
+
+    async def _render_items(self, items: list[dict]) -> None:
+        left_panel = self.query_one("#left-panel-home", VerticalScroll)
+        await left_panel.remove_children()
+        registry_data = parse_registry_file()
+        for item in items:
+            await left_panel.mount(
+                DescButton(
+                    item["name"],
+                    item["description"],
+                    item["path"],
+                    item["is_script"],
+                    item.get("is_new", False),
+                    item["name"] in registry_data,
+                    item.get("revert", None),
+                    item.get("reboot", "no"),
+                    id=make_widget_id(item["path"]),
+                )
+            )
 
     @on(FocusableLabel.Pressed, "#report-bug")
     def handle_report_bug(self) -> None:
@@ -207,52 +227,47 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
     async def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id != "search-input":
             return
-        await self._filter_scripts(event.value)
 
-    async def _filter_scripts(self, query: str) -> None:
-        categories = load_categories(translations)
-        query = query.strip().lower()
-        left_panel = self.query_one("#left-panel-home", VerticalScroll)
-        await left_panel.remove_children()
+        query = event.value.strip()
 
-        items = categories if not query else search_scripts(query)
+        if self._search_timer:  ##
+            self._search_timer.cancel()  ##
 
-        registry_data = parse_registry_file()
+        if not query:
+            await self.action_reset_to_home()
+            return
 
-        for item in items:
-            await left_panel.mount(
-                DescButton(
-                    item["name"],
-                    item["description"],
-                    item["path"],
-                    item["is_script"],
-                    item.get("is_new", False),
-                    item["name"] in registry_data,
-                    item.get("revert", None),
-                    item.get("reboot", "no"),
-                    id=make_widget_id(item["path"]),
-                )
-            )
+        loop = asyncio.get_running_loop()  ##
+        self._search_timer = loop.call_later(  ##
+            0.2,  ##
+            lambda: self.run_worker(
+                lambda: self._execute_search_worker(query),
+                thread=True,
+                exclusive=True,
+                name="search_filter",
+            ),
+        )
+
+    def _execute_search_worker(self, query: str) -> None:
+        # If cache is still warming on first keystroke, this ensures it finishes
+        if not is_search_ready():
+            warm_search_and_category_index(translations)
+
+        items = search_scripts_fast(query)
+        # Safely post back to main UI thread
+        self.app.call_from_thread(self._render_search_results, items, query)
+
+    async def _render_search_results(
+        self, items: list[dict], query: str
+    ) -> None:
+        # Guard against out-of-order race conditions when typing quickly
+        if self.query_one("#search-input", Input).value.strip() != query:
+            return
+        await self._render_items(items)
 
     async def action_reset_to_home(self) -> None:
-        categories = load_categories(translations)
-        left_panel = self.query_one("#left-panel-home", VerticalScroll)
-        await left_panel.remove_children()
-        registry_data = parse_registry_file()
-        for item in categories:
-            await left_panel.mount(
-                DescButton(
-                    item["name"],
-                    item["description"],
-                    item["path"],
-                    item["is_script"],
-                    item.get("is_new", False),
-                    item["name"] in registry_data,
-                    item.get("revert", None),
-                    item.get("reboot", "no"),
-                    id=make_widget_id(item["path"]),
-                )
-            )
+        categories = get_categories(translations)
+        await self._render_items(categories)
 
     def _start_scripts_resync(self) -> None:
         if is_dev_mode_enabled():
@@ -285,13 +300,13 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
             self.notify(
                 "Scripts sincronizados com sucesso.", severity="information"
             )
-            # invalida o cache de busca (senão a busca continuaria vendo
-            # os scripts antigos, mesmo depois do pull ter trazido novos)
-            import app.tui.helper as helper_module
-
-            helper_module._search_index_cache = None
-            helper_module._category_scripts_cache = {}
-            # e recarrega a home, já que categorias podem ter mudado
+            invalidate_search_caches()
+            self.run_worker(
+                self._warm_search_worker,
+                thread=True,
+                exclusive=False,
+                name="warm_search_index",
+            )
             self.run_worker(self.action_reset_to_home())
         else:
             self.notify(
@@ -311,11 +326,13 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
         translations.clear()
         translations.update(new_translations)  # muta no lugar, não reatribui
         lang_utils.save_language(new_language_code)
-
-        from . import helper as helper_module
-
-        helper_module._search_index_cache = None  # invalida a busca
-        helper_module._category_scripts_cache = {}
+        invalidate_search_caches()
+        self.run_worker(
+            self._warm_search_worker,
+            thread=True,
+            exclusive=False,
+            name="warm_search_index",
+        )
 
         await self.action_reset_to_home()
         await self._refresh_fixed_ui_labels()
