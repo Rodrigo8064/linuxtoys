@@ -21,6 +21,7 @@ from .dialog_screen import (
     CancelledDialog,
     ConfirmScriptScreen,
     ErrorDialog,
+    RebootDialog,
     RemoveScriptScreen,
     SuccessDialog,
     SudoPasswordScreen,
@@ -337,6 +338,7 @@ class ScriptRunnerMixin:
             return
         script_info = self._running_script_info or {}
         script_name = script_info.get("name", "o script")
+        reboot = script_info.get("reboot", "no")
         temp_path = self._running_temp_path
         dev_mode = self._running_dev_mode
         is_uninstall = self._running_is_uninstall
@@ -351,10 +353,15 @@ class ScriptRunnerMixin:
                 _cleanup_tmp_noram_dirs(TRANSMAP_PATH)
                 self._remove_transmap()
             self._cleanup_temp_file(temp_path, dev_mode)
-            self.app.push_screen(
-                SuccessDialog(script_name, action=action_done),
-                callback=self._finish_script_run,
-            )
+            if reboot == "yes":
+                self.app.push_screen(
+                    RebootDialog(), callback=self._finish_script_run
+                )
+            else:
+                self.app.push_screen(
+                    SuccessDialog(script_name, action=action_done),
+                    callback=self._finish_script_run,
+                )
 
         elif exit_code == 100:
             if not dev_mode and not is_uninstall:

@@ -162,6 +162,30 @@ class SuccessDialog(ModalScreen[None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="confirm-dialog"):
+            yield Label(
+                translations.get(
+                    "reboot_required_message",
+                    "A script requiring a system reboot has been executed. You must reboot your computer before installing other features.",
+                )
+            )
+            with Horizontal(id="confirm-buttons"):
+                yield Button("Concluir", id="execute-btn", variant="success")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "execute-btn":
+            self.dismiss()
+
+    def action_cancel(self) -> None:
+        self.dismiss()
+
+
+class RebootDialog(ModalScreen[bool]):
+    BINDINGS = [
+        Binding("escape", "cancel", translations.get("script_runner_close"))
+    ]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="confirm-dialog"):
             yield Label(f"'{self.script_name}' foi {self.action} com sucesso.")
             with Horizontal(id="confirm-buttons"):
                 yield Button("Concluir", id="execute-btn", variant="success")
