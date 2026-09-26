@@ -7,7 +7,6 @@ import re
 import shlex
 import struct
 import termios
-import time
 import uuid
 
 import pyte
@@ -146,8 +145,6 @@ class TerminalPTY:
                 os.environ,
                 TERM="xterm-256color",
                 LANG=lang,
-                COLUMNS=str(self.ncol),
-                LINES=str(self.nrow),
                 PS1="$ ",
             )
             os.execvpe(argv[0], argv, env)
@@ -313,10 +310,10 @@ class Terminal(Widget, can_focus=True):
         self._screen.next_page()
         self._render_screen()
 
-    def on_resize(self, event: events.Resize) -> None:
-        self._resize_terminal(event.size.width, event.size.height)
+    async def on_resize(self, event: events.Resize) -> None:
+        await self._resize_terminal(event.size.width, event.size.height)
 
-    def _resize_terminal(self, ncol: int, nrow: int) -> None:
+    async def _resize_terminal(self, ncol: int, nrow: int) -> None:
         if ncol <= 0 or nrow <= 0 or (ncol == self.ncol and nrow == self.nrow):
             return
 
@@ -326,9 +323,7 @@ class Terminal(Widget, can_focus=True):
         self._render_screen()
 
         if self.pty is not None:
-            asyncio.create_task(
-                self.pty.recv_queue.put(["set_size", nrow, ncol, 0, 0])
-            )
+            await self.pty.recv_queue.put(["set_size", nrow, ncol, 0, 0])
 
     @staticmethod
     def _split_marker(marker: str) -> tuple[str, str]:
