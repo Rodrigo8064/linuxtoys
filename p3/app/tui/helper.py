@@ -32,6 +32,13 @@ def is_search_ready() -> bool:
     return _search_engine is not None and _category_cache is not None
 
 
+def is_removable(script_name: str, script_path: str) -> bool:
+    global _script_cache
+    script_cache = _script_cache
+    script_info = {"name": script_name, "path": script_path}
+    return script_cache.is_script_removable(script_info)
+
+
 def invalidate_search_caches() -> None:
     """Invalidates cached search and category structures."""
     global _category_cache, _script_cache, _search_engine

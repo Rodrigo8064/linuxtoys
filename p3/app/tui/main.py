@@ -48,7 +48,7 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
     """main screen for linuxtoys TUI"""
 
     CSS_PATH = "style.tcss"
-    _search_timer: asyncio.TimerHandle | None = None  ####
+    _search_timer: asyncio.TimerHandle | None = None
 
     BINDINGS = [
         Binding("q", "app.quit", "Sair"),
@@ -84,8 +84,6 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
                             item["is_script"],
                             item.get("is_new", False),
                             item["name"] in registry_data,
-                            item.get("revert", None),
-                            item.get("reboot", "no"),
                             id=make_widget_id(item["path"]),
                         )
             # right panel widgets
@@ -161,15 +159,6 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
         self.query_one("#terminal-conteiner").display = False
         self.query_one("#left-panel-home").border_title = "Categorias/Scripts"
         self.query_one("#menu-panel").border_title = "Menu"
-        self.run_worker(
-            self._warm_search_worker,
-            thread=True,
-            exclusive=False,
-            name="warm_search_index",
-        )
-
-    def _warm_search_worker(self) -> None:
-        warm_search_and_category_index(translations)
 
     async def _render_items(self, items: list[dict]) -> None:
         left_panel = self.query_one("#left-panel-home", VerticalScroll)
@@ -184,8 +173,6 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
                     item["is_script"],
                     item.get("is_new", False),
                     item["name"] in registry_data,
-                    item.get("revert", None),
-                    item.get("reboot", "no"),
                     id=make_widget_id(item["path"]),
                 )
             )
@@ -230,16 +217,16 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
 
         query = event.value.strip()
 
-        if self._search_timer:  ##
-            self._search_timer.cancel()  ##
+        if self._search_timer:
+            self._search_timer.cancel()
 
         if not query:
             await self.action_reset_to_home()
             return
 
-        loop = asyncio.get_running_loop()  ##
-        self._search_timer = loop.call_later(  ##
-            0.2,  ##
+        loop = asyncio.get_running_loop()
+        self._search_timer = loop.call_later(
+            0.2,
             lambda: self.run_worker(
                 lambda: self._execute_search_worker(query),
                 thread=True,
@@ -301,12 +288,7 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
                 "Scripts sincronizados com sucesso.", severity="information"
             )
             invalidate_search_caches()
-            self.run_worker(
-                self._warm_search_worker,
-                thread=True,
-                exclusive=False,
-                name="warm_search_index",
-            )
+            warm_search_and_category_index(translations)
             self.run_worker(self.action_reset_to_home())
         else:
             self.notify(
@@ -412,6 +394,7 @@ class LinuxToys(App):
     CSS_PATH = "style.tcss"
 
     def on_mount(self) -> None:
+        warm_search_and_category_index(translations)
         self.push_screen(HomeScreen())
 
 

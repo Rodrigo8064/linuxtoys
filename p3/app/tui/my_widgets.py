@@ -16,6 +16,8 @@ from textual.message import Message
 from textual.widget import Widget
 from textual.widgets import Button, Label, ListItem
 
+from .helper import is_removable
+
 
 class FocusableLabel(Label):
     """Um Label que aceita foco via tecla TAB e emite um evento ao pressionar Enter/Espaço."""
@@ -65,8 +67,6 @@ class DescButton(Button):
         is_script: bool,
         is_new: bool = False,
         is_installed: bool = False,
-        revert: str | None = "yes",
-        reboot: str = "no",
         **kwargs,
     ) -> None:
         super().__init__(label, tooltip=description, **kwargs)
@@ -76,15 +76,10 @@ class DescButton(Button):
         self.is_new = is_new
         self.script_name = label
         self.is_installed = is_installed
-        self.revert = revert
-        self.reboot = reboot
-
-    def _is_reversible(self) -> bool:
-        normalized = (self.revert or "").strip().lower()
-        return normalized in ("", "yes")
+        self.revert = is_removable(str(label), path)
 
     def on_mount(self) -> None:
-        if self._is_reversible() and self.is_installed:
+        if self.revert and self.is_installed:
             self.styles.border = ("tall", "red")
             self.styles.border_title_align = "left"
             self.border_title = ""

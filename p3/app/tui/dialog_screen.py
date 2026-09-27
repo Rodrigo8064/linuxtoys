@@ -1,6 +1,3 @@
-import os
-import sys
-
 from textual import on, work
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -162,12 +159,7 @@ class SuccessDialog(ModalScreen[None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="confirm-dialog"):
-            yield Label(
-                translations.get(
-                    "reboot_required_message",
-                    "A script requiring a system reboot has been executed. You must reboot your computer before installing other features.",
-                )
-            )
+            yield Label(f"'{self.script_name}' foi {self.action} com sucesso.")
             with Horizontal(id="confirm-buttons"):
                 yield Button("Concluir", id="execute-btn", variant="success")
 
@@ -186,7 +178,12 @@ class RebootDialog(ModalScreen[bool]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="confirm-dialog"):
-            yield Label(f"'{self.script_name}' foi {self.action} com sucesso.")
+            yield Label(
+                translations.get(
+                    "reboot_required_message",
+                    "A script requiring a system reboot has been executed. You must reboot your computer before installing other features.",
+                )
+            )
             with Horizontal(id="confirm-buttons"):
                 yield Button("Concluir", id="execute-btn", variant="success")
 

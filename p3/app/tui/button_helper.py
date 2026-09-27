@@ -1,7 +1,6 @@
 import os
 
-from textual.containers import VerticalScroll
-
+from app.compat import get_system_compat_keys
 from app.easy_cli import (
     _cleanup_tmp_noram_dirs,
     _is_error_exit_code,
@@ -12,6 +11,7 @@ from app.easy_cli import (
     resolve_script_dir,
 )
 from app.library_loader import script_command
+from app.parser import script_requires_reboot
 from app.registry_utils import parse_registry_file
 from app.repo_parser import materialize_repo_script
 from app.revert_helper import build_uninstall_script_entry
@@ -30,7 +30,7 @@ from .dialog_screen import (
 )
 from .helper import (
     get_scripts_for_category_cached,
-    make_widget_id,
+    is_removable,
     translations,
 )
 from .manifest_dialog import ManifestReportDialog
@@ -71,18 +71,19 @@ class ScriptRunnerMixin:
         script_name = str(button.label)
         registry_data = parse_registry_file()
         is_first_run = script_name not in registry_data
+        is_script_removable = is_removable(script_name, button.path)
 
-        if is_first_run:
+        if not is_first_run and is_script_removable:
             self.app.push_screen(
-                ConfirmScriptScreen(script_name, button.description),
-                callback=lambda confirmed: self._on_confirm_install(
+                RemoveScriptScreen(script_name, button.description),
+                callback=lambda confirmed: self._on_confirm_uninstall(
                     button, confirmed
                 ),
             )
         else:
             self.app.push_screen(
-                RemoveScriptScreen(script_name, button.description),
-                callback=lambda confirmed: self._on_confirm_uninstall(
+                ConfirmScriptScreen(script_name, button.description),
+                callback=lambda confirmed: self._on_confirm_install(
                     button, confirmed
                 ),
             )
@@ -99,23 +100,7 @@ class ScriptRunnerMixin:
 
     async def _navigate_to_category(self, button: DescButton) -> None:
         items = get_scripts_for_category_cached(button.path)
-        left_panel = self.query_one("#left-panel-home", VerticalScroll)
-        await left_panel.remove_children()
-        registry_data = parse_registry_file()
-        for item in items:
-            await left_panel.mount(
-                DescButton(
-                    item["name"],
-                    item["description"],
-                    item["path"],
-                    item["is_script"],
-                    item.get("is_new", False),
-                    item["name"] in registry_data,
-                    item.get("revert", None),
-                    item.get("reboot", "no"),
-                    id=make_widget_id(item["path"]),
-                )
-            )
+        await self._render_items(items)
 
     def run_script(self, button: DescButton) -> None:
         self._running_button = button
@@ -338,7 +323,12 @@ class ScriptRunnerMixin:
             return
         script_info = self._running_script_info or {}
         script_name = script_info.get("name", "o script")
-        reboot = script_info.get("reboot", "no")
+
+        # verify if is reboot
+        script_path = script_info.get("path", "")
+        system_compat_keys = get_system_compat_keys()
+        reboot = script_requires_reboot(script_path, system_compat_keys)
+
         temp_path = self._running_temp_path
         dev_mode = self._running_dev_mode
         is_uninstall = self._running_is_uninstall
@@ -353,7 +343,7 @@ class ScriptRunnerMixin:
                 _cleanup_tmp_noram_dirs(TRANSMAP_PATH)
                 self._remove_transmap()
             self._cleanup_temp_file(temp_path, dev_mode)
-            if reboot == "yes":
+            if reboot:
                 self.app.push_screen(
                     RebootDialog(), callback=self._finish_script_run
                 )
@@ -381,13 +371,12 @@ class ScriptRunnerMixin:
             self._finish_script_run()
 
         elif not _is_error_exit_code(exit_code):
-            # cancelamento (100) ou terminação por sinal (128-192) —
-            # não é um erro de verdade, não precisa de diálogo
+            # is not a error exit code, do not need dialog
             self._cleanup_temp_file(temp_path, dev_mode)
             self._finish_script_run()
 
         else:
-            # erro de verdade
+            # true error
             if not dev_mode and not is_uninstall:
                 revert_info = {
                     "name": script_name,
