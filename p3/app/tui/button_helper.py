@@ -631,5 +631,7 @@ class ScriptRunnerMixin:
             return
 
         crumbs = get_breadcrumb_path(current, translations)
-        names = " › ".join(c["name"] for c in crumbs)
+        names = " › ".join(
+            translations.get(c["name"], c["name"]) for c in crumbs
+        )
         panel.border_title = f"{names}" if names else base

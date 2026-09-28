@@ -368,6 +368,7 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
                 id="registry",
             )
         )
+        await menu.mount(ListItem(Label("󰚰 Update LinuxToys"), id="update"))
         await menu.mount(
             ListItem(
                 Label(
@@ -382,6 +383,7 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
         await links_container.mount(
             Link(" Wiki", url="https://linux.toys/documentation.html")
         )
+        await links_container.mount(Static("│", classes="link-sep"))
         await links_container.mount(
             FocusableLabel(
                 f" [u]{translations.get('report_label', 'Report Bug')}[/u]",
@@ -389,12 +391,14 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
                 classes="report-bug",
             )
         )
+        await links_container.mount(Static("│", classes="link-sep"))
         await links_container.mount(
             Link(
                 f" {translations.get('devportal_label', 'Credits')}",
                 url="https://dev.linux.toys",
             )
         )
+        await links_container.mount(Static("│", classes="link-sep"))
         await links_container.mount(
             Link(
                 f" {translations.get('support_footer', 'Support this project')}",
