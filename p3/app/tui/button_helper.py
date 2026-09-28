@@ -29,6 +29,7 @@ from .dialog_screen import (
     UpdateCompleteDialog,
 )
 from .helper import (
+    SPECIALS_ROOT,
     get_scripts_for_category_cached,
     get_specials_items,
     is_removable,
@@ -106,7 +107,7 @@ class ScriptRunnerMixin:
             self.run_uninstall(button)
 
     async def _navigate_to_category(self, button: DescButton) -> None:
-        self._nav_stack.append(button.path)
+        self._nav_stack.append((button.path, str(button.label)))
         await self._render_items(self._items_for_path(button.path))
         self._update_breadcrumb()
 
@@ -118,7 +119,11 @@ class ScriptRunnerMixin:
     def run_script(self, button: DescButton) -> None:
         self._running_button = button
         self._execute_script_info(
-            {"name": str(button.label), "path": button.path}
+            {
+                "name": str(button.label),
+                "path": button.path,
+                "is_repo_entry": button.is_repo_entry,
+            }
         )
 
     def _execute_script_info(self, script_info: dict) -> None:
@@ -625,13 +630,17 @@ class ScriptRunnerMixin:
             panel.border_title = base
             return
 
-        current = self._nav_stack[-1]
-        if is_specials_path(current):
-            panel.border_title = "Specials"
+        current_path, current_name = self._nav_stack[-1]
+        if is_specials_path(current_path):
+            specials_label = translations.get("specials", "Specials")
+            if current_path == SPECIALS_ROOT:
+                panel.border_title = specials_label
+            else:
+                panel.border_title = f"{specials_label} > {current_name}"
             return
 
-        crumbs = get_breadcrumb_path(current, translations)
+        crumbs = get_breadcrumb_path(current_path, translations)
         names = " › ".join(
             translations.get(c["name"], c["name"]) for c in crumbs
         )
-        panel.border_title = f"{names}" if names else base
+        panel.border_title = names if names else base

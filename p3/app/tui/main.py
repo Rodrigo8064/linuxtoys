@@ -50,7 +50,7 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self._nav_stack: list[str] = []
+        self._nav_stack: list[tuple[str, str]] = []
 
     CSS_PATH = "style.tcss"
     _search_timer: asyncio.TimerHandle | None = None
@@ -263,12 +263,14 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
 
     async def action_go_back(self) -> None:
         if not self._nav_stack:
-            return  # já está na home
+            return
         self._nav_stack.pop()
         if self._nav_stack:
-            await self._render_items(self._items_for_path(self._nav_stack[-1]))
+            current_path, _ = self._nav_stack[-1]
+            await self._render_items(self._items_for_path(current_path))
         else:
             await self.action_reset_to_home()
+            return
         self._update_breadcrumb()
 
     async def action_reset_to_home(self) -> None:
