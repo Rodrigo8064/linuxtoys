@@ -33,7 +33,8 @@ from . import (
     repo_parser,
     uri_parser,
     git_scripts_manager,
-    gtk_dialogs
+    gtk_dialogs,
+    gui_rs
 )
 from .gtk_common import Gdk, GLib, Gtk, GdkPixbuf
 from gi.repository import Gio
@@ -1219,6 +1220,10 @@ class AppWindow(
             self.script_cache.refresh_removable_cache()
         self._invalidate_featured_eligibility_cache()
 
+        # The installed-package snapshot is now current, so update the removal
+        # controls on already-built category cards without rebuilding the FlowBox.
+        self._refresh_removable_scripts(refresh_cache=False)
+
         app_page = self.main_stack.get_child_by_name("app_page")
         if app_page is not None and hasattr(app_page, "refresh_install_state"):
             app_page.refresh_install_state()
@@ -1853,29 +1858,12 @@ class AppWindow(
         return False
 
     def _start_startup_watermark_flush(self):
-        """Render deferred startup watermarks cooperatively with the GTK main loop."""
+        """Render native startup watermarks cooperatively with the GTK main loop."""
         if self._categories_loading_watermark_source is not None:
             return False
 
         flowbox = getattr(self, "categories_flowbox", None)
         if flowbox is None:
-            self._categories_loading_watermarks_flushed = True
-            return False
-
-        surfaces = []
-        stack = [flowbox]
-        while stack:
-            widget = stack.pop()
-            apply_pending = getattr(widget, "_linuxtoys_apply_pending_watermark", None)
-            if apply_pending is not None:
-                surfaces.append(widget)
-            try:
-                stack.extend(widget.get_children())
-            except (AttributeError, RuntimeError):
-                pass
-
-        self._categories_loading_watermark_queue = surfaces
-        if not surfaces:
             self._categories_loading_watermarks_flushed = True
             return False
 
@@ -1885,18 +1873,9 @@ class AppWindow(
         return False
 
     def _flush_one_startup_watermark(self):
-        """Render one category watermark, then yield so the roller can repaint."""
-        queue = self._categories_loading_watermark_queue
-        while queue:
-            surface = queue.pop()
-            apply_pending = getattr(surface, "_linuxtoys_apply_pending_watermark", None)
-            if apply_pending is None:
-                continue
-            try:
-                apply_pending(surface)
-            except (RuntimeError, AttributeError):
-                pass
-            # Exactly one expensive composition per main-loop dispatch.
+        """Ask gui-rs to render one pending category watermark, then yield."""
+        flowbox = getattr(self, "categories_flowbox", None)
+        if flowbox is not None and gui_rs.flush_category_watermarks(flowbox, 1):
             return True
 
         self._categories_loading_watermark_source = None
@@ -1925,8 +1904,13 @@ class AppWindow(
         return False
 
     def _render_categories(self, categories):
-        """Render an already parsed category snapshot on the GTK thread."""
-        # Store current category info and temporarily set to None for proper bold formatting.
+        """Render a parsed category snapshot cooperatively on the GTK thread."""
+        # Cancel any older publication that may still be draining. Incrementing the
+        # generation makes its idle callback harmless without needing to remove a
+        # source that may currently be dispatching.
+        generation = getattr(self, "_category_render_generation", 0) + 1
+        self._category_render_generation = generation
+
         temp_current_category = self.current_category_info
         self.current_category_info = None
 
@@ -1934,10 +1918,6 @@ class AppWindow(
             lambda widget: self.categories_flowbox.remove(widget)
         )
 
-        # Specials is a virtual top-level category backed by the curated category
-        # cache. Keep it first so the LinuxToys-curated catalog is the leading
-        # main-menu option. Its visible strings come from the normal translation
-        # dictionary, just like the parser-backed categories.
         specials_category = {
             "name": self.translations.get("specials", "Specials"),
             "description": self.translations.get(
@@ -1951,16 +1931,47 @@ class AppWindow(
             "is_subcategory": False,
             "is_linuxtoys_specials": True,
         }
-        rendered_categories = [specials_category, *categories]
+        pending = iter([specials_category, *categories])
 
-        for cat in rendered_categories:
-            widget = self.create_item_widget(cat)
-            description = cat.get("description", "")
-            widget.set_tooltip_text(description or None)
-            self.categories_flowbox.add(widget)
+        # Four cards keeps each GTK burst short while normally filling enough of
+        # the first viewport to begin the startup transition immediately.
+        batch_size = 4
+        first_batch = True
 
-        self.current_category_info = temp_current_category
-        self.categories_flowbox.show_all()
+        def append_batch():
+            nonlocal first_batch
+
+            if self._category_render_generation != generation:
+                return False
+
+            added = 0
+            while added < batch_size:
+                try:
+                    cat = next(pending)
+                except StopIteration:
+                    self.current_category_info = temp_current_category
+                    return False
+
+                widget = self.create_item_widget(cat)
+                description = cat.get("description", "")
+                widget.set_tooltip_text(description or None)
+                self.categories_flowbox.add(widget)
+                widget.show_all()
+                added += 1
+
+            if first_batch:
+                first_batch = False
+                # The first visible row is enough to release the startup overlay.
+                # Remaining category cards continue to arrive in later idle turns.
+                self.current_category_info = temp_current_category
+                self._hide_categories_loading_indicator()
+
+            return True
+
+        # Publish the first small batch now so the parser-ready callback immediately
+        # produces useful UI, then yield between all remaining batches.
+        if append_batch():
+            GLib.idle_add(append_batch)
 
     def load_categories(self):
         """Load categories synchronously for explicit refresh/fallback paths."""
@@ -1970,7 +1981,54 @@ class AppWindow(
         if not categories:
             categories = parser.get_categories(self.translations)
         self._render_categories(categories)
-        self._hide_categories_loading_indicator()
+
+    def _category_items_for_display(self, category_info):
+        """Return the exact item list used by normal category browsing."""
+        category_path = category_info["path"]
+        if category_info.get("is_linuxtoys_specials"):
+            return list(
+                self.category_cache.get_linuxtoys_special_categories(self.translations)
+            )
+        if category_info.get("is_linuxtoys_specials_category"):
+            return list(
+                self.category_cache.get_linuxtoys_special_scripts(
+                    category_info.get("specials_category_path", "")
+                )
+            )
+        if self.category_cache.is_populated:
+            scripts = self.category_cache.get_scripts_for_category(category_path)
+            if scripts:
+                return list(scripts)
+        return list(
+            parser.get_scripts_for_category(category_path, self.translations)
+        )
+
+    def _partition_category_items(self, category_info, items=None):
+        """Split one category into Available and Installed without changing order."""
+        available = []
+        installed = []
+        if items is None:
+            items = self._category_items_for_display(category_info)
+        for item in items:
+            if item.get("is_script") and self._is_script_removable(item):
+                installed.append(item)
+            else:
+                # Subcategories, create-script entries and every other structural
+                # card stay exactly where normal category browsing puts them.
+                available.append(item)
+        return available, installed
+
+    def _category_has_installed_items(self, category_info):
+        """Return whether this category needs the Available/Installed tab UI."""
+        if not category_info or category_info.get("display_mode", "menu") == "checklist":
+            return False
+        if (
+            category_info.get("is_linuxtoys_specials")
+            and not self.category_cache.is_populated
+        ):
+            return False
+        _available, installed = self._partition_category_items(category_info)
+        return bool(installed)
 
     def _load_scripts_into_flowbox(
         self,
@@ -2056,26 +2114,13 @@ class AppWindow(
             GLib.timeout_add(100, populate_specials_when_ready)
             return
 
-        if category_info.get("is_linuxtoys_specials"):
-            scripts = self.category_cache.get_linuxtoys_special_categories(
-                self.translations
+        scripts = self._category_items_for_display(category_info)
+        category_tab = getattr(flowbox, "_linuxtoys_category_tab", None)
+        if category_tab in ("available", "installed"):
+            available, installed = self._partition_category_items(
+                category_info, scripts
             )
-        elif category_info.get("is_linuxtoys_specials_category"):
-            scripts = self.category_cache.get_linuxtoys_special_scripts(
-                category_info.get("specials_category_path", "")
-            )
-        elif self.category_cache.is_populated:
-            scripts = self.category_cache.get_scripts_for_category(category_path)
-            if not scripts:
-                scripts = parser.get_scripts_for_category(
-                    category_path, self.translations
-                )
-        else:
-            scripts = parser.get_scripts_for_category(
-                category_path, self.translations
-            )
-
-        scripts = list(scripts)
+            scripts = available if category_tab == "available" else installed
         checklist_mode = category_info.get("display_mode", "menu") == "checklist"
         allow_drag = self._is_local_scripts_category(category_info)
 
@@ -2153,6 +2198,13 @@ class AppWindow(
                 and getattr(flowbox, "_linuxtoys_lazy_state", None) is state
             )
 
+        def flush_new_category_watermarks():
+            """Flush newly allocated native category cards after this population pass."""
+            if not state_is_current():
+                return False
+            gui_rs.flush_category_watermarks(flowbox)
+            return False
+
         def add_card(script_info):
             widget = self.create_item_widget(
                 script_info,
@@ -2199,6 +2251,11 @@ class AppWindow(
             state["next_index"] = stop
             for widget in batch_widgets:
                 widget.show_all()
+
+            GLib.idle_add(
+                flush_new_category_watermarks,
+                priority=GLib.PRIORITY_LOW,
+            )
 
             self.animate_item_batch(
                 batch_widgets,
@@ -2316,6 +2373,11 @@ class AppWindow(
             state["next_index"] = seed_count
             for widget in seed_widgets:
                 widget.show_all()
+
+            GLib.idle_add(
+                flush_new_category_watermarks,
+                priority=GLib.PRIORITY_LOW,
+            )
 
             if animate_initial:
                 self.animate_item_batch(
@@ -2828,6 +2890,14 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
         )
         return False
 
+    def _flush_visible_category_watermarks(self):
+        """Apply deferred native category watermarks in the visible view."""
+        if not hasattr(self, "main_stack"):
+            return
+        root = self.main_stack.get_visible_child()
+        if root is not None:
+            gui_rs.flush_category_watermarks(root)
+
     def _apply_window_resize_settled(self):
         """Run expensive responsive calculations once after resizing goes quiet."""
         self._window_resize_settle_timer = None
@@ -2842,12 +2912,11 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
             # Allocation-sized category watermarks are intentionally not regenerated
             # while an interactive resize is in progress. Render them once at the
             # final settled allocation instead.
-            flush_watermarks = getattr(self, "_flush_deferred_category_watermarks", None)
             startup_watermarks_active = (
                 getattr(self, "_categories_loading_watermark_source", None) is not None
             )
-            if flush_watermarks is not None and not startup_watermarks_active:
-                flush_watermarks()
+            if not startup_watermarks_active:
+                self._flush_visible_category_watermarks()
 
             # Main-menu Featured already compares its final rows/columns against
             # the previous layout, so this is cheap when no breakpoint changed.
@@ -3220,33 +3289,72 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
                                 self.navigation_stack[i] = subcategory
                                 break
 
-    def _refresh_removable_scripts(
-        self, pause_after_initial_ms=0, animate_initial=True
-    ):
-        """
-        Refresh removable-script state and rebuild the currently visible cards.
-
-        The removal button is created inside create_item_widget(), so refreshing
-        only the boolean cache is insufficient: the displayed widgets must also
-        be recreated.
-
-        ``pause_after_initial_ms`` is used by terminal Back navigation: the first
-        screenful is rebuilt synchronously while the terminal is still visible,
-        then later progressive batches are held until the stack transition ends.
-        """
-        if self.script_cache.is_populated:
+    def _refresh_removable_scripts(self, refresh_cache=True):
+        """Refresh removable state and update existing cards in place."""
+        if refresh_cache and self.script_cache.is_populated:
             self.script_cache.refresh_removable_cache()
         self._invalidate_featured_eligibility_cache()
 
-        # Refresh the current category/subcategory view.
-        if self.current_category_info is not None:
-            self._load_scripts_into_flowbox(
-                self.scripts_flowbox,
-                self.current_category_info,
-                pause_after_initial_ms=pause_after_initial_ms,
-                animate_initial=animate_initial,
+        # Card hierarchies now always contain a hidden removal control. Updating
+        # state therefore requires no parser work, card reconstruction, or FlowBox
+        # repopulation.
+        flowbox = (
+            self.scripts_flowbox
+            if self.current_category_info is not None
+            else self.categories_flowbox
+        )
+
+        view = getattr(self, "scripts_view", None)
+        available_flowbox = getattr(view, "_linuxtoys_available_flowbox", None)
+        installed_flowbox = getattr(view, "_linuxtoys_installed_flowbox", None)
+        if self.current_category_info is not None and installed_flowbox is not None:
+            # Only rebuild the two lazy lists when an actually displayed card has
+            # crossed the Available/Installed boundary. Ordinary terminal returns
+            # remain the same zero-rebuild path as before.
+            membership_changed = False
+            for fb, expected_installed in (
+                (available_flowbox, False),
+                (installed_flowbox, True),
+            ):
+                for child in fb.get_children():
+                    card = child.get_child()
+                    info = getattr(card, "info", None)
+                    if not info or not info.get("is_script"):
+                        continue
+                    if bool(self._is_script_removable(info)) != expected_installed:
+                        membership_changed = True
+                        break
+                if membership_changed:
+                    break
+
+            if membership_changed:
+                self._load_scripts_into_flowbox(
+                    available_flowbox, self.current_category_info, animate_initial=False
+                )
+                self._load_scripts_into_flowbox(
+                    installed_flowbox, self.current_category_info, animate_initial=False
+                )
+            else:
+                self._refresh_flowbox_removable_states(available_flowbox)
+                self._refresh_flowbox_removable_states(installed_flowbox)
+
+            # The tab bar itself is conditional. The wrapper always exists so a
+            # just-installed app can expose Installed without replacing the whole
+            # category view, while removing the last installed app hides it again.
+            switcher = getattr(view, "_linuxtoys_category_switcher", None)
+            tabs = getattr(view, "_linuxtoys_category_tabs", None)
+            has_installed = self._category_has_installed_items(
+                self.current_category_info
             )
-            self.scripts_flowbox.show_all()
-        else:
-            # Root-level scripts can also be removable.
-            self.load_categories()
+            if switcher is not None:
+                if has_installed:
+                    switcher.set_no_show_all(False)
+                    switcher.show_all()
+                else:
+                    switcher.hide()
+                    switcher.set_no_show_all(True)
+                    if tabs is not None:
+                        tabs.set_visible_child_name("available")
+            return
+
+        self._refresh_flowbox_removable_states(flowbox)

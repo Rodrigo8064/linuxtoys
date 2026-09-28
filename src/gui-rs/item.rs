@@ -19,7 +19,7 @@ fn load_image(value: &str, size: i32) -> gtk::Image {
 }
 
 #[pyfunction]
-#[pyo3(signature = (name, icon, badge=None, bold=false, checklist=false, removable=false, is_new=false))]
+#[pyo3(signature = (name, icon, badge=None, bold=false, checklist=false, removable=false, is_new=false, category=false))]
 fn create_item_widget(
     py: Python<'_>,
     name: &str,
@@ -29,6 +29,7 @@ fn create_item_widget(
     checklist: bool,
     removable: bool,
     is_new: bool,
+    category: bool,
 ) -> PyResult<PyObject> {
     // GTK is initialized by the Python application before cards are requested.
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
@@ -36,8 +37,7 @@ fn create_item_widget(
     row.set_hexpand(false);
     row.set_halign(gtk::Align::Fill);
 
-    let remove_button = if removable {
-        row.style_context().add_class("installed-card");
+    let remove_button = {
         let button = gtk::Button::from_icon_name(Some("edit-delete-symbolic"), gtk::IconSize::Menu);
         button.style_context().add_class("installed-card-remove-left");
         button.style_context().add_class("destructive-action");
@@ -45,8 +45,14 @@ fn create_item_widget(
         button.set_relief(gtk::ReliefStyle::None);
         button.set_can_focus(true);
         row.pack_start(&button, false, false, 0);
+        if removable {
+            row.style_context().add_class("installed-card");
+        } else {
+            button.set_no_show_all(true);
+            button.hide();
+        }
         Some(button)
-    } else { None };
+    };
 
     let check = if checklist {
         let button = gtk::CheckButton::new();
@@ -57,7 +63,10 @@ fn create_item_widget(
     } else { None };
 
     let label = gtk::Label::new(Some(name));
-    if !removable && !checklist { label.set_margin_start(22); }
+    if !removable && !checklist {
+        if category { label.set_margin_end(38); }
+        else { label.set_margin_start(22); }
+    }
     label.set_line_wrap(true);
     label.set_justify(gtk::Justification::Center);
     label.set_halign(gtk::Align::Center);
@@ -69,12 +78,25 @@ fn create_item_widget(
         let escaped = glib::markup_escape_text(name);
         label.set_markup(&format!("<b>{}</b>", escaped));
     }
-    row.pack_start(&label, true, true, 0);
-
     let image = load_image(icon, 38);
     image.set_halign(gtk::Align::End);
     image.set_valign(gtk::Align::Center);
-    row.pack_start(&image, false, false, 20);
+
+    if category {
+        let slot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        slot.set_size_request(38, 38);
+        slot.set_halign(gtk::Align::Start);
+        slot.set_valign(gtk::Align::Center);
+        row.pack_start(&slot, false, false, 20);
+        row.pack_start(&label, true, true, 0);
+        image.set_no_show_all(true);
+        image.hide();
+        row.set_hexpand(true);
+        row.set_halign(gtk::Align::Fill);
+    } else {
+        row.pack_start(&label, true, true, 0);
+        row.pack_start(&image, false, false, 20);
+    }
 
     let surface = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     surface.pack_start(&row, true, true, 0);

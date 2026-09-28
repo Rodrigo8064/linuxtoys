@@ -12,6 +12,7 @@ import uuid
 from .antenna import antenna
 from .gtk_common import GLib
 from .library_loader import script_command, script_environment
+from .appstream_resolver import resolve_native_appstream_package
 from .term_registry import ExecutionRegistry
 
 
@@ -50,6 +51,60 @@ class AppStreamRunner:
             self._condition.notify()
         self._notify_changed()
         return added
+
+
+    def enqueue_extension(self, info):
+        """Queue a Flatpak extension install through the persistent PTY."""
+        payload = dict(info)
+        payload["is_flatpak_extension"] = True
+        return self.enqueue([payload])
+
+    def enqueue_extension_removal(self, info, record_id=None):
+        """Queue removal of a Flatpak extension without Action Registry state."""
+        self._ensure_started()
+        ref = str(info.get("flatpak_ref") or "").strip()
+        if not ref:
+            return None
+        with self._condition:
+            record = None
+            if record_id:
+                record = next((item for item in self._records if item["id"] == record_id), None)
+            if record is None:
+                record = next((item for item in reversed(self._records)
+                    if item["status"] == "success"
+                    and str(item["info"].get("flatpak_ref") or "").strip() == ref), None)
+            if record is None:
+                record = {
+                    "id": uuid.uuid4().hex, "info": dict(info),
+                    "name": info.get("name", ref),
+                    "icon": info.get("icon", "application-x-addon-symbolic"),
+                    "status": "queued", "exit_code": None,
+                }
+                self._records.append(record)
+            elif record["status"] in ("queued", "running"):
+                return None
+            else:
+                record["status"] = "queued"
+                record["exit_code"] = None
+            record["action"] = "extension_remove"
+            self._jobs.append(record)
+            self._condition.notify()
+        self._notify_changed()
+        return record["id"]
+
+    def status_for_extension_ref(self, flatpak_ref):
+        target = str(flatpak_ref or "").strip()
+        if not target:
+            return None
+        with self._condition:
+            matches = [r for r in self._records if str(r["info"].get("flatpak_ref") or "").strip() == target]
+            if any(r.get("action") == "extension_remove" and r["status"] in ("queued", "running") for r in matches):
+                return "removing"
+            if any(r["status"] in ("queued", "running") for r in matches):
+                return "queued"
+            if any(r["status"] == "success" and r.get("action") != "extension_remove" for r in matches):
+                return "installed"
+        return None
 
     def enqueue_removal(self, app_info, remove_info, record_id=None):
         """Queue an AppStream uninstall through the persistent PTY."""
@@ -258,12 +313,16 @@ class AppStreamRunner:
                 # installation registry/transmap behavior.
                 if record.get("action") == "remove":
                     exit_code = self._run_removal_job(record["remove_info"])
+                elif record.get("action") == "extension_remove":
+                    exit_code = self._run_flatpak_extension(record["info"], remove=True)
+                elif record["info"].get("is_flatpak_extension"):
+                    exit_code = self._run_flatpak_extension(record["info"], remove=False)
                 else:
                     exit_code = self._run_job(record["info"])
 
                 with self._condition:
                     record["exit_code"] = exit_code
-                    if record.get("action") == "remove" and exit_code == 0:
+                    if record.get("action") in ("remove", "extension_remove") and exit_code == 0:
                         # The generated uninstall script has already removed the
                         # reverted registry transaction. Retire its session record.
                         try:
@@ -283,6 +342,45 @@ class AppStreamRunner:
                 if refresh is not None:
                     GLib.idle_add(refresh, True)
 
+    def _flatpak_scope_args(self, info):
+        scope = str(info.get("flatpak_scope") or "").strip()
+        installation = str(info.get("flatpak_installation") or "").strip()
+        if scope == "user":
+            return ["--user"]
+        if installation and installation != "default":
+            return [f"--installation={installation}"]
+        return ["--system"]
+
+    def _run_flatpak_extension(self, info, remove=False):
+        if self._process is None or self._process.poll() is not None:
+            self._close_pty()
+            self._spawn_shell()
+        ref = str(info.get("flatpak_ref") or "").strip()
+        if not ref:
+            return 2
+        argv = ["flatpak", *self._flatpak_scope_args(info)]
+        if remove:
+            argv += ["uninstall", "-y", ref]
+        else:
+            remote = str(info.get("flatpak_remote") or "flathub").strip() or "flathub"
+            argv += ["install", "-y", remote, ref]
+        return self._dispatch_argv(argv)
+
+    def _dispatch_argv(self, argv):
+        token = uuid.uuid4().hex
+        marker = f"__LINUXTOYS_APPSTREAM_DONE_{token}__"
+        command = " ".join(shlex.quote(str(part)) for part in argv)
+        mid = len(marker) // 2
+        dispatch = (
+            f"_lt_marker={shlex.quote(marker[:mid])};"
+            f"_lt_marker=\"$_lt_marker\"{shlex.quote(marker[mid:])}; "
+            f"{command}; _lt_status=$?; "
+            f"printf '\\n%s:%s\\n' \"$_lt_marker\" \"$_lt_status\"\n"
+        )
+        self._process.stdin.write(dispatch.encode("utf-8"))
+        self._process.stdin.flush()
+        return self._read_until_marker(marker)
+
     def _run_job(self, script_info):
         if self._process is None or self._process.poll() is not None:
             self._close_pty()
@@ -299,6 +397,38 @@ class AppStreamRunner:
         env = script_environment(script_info, os.environ.copy())
         env["TRANSMAP_PATH"] = transmap_path
         env.pop("LINUXTOYS_RUNNER_STATE", None)
+
+        # Resolve misleading AppStream native package ownership before any
+        # background script starts.  The generated AppStream script consumes
+        # this value instead of asking pkg_install to reinterpret its argument.
+        env.pop("LINUXTOYS_APPSTREAM_PACKAGE", None)
+        if script_info.get("appstream_source") == "native":
+            package_value = script_info.get("package-name")
+            if isinstance(package_value, str):
+                packages = [package_value.strip()] if package_value.strip() else []
+            elif isinstance(package_value, (list, tuple)):
+                packages = [str(value).strip() for value in package_value if str(value).strip()]
+            else:
+                packages = []
+
+            # A single AppStream package is the only case where semantic
+            # promotion is unambiguous. Multi-package entries keep their
+            # materialized pkg_install commands unchanged.
+            if len(packages) == 1:
+                original_package = packages[0]
+                resolved_package = resolve_native_appstream_package(
+                    original_package,
+                    component_id=script_info.get("appstream_id"),
+                    desktop_id=script_info.get("appstream_launchable"),
+                    name=script_info.get("name"),
+                )
+                env["LINUXTOYS_APPSTREAM_PACKAGE"] = resolved_package
+                if resolved_package != original_package:
+                    print(
+                        f"Resolved AppStream package '{original_package}' to "
+                        f"'{resolved_package}'.",
+                        file=os.sys.stderr,
+                    )
 
         override_paths = []
         try:
