@@ -11,7 +11,7 @@ from app.easy_cli import (
     resolve_script_dir,
 )
 from app.library_loader import script_command
-from app.parser import script_requires_reboot
+from app.parser import get_breadcrumb_path, script_requires_reboot
 from app.registry_utils import parse_registry_file
 from app.repo_parser import materialize_repo_script
 from app.revert_helper import build_uninstall_script_entry
@@ -106,11 +106,14 @@ class ScriptRunnerMixin:
             self.run_uninstall(button)
 
     async def _navigate_to_category(self, button: DescButton) -> None:
-        if is_specials_path(button.path):
-            items = get_specials_items(button.path)
-        else:
-            items = get_scripts_for_category_cached(button.path)
-        await self._render_items(items)
+        self._nav_stack.append(button.path)
+        await self._render_items(self._items_for_path(button.path))
+        self._update_breadcrumb()
+
+    def _items_for_path(self, path: str) -> list[dict]:
+        if is_specials_path(path):
+            return get_specials_items(path)
+        return get_scripts_for_category_cached(path)
 
     def run_script(self, button: DescButton) -> None:
         self._running_button = button
@@ -614,3 +617,19 @@ class ScriptRunnerMixin:
         terminal.run_script(
             ["sh", "-c", "curl -fsSL https://linux.toys/install.sh | bash"]
         )
+
+    def _update_breadcrumb(self) -> None:
+        panel = self.query_one("#left-panel-home")
+        base = "Categorias/Scripts"
+        if not self._nav_stack:
+            panel.border_title = base
+            return
+
+        current = self._nav_stack[-1]
+        if is_specials_path(current):
+            panel.border_title = "Specials"
+            return
+
+        crumbs = get_breadcrumb_path(current, translations)
+        names = " › ".join(c["name"] for c in crumbs)
+        panel.border_title = f"{names}" if names else base

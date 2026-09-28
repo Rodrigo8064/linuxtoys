@@ -48,6 +48,10 @@ from .registry_screen import RegistryOpenerMixin, RegistryScreen
 class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
     """main screen for linuxtoys TUI"""
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._nav_stack: list[str] = []
+
     CSS_PATH = "style.tcss"
     _search_timer: asyncio.TimerHandle | None = None
 
@@ -56,6 +60,7 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
         Binding("tab", "app.focus_next", "Navegar"),
         Binding("shift+tab", "app.focus_previous", "Anterior"),
         Binding("h", "reset_to_home", "Home"),
+        Binding("escape", "go_back", "Voltar"),
         Binding("f1", "noop", "🔴 Uninstall   🟡 New", key_display=" "),
     ]
 
@@ -256,8 +261,20 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
             *get_categories(translations),
         ]
 
+    async def action_go_back(self) -> None:
+        if not self._nav_stack:
+            return  # já está na home
+        self._nav_stack.pop()
+        if self._nav_stack:
+            await self._render_items(self._items_for_path(self._nav_stack[-1]))
+        else:
+            await self.action_reset_to_home()
+        self._update_breadcrumb()
+
     async def action_reset_to_home(self) -> None:
+        self._nav_stack.clear()
         await self._render_items(self._home_items())
+        self._update_breadcrumb()
 
     def _start_scripts_resync(self) -> None:
         if is_dev_mode_enabled():
