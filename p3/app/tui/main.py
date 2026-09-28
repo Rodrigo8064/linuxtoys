@@ -28,6 +28,7 @@ from .button_helper import ScriptRunnerMixin
 from .dialog_screen import LanguageSelectorDialog, ReportBugDialog
 from .helper import (
     get_categories,
+    get_specials_root_item,
     invalidate_search_caches,
     is_search_ready,
     make_widget_id,
@@ -62,7 +63,6 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
         """Empty action for purely informational captions in the footer."""
 
     def compose(self) -> ComposeResult:
-        categories = get_categories(translations)
         yield Header(icon="")
 
         with Horizontal(id="body-home"):
@@ -76,16 +76,8 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
                 )
                 with VerticalScroll(id="left-panel-home"):
                     registry_data = parse_registry_file()
-                    for item in categories:
-                        yield DescButton(
-                            item["name"],
-                            item["description"],
-                            item["path"],
-                            item["is_script"],
-                            item.get("is_new", False),
-                            item["name"] in registry_data,
-                            id=make_widget_id(item["path"]),
-                        )
+                    for item in self._home_items():
+                        yield self._make_desc_button(item, registry_data)
             # right panel widgets
             with Vertical(id="menu-panel"):
                 yield Static(logo, id="logo")
@@ -160,22 +152,27 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
         self.query_one("#left-panel-home").border_title = "Categorias/Scripts"
         self.query_one("#menu-panel").border_title = "Menu"
 
+    def _make_desc_button(self, item: dict, registry_data) -> DescButton:
+        return DescButton(
+            item["name"],
+            item["description"],
+            item["path"],
+            item["is_script"],
+            item.get("is_new", False),
+            item["name"] in registry_data,
+            item.get("is_repo_entry", False),
+            item.get("is_appstream_entry", False),
+            id=make_widget_id(item["path"]),
+        )
+
     async def _render_items(self, items: list[dict]) -> None:
         left_panel = self.query_one("#left-panel-home", VerticalScroll)
         await left_panel.remove_children()
         registry_data = parse_registry_file()
-        for item in items:
-            await left_panel.mount(
-                DescButton(
-                    item["name"],
-                    item["description"],
-                    item["path"],
-                    item["is_script"],
-                    item.get("is_new", False),
-                    item["name"] in registry_data,
-                    id=make_widget_id(item["path"]),
-                )
-            )
+        buttons = [
+            self._make_desc_button(item, registry_data) for item in items
+        ]
+        await left_panel.mount_all(buttons)
 
     @on(FocusableLabel.Pressed, "#report-bug")
     def handle_report_bug(self) -> None:
@@ -252,9 +249,15 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
             return
         await self._render_items(items)
 
+    def _home_items(self) -> list[dict]:
+        """Top-level items: Specials button first, then the cached categories."""
+        return [
+            get_specials_root_item(translations),
+            *get_categories(translations),
+        ]
+
     async def action_reset_to_home(self) -> None:
-        categories = get_categories(translations)
-        await self._render_items(categories)
+        await self._render_items(self._home_items())
 
     def _start_scripts_resync(self) -> None:
         if is_dev_mode_enabled():
@@ -309,12 +312,7 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
         translations.update(new_translations)  # muta no lugar, não reatribui
         lang_utils.save_language(new_language_code)
         invalidate_search_caches()
-        self.run_worker(
-            self._warm_search_worker,
-            thread=True,
-            exclusive=False,
-            name="warm_search_index",
-        )
+        warm_search_and_category_index(translations)
 
         await self.action_reset_to_home()
         await self._refresh_fixed_ui_labels()

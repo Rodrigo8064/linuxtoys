@@ -67,6 +67,8 @@ class DescButton(Button):
         is_script: bool,
         is_new: bool = False,
         is_installed: bool = False,
+        is_repo_entry: bool = False,
+        is_appstream_entry: bool = False,
         **kwargs,
     ) -> None:
         super().__init__(label, tooltip=description, **kwargs)
@@ -76,7 +78,11 @@ class DescButton(Button):
         self.is_new = is_new
         self.script_name = label
         self.is_installed = is_installed
-        self.revert = is_removable(str(label), path)
+        self.revert = is_removable(
+            str(label), path, is_repo_entry, is_appstream_entry
+        )
+        self.is_repo_entry = is_repo_entry
+        self.is_appstream_entry = is_appstream_entry
 
     def on_mount(self) -> None:
         if self.revert and self.is_installed:

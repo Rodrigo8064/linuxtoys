@@ -15,6 +15,8 @@ _category_cache: CategoryCache | None = None
 _script_cache: ScriptCache | None = None
 _search_engine: SearchEngine | None = None
 _cache_lock = threading.Lock()
+SPECIALS_PREFIX = "specials://"
+SPECIALS_ROOT = "specials://root"
 
 
 def make_widget_id(identifier: str) -> str:
@@ -32,10 +34,20 @@ def is_search_ready() -> bool:
     return _search_engine is not None and _category_cache is not None
 
 
-def is_removable(script_name: str, script_path: str) -> bool:
+def is_removable(
+    script_name: str,
+    script_path: str,
+    is_repo_entry: bool,
+    is_appstream_entry: bool,
+) -> bool:
     global _script_cache
     script_cache = _script_cache
-    script_info = {"name": script_name, "path": script_path}
+    script_info = {
+        "name": script_name,
+        "path": script_path,
+        "is_repo_entry": is_repo_entry,
+        "is_appstream_entry": is_appstream_entry,
+    }
     return script_cache.is_script_removable(script_info)
 
 
@@ -110,3 +122,45 @@ def get_categories(trans=None) -> list[dict]:
     from app.parser import get_categories as parser_get_categories
 
     return parser_get_categories(translations=trans or translations)
+
+
+def is_specials_path(path: str) -> bool:
+    return path.startswith(SPECIALS_PREFIX)
+
+
+def get_specials_items(path: str, trans=None) -> list[dict]:
+    """Resolve a virtual specials:// path into the items to render.
+
+    - specials://root         -> curated categories
+    - specials://category/{n} -> curated scripts of that category
+    """
+    cache = _category_cache
+    if cache is None or not cache.is_populated:
+        return []
+
+    active_translations = trans or translations
+    categories = cache.get_linuxtoys_special_categories(active_translations)
+
+    if path == SPECIALS_ROOT:
+        return categories
+
+    for category in categories:
+        if category["path"] == path:
+            return cache.get_linuxtoys_special_scripts(
+                category["specials_category_path"]
+            )
+
+    return []
+
+
+def get_specials_root_item(trans=None) -> dict:
+    active_translations = trans or translations
+    return {
+        "name": active_translations.get("specials", "Specials"),
+        "description": active_translations.get(
+            "specials_desc", "LinuxToys-curated software and scripts."
+        ),
+        "path": SPECIALS_ROOT,
+        "is_script": False,
+        "widget_id": "is_linuxtoys_specials",
+    }

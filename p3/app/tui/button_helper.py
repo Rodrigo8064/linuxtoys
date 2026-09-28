@@ -30,7 +30,9 @@ from .dialog_screen import (
 )
 from .helper import (
     get_scripts_for_category_cached,
+    get_specials_items,
     is_removable,
+    is_specials_path,
     translations,
 )
 from .manifest_dialog import ManifestReportDialog
@@ -71,7 +73,12 @@ class ScriptRunnerMixin:
         script_name = str(button.label)
         registry_data = parse_registry_file()
         is_first_run = script_name not in registry_data
-        is_script_removable = is_removable(script_name, button.path)
+        is_script_removable = is_removable(
+            script_name,
+            button.path,
+            button.is_repo_entry,
+            button.is_appstream_entry,
+        )
 
         if not is_first_run and is_script_removable:
             self.app.push_screen(
@@ -99,7 +106,10 @@ class ScriptRunnerMixin:
             self.run_uninstall(button)
 
     async def _navigate_to_category(self, button: DescButton) -> None:
-        items = get_scripts_for_category_cached(button.path)
+        if is_specials_path(button.path):
+            items = get_specials_items(button.path)
+        else:
+            items = get_scripts_for_category_cached(button.path)
         await self._render_items(items)
 
     def run_script(self, button: DescButton) -> None:
