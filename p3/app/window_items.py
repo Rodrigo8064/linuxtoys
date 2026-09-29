@@ -20,7 +20,7 @@ class ItemWidgetFactory:
     def create_flowbox(self):
         flowbox = Gtk.FlowBox()
         flowbox.set_valign(Gtk.Align.START)
-        flowbox.set_max_children_per_line(5)
+        flowbox.set_max_children_per_line(10)
         flowbox.set_activate_on_single_click(False)
 
         flowbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
@@ -161,14 +161,15 @@ class ItemWidgetFactory:
                 return True
         return False
 
-    def _native_item_spec(self, item_info, checklist=False):
+    def _native_item_spec(self, item_info, checklist=False, force_category=False):
         """Return the native-card descriptor, or None for Python-only cards."""
         is_main_category = self.current_category_info is None
         is_subcategory = item_info.get("is_subcategory", False)
         is_category_type = item_info.get("type") == "category"
         is_not_script = not item_info.get("is_script", False)
         is_category_card = (
-            is_subcategory
+            force_category
+            or is_subcategory
             or (is_category_type and is_not_script)
             or (is_main_category and is_not_script)
         )
@@ -179,7 +180,11 @@ class ItemWidgetFactory:
         icon_value = str(item_info.get("icon", "application-x-executable") or "")
         icon_path = ""
         icon_name = icon_value
-        if icon_value.endswith((".png", ".svg")):
+
+        # Remote icons are first-class sources for the native Rust image loader.
+        # Do not classify URL paths ending in .png/.svg as local filesystem icons.
+        is_remote_icon = icon_value.startswith(("https://", "http://", "/v2/"))
+        if not is_remote_icon and icon_value.endswith((".png", ".svg")):
             if not os.path.isabs(icon_value) and "/" not in icon_value:
                 icon_path = get_icon_path(
                     "local-script.svg"
@@ -372,6 +377,7 @@ class ItemWidgetFactory:
         allow_drag: bool = False,
         featured_large: bool = False,
         featured_height: int = 0,
+        force_category: bool = False,
     ):
         if featured_large:
             return self._create_featured_large_item_widget(
@@ -381,7 +387,11 @@ class ItemWidgetFactory:
         # All standard cards are native-only. The Rust GUI owns the complete
         # foreground/card hierarchy; Python only attaches application state,
         # callbacks, and the allocation-dependent category watermark wrapper.
-        native_spec = self._native_item_spec(item_info, checklist=checklist)
+        native_spec = self._native_item_spec(
+            item_info,
+            checklist=checklist,
+            force_category=force_category,
+        )
         if native_spec is None:
             raise RuntimeError(
                 "Standard cards require the native Rust GUI implementation"

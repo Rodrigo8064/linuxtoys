@@ -149,7 +149,31 @@ class AppWindow(
         self._categories_loading_fade_source = None
         self._categories_loading_fade_started_us = None
         self._categories_loading_fade_duration_ms = 220
+        # Startup has three independent readiness stages. Do not expose the real
+        # menu or let Featured measure it until the complete category snapshot has
+        # been published, GTK has allocated that snapshot, and its allocation-sized
+        # watermarks have been rendered.
+        self._categories_startup_render_complete = False
+        self._categories_startup_allocation_complete = False
+        self._categories_startup_waiting_for_allocation = False
+        self._categories_startup_expected_children = 0
         self._categories_startup_transition_complete = False
+
+        # Language changes are presented as a content crossfade. Native Rust
+        # rendering remains authoritative for allocation-dependent decorations.
+        self._language_transition_active = False
+        self._language_transition_phase = None
+        self._language_transition_source = None
+        self._language_transition_started_us = None
+        self._language_transition_duration_ms = 120
+        self._language_transition_target = None
+        self._language_categories_render_pending = False
+        self._language_categories_waiting_for_allocation = False
+        self._language_categories_expected_children = 0
+        self._language_categories_allocation_complete = False
+        self._language_featured_refresh_started = False
+        self._language_featured_allocation_complete = False
+        self._language_featured_allocate_handler = None
 
         # --- UI Structure ---
         main_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
@@ -236,10 +260,20 @@ class AppWindow(
         )  # Set a reasonable transition duration
         main_vbox.pack_start(self.main_stack, True, True, 0)
 
-        # Create categories view with random scripts section
+        # Create categories view with random scripts section. Keep the complete
+        # menu anchored to the top of the viewport: its natural content height is
+        # also the geometry basis used by Featured capacity calculations.
         categories_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        categories_container.set_valign(Gtk.Align.START)
+        categories_container.set_halign(Gtk.Align.FILL)
+        categories_container.set_hexpand(True)
+        categories_container.set_vexpand(False)
 
         self.categories_flowbox = self.create_flowbox()
+        self.categories_flowbox.connect(
+            "size-allocate",
+            self._on_categories_startup_size_allocate,
+        )
         categories_container.pack_start(self.categories_flowbox, False, False, 0)
 
         # Create separator and featured scripts section. The outer revealer animates
@@ -1809,8 +1843,71 @@ class AppWindow(
         self.reveal.support.hide()
         self.reveal.set_reveal_child(len(self.check_buttons) >= 2)
 
+    def _on_categories_startup_size_allocate(self, _widget, allocation):
+        """Commit category geometry barriers after a real final FlowBox allocation."""
+        if allocation.width <= 1 or allocation.height <= 1:
+            return
+
+        child_count = len(self.categories_flowbox.get_children())
+
+        # Startup and language refresh intentionally share the same allocation
+        # signal.  Publishing the last card or calling queue_resize() is not a
+        # geometry barrier: GTK may still report the previous allocation until
+        # this callback runs.
+        if (
+            getattr(self, "_language_transition_active", False)
+            and getattr(self, "_language_categories_waiting_for_allocation", False)
+            and (
+                self._language_categories_expected_children <= 0
+                or child_count == self._language_categories_expected_children
+            )
+        ):
+            self._language_categories_waiting_for_allocation = False
+            self._language_categories_allocation_complete = True
+            self._language_categories_render_pending = False
+
+        if self._categories_startup_transition_complete:
+            return
+        if not self._categories_startup_render_complete:
+            return
+        if not self._categories_startup_waiting_for_allocation:
+            return
+        if (
+            self._categories_startup_expected_children > 0
+            and child_count != self._categories_startup_expected_children
+        ):
+            return
+
+        self._categories_startup_waiting_for_allocation = False
+        self._categories_startup_allocation_complete = True
+
+        # Every category surface now exists and has an allocation, so the native
+        # watermark pass can no longer finish before later cards are registered.
+        self._categories_loading_watermarks_flushed = False
+        self._start_startup_watermark_flush()
+
+    def _maybe_start_categories_loading_fade(self):
+        """Reveal the main menu only when its complete startup snapshot is paint-ready."""
+        if self._categories_startup_transition_complete:
+            return False
+        if self._appstream_initial_build_pending:
+            return False
+        if not (
+            self._categories_startup_render_complete
+            and self._categories_startup_allocation_complete
+            and self._categories_loading_watermarks_flushed
+        ):
+            return False
+        if not self.categories_loading_box.get_visible():
+            return False
+        if self._categories_loading_fade_source is not None:
+            return False
+
+        self._start_categories_loading_fade()
+        return False
+
     def _start_categories_loading_fade(self):
-        """Cross-fade the completed main menu in while the startup roller fades out."""
+        """Cross-fade the fully rendered main menu in while the startup roller fades out."""
         if self._categories_loading_fade_source is not None:
             return False
         if not hasattr(self, "categories_view"):
@@ -1880,28 +1977,14 @@ class AppWindow(
 
         self._categories_loading_watermark_source = None
         self._categories_loading_watermarks_flushed = True
+        self._maybe_start_categories_loading_fade()
         return False
 
     def _hide_categories_loading_indicator(self):
-        """Begin the usable-menu transition as soon as bootstrap data is ready."""
+        """Release startup only after the complete category snapshot is paint-ready."""
         if not hasattr(self, "categories_loading_box"):
             return False
-        if self._appstream_initial_build_pending:
-            return False
-        if not self.categories_loading_box.get_visible():
-            return False
-        if self._categories_loading_fade_source is not None:
-            return False
-
-        # Watermark composition is cosmetic and already cooperative: one expensive
-        # pixbuf is produced per idle dispatch. Do not serialize first paint behind
-        # the complete watermark queue. Start draining it and cross-fade the usable
-        # menu at the same time; GTK can paint between individual compositions.
-        if not self._categories_loading_watermarks_flushed:
-            self._start_startup_watermark_flush()
-
-        self._start_categories_loading_fade()
-        return False
+        return self._maybe_start_categories_loading_fade()
 
     def _render_categories(self, categories):
         """Render a parsed category snapshot cooperatively on the GTK thread."""
@@ -1910,6 +1993,16 @@ class AppWindow(
         # source that may currently be dispatching.
         generation = getattr(self, "_category_render_generation", 0) + 1
         self._category_render_generation = generation
+        if getattr(self, "_language_transition_active", False):
+            self._language_categories_render_pending = True
+
+        startup_render = not self._categories_startup_transition_complete
+        if startup_render:
+            self._categories_startup_render_complete = False
+            self._categories_startup_allocation_complete = False
+            self._categories_startup_waiting_for_allocation = False
+            self._categories_startup_expected_children = 0
+            self._categories_loading_watermarks_flushed = False
 
         temp_current_category = self.current_category_info
         self.current_category_info = None
@@ -1942,6 +2035,7 @@ class AppWindow(
             nonlocal first_batch
 
             if self._category_render_generation != generation:
+                self.current_category_info = temp_current_category
                 return False
 
             added = 0
@@ -1950,9 +2044,30 @@ class AppWindow(
                     cat = next(pending)
                 except StopIteration:
                     self.current_category_info = temp_current_category
+                    if getattr(self, "_language_transition_active", False):
+                        self._language_categories_expected_children = len(
+                            self.categories_flowbox.get_children()
+                        )
+                        self._language_categories_waiting_for_allocation = True
+                        self._language_categories_allocation_complete = False
+                    if startup_render:
+                        self._categories_startup_expected_children = len(
+                            self.categories_flowbox.get_children()
+                        )
+                        self._categories_startup_render_complete = True
+                        self._categories_startup_waiting_for_allocation = True
+                        # Force one allocation of the final, complete FlowBox. The
+                        # size-allocate callback is the startup geometry barrier.
+                        self.categories_flowbox.queue_resize()
+                        self.categories_view.queue_resize()
+                    elif getattr(self, "_language_transition_active", False):
+                        self.categories_flowbox.queue_resize()
                     return False
 
-                widget = self.create_item_widget(cat)
+                # Root-menu cards have an explicit structural role. Do not infer
+                # it from mutable navigation state while this cooperative render
+                # yields back to the GTK main loop between batches.
+                widget = self.create_item_widget(cat, force_category=True)
                 description = cat.get("description", "")
                 widget.set_tooltip_text(description or None)
                 self.categories_flowbox.add(widget)
@@ -1961,10 +2076,11 @@ class AppWindow(
 
             if first_batch:
                 first_batch = False
-                # The first visible row is enough to release the startup overlay.
-                # Remaining category cards continue to arrive in later idle turns.
-                self.current_category_info = temp_current_category
-                self._hide_categories_loading_indicator()
+                # Keep current_category_info cleared for the entire cooperative
+                # publication. create_item_widget() uses this state to distinguish
+                # main-menu category cards from ordinary category/app entries.
+                # Restoring it after only the first batch makes later cards use the
+                # ordinary icon layout when a refresh originates from another view.
 
             return True
 
@@ -3003,16 +3119,123 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
 
         self.get_application().quit()
 
+    def _on_language_visible_size_allocate(self, widget, allocation):
+        """Commit a translated non-category view only after a fresh allocation."""
+        if not getattr(self, "_language_transition_active", False):
+            return
+        if allocation.width <= 1 or allocation.height <= 1:
+            return
+        handler_id = getattr(self, "_language_visible_allocate_handler", None)
+        if handler_id is not None:
+            try:
+                widget.disconnect(handler_id)
+            except (RuntimeError, TypeError):
+                pass
+            self._language_visible_allocate_handler = None
+        self._language_visible_allocation_complete = True
+
+    def _arm_language_visible_allocation_barrier(self, widget):
+        """Require an allocation produced by the translated rebuild, not an old one."""
+        old_handler = getattr(self, "_language_visible_allocate_handler", None)
+        old_widget = getattr(self, "_language_visible_allocate_widget", None)
+        if old_handler is not None and old_widget is not None:
+            try:
+                old_widget.disconnect(old_handler)
+            except (RuntimeError, TypeError):
+                pass
+        self._language_visible_allocation_complete = False
+        self._language_visible_allocate_widget = widget
+        self._language_visible_allocate_handler = widget.connect(
+            "size-allocate", self._on_language_visible_size_allocate
+        )
+        widget.queue_resize()
+
+    def _on_language_featured_size_allocate(self, grid, allocation):
+        """Commit the hidden language Featured rebuild after its real allocation."""
+        if not getattr(self, "_language_transition_active", False):
+            return
+        if allocation.width <= 1 or allocation.height <= 1 or not grid.get_children():
+            return
+        handler_id = getattr(self, "_language_featured_allocate_handler", None)
+        if handler_id is not None:
+            grid.disconnect(handler_id)
+            self._language_featured_allocate_handler = None
+        self._language_featured_allocation_complete = True
+
     def on_language_changed(self, new_language_code):
-        """Handle language change by reloading translations and updating UI"""
+        """Cross-fade a complete language refresh instead of exposing rebuild work."""
+        if getattr(self, "_language_transition_active", False):
+            self._language_transition_target = new_language_code
+            return
+
+        self._language_transition_active = True
+        self._language_transition_target = new_language_code
+        self._language_transition_phase = "out"
+        self._language_transition_started_us = GLib.get_monotonic_time()
+        self._language_transition_duration_ms = 120
+        self._language_categories_render_pending = False
+        self._language_categories_waiting_for_allocation = False
+        self._language_categories_expected_children = 0
+        self._language_categories_allocation_complete = False
+        self._language_featured_refresh_started = False
+        self._language_featured_allocation_complete = False
+        self._language_visible_allocation_complete = False
+        self._language_visible_allocate_handler = None
+        self._language_visible_allocate_widget = None
+        handler_id = getattr(self, "_language_featured_allocate_handler", None)
+        if handler_id is not None:
+            self.random_scripts_flowbox.disconnect(handler_id)
+            self._language_featured_allocate_handler = None
+
+        if self._language_transition_source is not None:
+            GLib.source_remove(self._language_transition_source)
+        self._language_transition_source = GLib.timeout_add(
+            16, self._step_language_transition
+        )
+
+    def _step_language_transition(self):
+        """Drive the fade-out/fade-in phases around a hidden translated rebuild."""
+        phase = self._language_transition_phase
+        started = self._language_transition_started_us
+        if phase not in ("out", "in") or started is None:
+            self._language_transition_source = None
+            return False
+
+        elapsed_ms = (GLib.get_monotonic_time() - started) / 1000.0
+        duration = max(1, self._language_transition_duration_ms)
+        progress = min(1.0, elapsed_ms / duration)
+        self.main_stack.set_opacity(1.0 - progress if phase == "out" else progress)
+
+        if progress < 1.0:
+            return True
+
+        self._language_transition_source = None
+        if phase == "out":
+            self.main_stack.set_opacity(0.0)
+            self._language_transition_phase = "waiting"
+            self._apply_language_change_hidden(self._language_transition_target)
+            GLib.idle_add(self._wait_for_language_render_ready)
+        else:
+            self.main_stack.set_opacity(1.0)
+            self._language_transition_phase = None
+            self._language_transition_started_us = None
+            self._language_transition_active = False
+            self._language_transition_target = None
+            self._language_featured_refresh_started = False
+            if (
+                self.main_stack.get_visible_child_name() == "categories"
+                and self.should_start_random_timer
+                and self.all_scripts
+                and self.random_scripts_flowbox.get_children()
+            ):
+                self._restart_random_scripts_refresh_timer()
+        return False
+
+    def _apply_language_change_hidden(self, new_language_code):
+        """Apply translations while main-stack content is fully transparent."""
         from . import lang_utils
 
-        # Load new translations
         self.translations = lang_utils.load_translations(new_language_code)
-
-        # Swap in fresh parser-backed caches and rebuild them together.  Avoid
-        # SearchEngine.update_translations() here because it starts its own full
-        # filesystem scan, duplicating the category/featured refresh.
         self.search_engine.translations = self.translations
         self.script_cache = search_helper.ScriptCache()
         self.category_cache = search_helper.CategoryCache()
@@ -3020,18 +3243,94 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
         self.all_scripts = []
         self._populate_runtime_caches()
 
-        # Update search entry placeholder text
         self.search_entry.set_placeholder_text(
             self.translations.get("search_placeholder", "Search features")
         )
-
-        # Update random scripts label
         if self.random_scripts_label:
             featured_label = self.translations.get("featured_scripts", "Try These")
             self.random_scripts_label.set_markup(f"<big><b>{featured_label}</b></big>")
 
-        # Refresh the UI with new translations
+        # The entire stack is already transparent. Reset Featured without
+        # collapsing its revealers, otherwise the SLIDE_DOWN animation changes the
+        # menu requisition while translated category geometry is being measured.
+        self._prepare_featured_language_rebuild()
         self._refresh_ui_with_new_translations()
+
+    def _wait_for_language_render_ready(self):
+        """Reveal only after structural and native allocation-dependent work is done."""
+        if not getattr(self, "_language_transition_active", False):
+            return False
+
+        visible_name = self.main_stack.get_visible_child_name()
+        root = self.main_stack.get_visible_child()
+        if root is None:
+            return True
+
+        allocation = root.get_allocation()
+        if allocation.width <= 1 or allocation.height <= 1:
+            root.queue_resize()
+            return True
+
+        if self._language_categories_render_pending:
+            return True
+
+        if visible_name == "categories":
+            # The translated category snapshot must have received a *new* real
+            # allocation before Featured is allowed to measure it.  Positive old
+            # allocations are deliberately insufficient here.
+            if not self._language_categories_allocation_complete:
+                self.categories_flowbox.queue_resize()
+                self.categories_view.queue_resize()
+                return True
+            if not self.all_scripts:
+                return True
+            if not self._language_featured_refresh_started:
+                self._language_featured_refresh_started = True
+                self._language_featured_allocation_complete = False
+                self._language_featured_allocate_handler = (
+                    self.random_scripts_flowbox.connect(
+                        "size-allocate", self._on_language_featured_size_allocate
+                    )
+                )
+                # Language refresh owns Featured while hidden.  Bypass the normal
+                # startup/resize entry points so only one calculation can consume
+                # this settled category geometry.
+                self._refresh_random_scripts_display(force=True)
+                self.random_scripts_flowbox.queue_resize()
+                self.featured_scripts_container.queue_resize()
+                return True
+            if (
+                not self.random_scripts_flowbox.get_children()
+                or not self._language_featured_allocation_complete
+            ):
+                return True
+
+        if visible_name != "categories":
+            if not self._language_visible_allocation_complete:
+                root.queue_resize()
+                return True
+
+            # App pages have additional deferred layout work: wrapped text height,
+            # screenshots, extension/body layout, and their adaptive Featured fill.
+            if visible_name == "app_page" and hasattr(root, "language_render_ready"):
+                if not root.language_render_ready():
+                    root.queue_resize()
+                    return True
+
+        # Rust owns readiness for allocation-dependent native decoration. Flush a
+        # small batch per main-loop turn and do not reveal zero/stale allocations.
+        gui_rs.flush_category_watermarks(root, 2)
+        if gui_rs.has_pending_render_work(root):
+            root.queue_resize()
+            return True
+
+        self._language_transition_phase = "in"
+        self._language_transition_started_us = GLib.get_monotonic_time()
+        self._language_transition_duration_ms = 180
+        self._language_transition_source = GLib.timeout_add(
+            16, self._step_language_transition
+        )
+        return False
 
     def _refresh_ui_with_new_translations(self):
         """Refresh all UI elements with new translations"""
@@ -3077,9 +3376,18 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
         # their utility-view header state instead of falling through to category
         # navigation refresh logic from the view they were opened from.
         if current_view == "appstream_queue":
-            queue_view = self.main_stack.get_child_by_name("appstream_queue")
-            if queue_view is not None and hasattr(queue_view, "refresh"):
-                queue_view.refresh()
+            # Recreate instead of reconciling the visible instance in place.  This
+            # gives the language transaction a clean widget generation and avoids
+            # retaining old translated labels/callback bindings between refreshes.
+            old_view = self.main_stack.get_child_by_name("appstream_queue")
+            if old_view is not None:
+                self.main_stack.remove(old_view)
+                old_view.destroy()
+            queue_view = appstream_queue.AppStreamQueueView(self)
+            self.main_stack.add_named(queue_view, "appstream_queue")
+            queue_view.show_all()
+            self.main_stack.set_visible_child(queue_view)
+            self._arm_language_visible_allocation_barrier(queue_view)
             self.header_widget.hide()
             self.reveal.set_reveal_child(False)
             self.back_button.show()
@@ -3088,9 +3396,15 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
             return
 
         if current_view == "installed_features":
-            installed_view = self.main_stack.get_child_by_name("installed_features")
-            if installed_view is not None and hasattr(installed_view, "refresh"):
-                installed_view.refresh()
+            old_view = self.main_stack.get_child_by_name("installed_features")
+            if old_view is not None:
+                self.main_stack.remove(old_view)
+                old_view.destroy()
+            installed_view = installed_features.InstalledFeaturesView(self)
+            self.main_stack.add_named(installed_view, "installed_features")
+            installed_view.show_all()
+            self.main_stack.set_visible_child(installed_view)
+            self._arm_language_visible_allocation_barrier(installed_view)
             self.header_widget.hide()
             self.reveal.set_reveal_child(False)
             self.back_button.show()
@@ -3110,7 +3424,13 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
                         script_name, self.translations
                     )
 
-            self.refresh_app_page_with_fade(fresh_info or app_page_info)
+            # The outer language transaction already owns the cross-fade.  Do not
+            # start the app-page-specific Stack crossfade inside it; replace the page
+            # while the whole stack is transparent and wait for the new page itself.
+            self.open_app_page(fresh_info or app_page_info, preserve_previous=True)
+            page = self.main_stack.get_child_by_name("app_page")
+            if page is not None:
+                self._arm_language_visible_allocation_barrier(page)
             return
 
         # If the Skills Seeker is active, recreate it with the new translations
