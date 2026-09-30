@@ -154,7 +154,7 @@ class TerminalPTY:
 
     def start(self) -> None:
         asyncio.create_task(self._run())
-        asyncio.create_task(self._send_data())
+        # asyncio.create_task(self._send_data())
 
     async def _run(self) -> None:
         loop = asyncio.get_running_loop()
@@ -162,12 +162,19 @@ class TerminalPTY:
         def on_output() -> None:
             try:
                 raw = self.p_out.read(65536)
-                self.data_or_disconnect = self._decoder.decode(raw)
-                self.event.set()
+                if not raw:
+                    loop.remove_reader(self.p_out)
+                    self.send_queue.put_nowait(["disconnect", 1])
+                    return
+                text = self._decoder.decode(raw)
+                self.send_queue.put_nowait(["stdout", text])
+                # self.data_or_disconnect = self._decoder.decode(raw)
+                # self.event.set()
             except Exception:
                 loop.remove_reader(self.p_out)
-                self.data_or_disconnect = None
-                self.event.set()
+                self.send_queue.put_nowait(["disconnect", 1])
+                # self.data_or_disconnect = None
+                # self.event.set()
 
         loop.add_reader(self.p_out, on_output)
         await self.send_queue.put(["setup", {}])
@@ -179,14 +186,14 @@ class TerminalPTY:
                 winsize = struct.pack("HH", msg[1], msg[2])
                 fcntl.ioctl(self.fd, termios.TIOCSWINSZ, winsize)
 
-    async def _send_data(self) -> None:
-        while True:
-            await self.event.wait()
-            self.event.clear()
-            if self.data_or_disconnect is None:
-                await self.send_queue.put(["disconnect", 1])
-            else:
-                await self.send_queue.put(["stdout", self.data_or_disconnect])
+    # async def _send_data(self) -> None:
+    #     while True:
+    #         await self.event.wait()
+    #         self.event.clear()
+    #         if self.data_or_disconnect is None:
+    #             await self.send_queue.put(["disconnect", 1])
+    #         else:
+    #             await self.send_queue.put(["stdout", self.data_or_disconnect])
 
 
 class ScriptFinished(Message):
@@ -219,7 +226,21 @@ class Terminal(Widget, can_focus=True):
             "down": "\u001b[B",
             "enter": "\r",
             "backspace": "\u007f",
+            "tab": "\t",
+            "escape": "\x1b",
+            "ctrl+c": "\x03",  # SIGINT
+            "ctrl+d": "\x04",  # EOF
+            "ctrl+z": "\x1a",  # SIGTSTP
+            "ctrl+l": "\x0c",  # Clear
         }
+        # self.ctrl_keys = {
+        #     "left": "\u001b[D",
+        #     "right": "\u001b[C",
+        #     "up": "\u001b[A",
+        #     "down": "\u001b[B",
+        #     "enter": "\r",
+        #     "backspace": "\u007f",
+        # }
         self.ncol = ncol
         self.nrow = nrow
         self._display = PyteDisplay([Text()])
@@ -297,8 +318,16 @@ class Terminal(Widget, can_focus=True):
             return
         if self.pty is None:
             return
+        if event.key == "ctrl+c" and self._awaiting_exit_code:
+            event.prevent_default()
+            event.stop()
+            self.send_interrupt()
+            return
+
         char = self.ctrl_keys.get(event.key) or event.character
         if char:
+            event.prevent_default()
+            event.stop()
             await self.pty.recv_queue.put(["stdin", char])
 
     def on_mouse_scroll_up(self, event: events.MouseScrollUp) -> None:
@@ -363,7 +392,11 @@ class Terminal(Widget, can_focus=True):
             f'echo "$_lt_s"; '
             f"{quoted_command}; "
             "__lt_code=$?; "
+            'if [ "$__lt_code" -eq 130 ] || [ "$__lt_code" -eq 100 ]; then '
+            "__lt_code=100; "
+            "else "
             'read -rp "Pressione ENTER para continuar..." ; '
+            "fi; "
             f'_lt_e={shlex.quote(exit_left)}; _lt_e="$_lt_e"{shlex.quote(exit_right)}; '
             f'echo "$_lt_e$__lt_code"\n'
         )
@@ -371,24 +404,63 @@ class Terminal(Widget, can_focus=True):
 
     async def _recv(self) -> None:
         while True:
+            # Pega a primeira mensagem
             message = await self.pty.send_queue.get()
-            cmd = message[0]
-            if cmd == "setup":
-                await self.pty.recv_queue.put(
-                    ["set_size", self.nrow, self.ncol, 567, 573]
-                )
-            elif cmd == "stdout":
-                chars = message[1]
-                self._check_exit_marker(chars)
-                self._check_password_prompt(chars)
-                visible = self._EXIT_LINE_RE.sub("", chars)
-                visible = self._START_LINE_RE.sub("", visible)
-                self.stream.feed(visible)
+            messages = [message]
+
+            # Drena todas as mensagens já disponíveis na fila (batching)
+            while not self.pty.send_queue.empty():
+                try:
+                    messages.append(self.pty.send_queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+
+            has_stdout = False
+            for msg in messages:
+                cmd = msg[0]
+                if cmd == "setup":
+                    await self.pty.recv_queue.put(
+                        ["set_size", self.nrow, self.ncol, 567, 573]
+                    )
+                elif cmd == "stdout":
+                    chars = msg[1]
+                    self._check_exit_marker(chars)
+                    self._check_password_prompt(chars)
+                    visible = self._EXIT_LINE_RE.sub("", chars)
+                    visible = self._START_LINE_RE.sub("", visible)
+                    self.stream.feed(visible)
+                    has_stdout = True
+                elif cmd == "disconnect":
+                    self._awaiting_exit_code = False
+                    self.post_message(ScriptFinished(None))
+                    self._spawn_pty()
+
+            # Renderiza apenas uma vez por lote acumulado
+            if has_stdout:
                 self._render_screen()
-            elif cmd == "disconnect":
-                self._awaiting_exit_code = False
-                self.post_message(ScriptFinished(None))
-                self._spawn_pty()
+
+            # Cede o loop para processar eventos de teclado/mouse sem lag
+            await asyncio.sleep(0.01)
+
+        # while True:
+        #     message = await self.pty.send_queue.get()
+        #     cmd = message[0]
+        #     if cmd == "setup":
+        #         await self.pty.recv_queue.put(
+        #             ["set_size", self.nrow, self.ncol, 567, 573]
+        #         )
+        #     elif cmd == "stdout":
+        #         chars = message[1]
+        #         self._check_exit_marker(chars)
+        #         self._check_password_prompt(chars)
+        #         visible = self._EXIT_LINE_RE.sub("", chars)
+        #         visible = self._START_LINE_RE.sub("", visible)
+        #         self.stream.feed(visible)
+        #         self._render_screen()
+        #     elif cmd == "disconnect":
+        #         self._awaiting_exit_code = False
+        #         self.post_message(ScriptFinished(None))
+        #         self._spawn_pty()
 
     def _check_exit_marker(self, chars: str) -> None:
         if not self._awaiting_exit_code:
@@ -446,7 +518,7 @@ class Terminal(Widget, can_focus=True):
 
         async def _do_interrupt() -> None:
             await self.pty.recv_queue.put(["stdin", "\x03"])
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.05)
             await self.pty.recv_queue.put(
                 ["stdin", f"echo {self.EXIT_MARKER}100\n"]
             )
