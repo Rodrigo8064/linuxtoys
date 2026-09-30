@@ -1,5 +1,6 @@
 import re
 import threading
+from enum import Enum, auto
 
 from app.lang_utils import load_translations
 from app.search_helper import (
@@ -164,3 +165,27 @@ def get_specials_root_item(trans=None) -> dict:
         "is_script": False,
         "widget_id": "is_linuxtoys_specials",
     }
+
+
+class ScriptResult(Enum):
+    SUCCESS = auto()
+    CANCELLED = auto()
+    TERMINAL_CLOSED = auto()
+    ERROR = auto()
+
+
+def _classify_exit_code(exit_code: int | None) -> ScriptResult:
+    """Classify a script's exit code into a result category.
+
+    - None: terminal closed unexpectedly, session was restarted
+    - 0: success
+    - 100 or 128-192: user cancellation / signal termination (not a real error)
+    - anything else: real error
+    """
+    if exit_code is None:
+        return ScriptResult.TERMINAL_CLOSED
+    if exit_code == 0:
+        return ScriptResult.SUCCESS
+    if exit_code == 100 or 128 <= exit_code <= 192:
+        return ScriptResult.CANCELLED
+    return ScriptResult.ERROR

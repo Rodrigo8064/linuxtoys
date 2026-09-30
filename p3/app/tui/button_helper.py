@@ -3,7 +3,6 @@ import os
 from app.compat import get_system_compat_keys
 from app.easy_cli import (
     _cleanup_tmp_noram_dirs,
-    _is_error_exit_code,
     _save_script_to_registry,
     _try_execute_auto_revert,
     create_temp_file,
@@ -30,6 +29,8 @@ from .dialog_screen import (
 )
 from .helper import (
     SPECIALS_ROOT,
+    ScriptResult,
+    _classify_exit_code,
     get_scripts_for_category_cached,
     get_specials_items,
     is_removable,
@@ -127,9 +128,17 @@ class ScriptRunnerMixin:
         )
 
     def _execute_script_info(self, script_info: dict) -> None:
-        """O que já era o corpo de run_script, só que recebendo o dict
-        direto — usado tanto por clique normal quanto pela fila do manifesto."""
-        script_info = materialize_repo_script(script_info)
+        if script_info.get("is_repo_entry"):
+            try:
+                script_info = materialize_repo_script(script_info)
+            except (ValueError, NotImplementedError, OSError) as exc:
+                self.notify(
+                    "✗ Could not prepare repository entry "
+                    f"'{script_info.get('name', 'unknown')}': {exc}",
+                    severity="error",
+                )
+                self._running_button = None
+                return
         dev_mode = is_dev_mode_enabled()
 
         if dev_mode:
@@ -289,7 +298,7 @@ class ScriptRunnerMixin:
 
         if not uninstall_entry:
             self.notify(
-                f"Nenhum registro removível encontrado para "
+                f"✗ No removable registry entry found for "
                 f"'{script_info['name']}'.",
                 severity="warning",
             )
@@ -351,11 +360,12 @@ class ScriptRunnerMixin:
         dev_mode = self._running_dev_mode
         is_uninstall = self._running_is_uninstall
         exit_code = message.exit_code
+        result = _classify_exit_code(exit_code)
 
         action_done = "removido" if is_uninstall else "instalado"
         action_verb = "remover" if is_uninstall else "instalar"
 
-        if exit_code == 0:
+        if result is ScriptResult.SUCCESS:
             if not dev_mode and not is_uninstall:
                 _save_script_to_registry(script_name, TRANSMAP_PATH)
                 _cleanup_tmp_noram_dirs(TRANSMAP_PATH)
@@ -371,7 +381,7 @@ class ScriptRunnerMixin:
                     callback=self._finish_script_run,
                 )
 
-        elif exit_code == 100:
+        elif result is ScriptResult.CANCELLED:
             if not dev_mode and not is_uninstall:
                 self._remove_transmap()
             self._cleanup_temp_file(temp_path, dev_mode)
@@ -379,7 +389,7 @@ class ScriptRunnerMixin:
                 CancelledDialog(script_name), callback=self._finish_script_run
             )
 
-        elif exit_code is None:
+        elif result is ScriptResult.TERMINAL_CLOSED:
             self.notify(
                 "O terminal encerrou inesperadamente; uma nova sessão foi "
                 "iniciada automaticamente.",
@@ -388,29 +398,22 @@ class ScriptRunnerMixin:
             self._cleanup_temp_file(temp_path, dev_mode)
             self._finish_script_run()
 
-        elif not _is_error_exit_code(exit_code):
-            # is not a error exit code, do not need dialog
-            self._cleanup_temp_file(temp_path, dev_mode)
-            self._finish_script_run()
-
-        else:
-            # true error
+        else:  # ScriptResult.ERROR
             if not dev_mode and not is_uninstall:
                 revert_info = {
                     "name": script_name,
                     "icon": "application-x-executable",
                     "repo": "",
                 }
-                # Bloqueante, sem PTY — limitação conhecida e aceita por
-                # enquanto (ver conversa sobre o item 3). Se o revert
-                # precisar de sudo_rq, hoje isso não vai funcionar.
                 reverted = _try_execute_auto_revert(revert_info, TRANSMAP_PATH)
                 if reverted:
                     self.notify(
-                        f"'{script_name}' falhou, mas as mudanças foram "
-                        "revertidas automaticamente.",
+                        f"'{script_name}' failed, but automatic reversion  "
+                        "completed successfully.",
                         severity="warning",
                     )
+                else:
+                    self.notify("✗ Automatic reversion failed with exit code")
                 self._remove_transmap()
 
             terminal = self.query_one("#terminal", Terminal)
