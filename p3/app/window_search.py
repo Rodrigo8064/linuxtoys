@@ -329,6 +329,31 @@ class SearchCtl:
                 self.animate_item_batch(widgets, duration_ms=110, stagger_ms=5)
                 if state["next"] >= target:
                     state["timer"] = None
+
+                    # During initial filling, wait for GTK to allocate this batch
+                    # before deciding whether the first viewport still needs more.
+                    # Otherwise the adjustment can contain stale geometry and make
+                    # Search materialize far too many cards up front.
+                    if state["ready"]:
+                        def fill_initial_viewport():
+                            if not current():
+                                return False
+                            adj = self.search_view.get_vadjustment()
+                            if (
+                                float(adj.get_upper())
+                                <= max(1.0, float(adj.get_page_size()))
+                                and state["next"] < len(population_queue)
+                            ):
+                                state["target"] = min(
+                                    len(population_queue), state["next"] + 2
+                                )
+                                start_timer()
+                            return False
+
+                        GLib.idle_add(
+                            fill_initial_viewport,
+                            priority=GLib.PRIORITY_LOW,
+                        )
                     return False
                 return True
 
@@ -388,24 +413,29 @@ class SearchCtl:
             def finish_initial():
                 if not current():
                     return False
-                cap = capacity()
-                multiplier = 3 if cap <= 20 else 2
-                state["target"] = min(
-                    len(population_queue),
-                    max(state["next"], cap * multiplier),
-                )
+
+                # The six-card seed has now had a chance to enter GTK's layout.
+                # Only extend the initial result set while it still does not make
+                # the Search viewport scrollable. Each completed two-card batch
+                # rechecks the real adjustment in tick() after GTK reallocates it.
                 state["ready"] = True
-                start_timer()
+                adj = self.search_view.get_vadjustment()
+                if (
+                    float(adj.get_upper())
+                    <= max(1.0, float(adj.get_page_size()))
+                    and state["next"] < len(population_queue)
+                ):
+                    state["target"] = min(
+                        len(population_queue), state["next"] + 2
+                    )
+                    start_timer()
                 return False
 
             GLib.idle_add(finish_initial, priority=GLib.PRIORITY_LOW)
             return False
 
         if entering_search:
-            GLib.timeout_add(
-                max(1, int(self.main_stack.get_transition_duration())),
-                begin_population, priority=GLib.PRIORITY_LOW,
-            )
+            GLib.idle_add(begin_population, priority=GLib.PRIORITY_DEFAULT_IDLE)
         else:
             begin_population()
 
@@ -441,6 +471,13 @@ class SearchCtl:
         # Return to appropriate view
         if self.current_category_info:
             self.main_stack.set_visible_child(self.scripts_view)
+            if getattr(self, "_search_origin_needs_language_refresh", False):
+                self._search_origin_needs_language_refresh = False
+                self.load_scripts(self.current_category_info)
+                self._update_header(self.current_category_info)
+                category_name = self.current_category_info.get("name", "Unknown")
+                self.header_bar.props.title = f"LinuxToys: {category_name}"
+
             # Ensure back button is visible for category views
             self.back_button.show()
 
@@ -453,15 +490,8 @@ class SearchCtl:
             else:
                 self._disable_drag_and_drop()
         else:
-            self.main_stack.set_visible_child_name("categories")
-            # Hide back button for main categories view
-            self.back_button.hide()
-            # Disable drag-and-drop for main categories
-            self._disable_drag_and_drop()
-            # Restore footer state for main menu
-            self.reveal.set_reveal_child(True)
-            self.reveal.button_box.hide()
-            self.reveal.support.show_all()
+            self._search_origin_needs_language_refresh = False
+            self.show_categories_view()
 
     def _update_search_header(self):
         """Update header for search results view."""

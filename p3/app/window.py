@@ -174,6 +174,11 @@ class AppWindow(
         self._language_featured_refresh_started = False
         self._language_featured_allocation_complete = False
         self._language_featured_allocate_handler = None
+        self._language_search_loading_active = False
+        self._language_search_transition_owned = False
+        self._language_search_loading_fade_source = None
+        self._language_search_loading_fade_started_us = None
+        self._language_search_loading_fade_duration_ms = 180
 
         # --- UI Structure ---
         main_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
@@ -404,11 +409,32 @@ class AppWindow(
         self.scripts_view.add(self.scripts_flowbox)
         self.main_stack.add_named(self.scripts_view, "scripts")
 
-        # Create search results view
+        # Create search results view. Keep it inside an Overlay so a language
+        # refresh can show the same centered roller pattern used by startup while
+        # the replacement translated search/cache generation is prepared.
         self.search_flowbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.search_view = Gtk.ScrolledWindow()
         self.search_view.add(self.search_flowbox)
-        self.main_stack.add_named(self.search_view, "search")
+
+        self.search_loading_overlay = Gtk.Overlay()
+        self.search_loading_overlay.add(self.search_view)
+
+        self.search_language_loading_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=10,
+        )
+        self.search_language_loading_box.set_halign(Gtk.Align.CENTER)
+        self.search_language_loading_box.set_valign(Gtk.Align.CENTER)
+        self.search_language_loading_box.set_no_show_all(True)
+
+        self.search_language_loading_spinner = Gtk.Spinner()
+        self.search_language_loading_spinner.set_size_request(64, 64)
+        self.search_language_loading_box.pack_start(
+            self.search_language_loading_spinner, False, False, 0
+        )
+        self.search_loading_overlay.add_overlay(self.search_language_loading_box)
+
+        self.main_stack.add_named(self.search_loading_overlay, "search")
 
         self.reveal = revealer.RevealerFooter(self)
         main_vbox.pack_start(self.reveal, False, False, 0)
@@ -745,6 +771,13 @@ class AppWindow(
         category_cache = self.category_cache
         script_cache = self.script_cache
         translations = self.translations
+        search_engine = self.search_engine
+        language_search_query = (
+            str(getattr(self, "_language_transition_search_query", "") or "").strip()
+            if getattr(self, "_language_transition_active", False)
+            and self.main_stack.get_visible_child_name() == "search"
+            else ""
+        )
         git_sync_scheduled = False
 
         def schedule_git_sync():
@@ -854,7 +887,7 @@ class AppWindow(
                 self._deferred_start_random_scripts_refresh_timer()
             return False
 
-        def publish_completed_runtime():
+        def publish_completed_runtime(prepared_search_query="", prepared_search_results=None):
             """Refresh only the currently visible secondary view after cache swap."""
             if self.category_cache is not category_cache or self.script_cache is not script_cache:
                 return False
@@ -863,9 +896,33 @@ class AppWindow(
             if visible == "scripts" and self.current_category_info is not None:
                 self.load_scripts(self.current_category_info)
             elif visible == "search":
-                query = self.search_entry.get_text()
+                query = self.search_entry.get_text().strip()
                 if query:
-                    self.search_entry.emit("changed")
+                    if (
+                        getattr(self, "_language_transition_active", False)
+                        and prepared_search_query
+                        and query == prepared_search_query
+                        and prepared_search_results is not None
+                    ):
+                        # The expensive Rust/Python search pass was completed on the
+                        # parser worker. GTK only publishes the resulting snapshot;
+                        # card creation remains progressively scheduled by
+                        # _display_search_results(), so the roller keeps animating.
+                        self.search_results = prepared_search_results
+                        self._display_search_results()
+                        self._language_search_refresh_pending = False
+                        self._language_visible_allocation_complete = True
+                    elif getattr(self, "_language_transition_active", False):
+                        # The query changed while the language cache was rebuilding.
+                        # Keep the existing safe fallback for that exceptional case.
+                        self._perform_search(query)
+                        self._language_search_refresh_pending = False
+                        self._language_visible_allocation_complete = True
+                    else:
+                        self.search_entry.emit("changed")
+                elif getattr(self, "_language_transition_active", False):
+                    self._language_search_refresh_pending = False
+                    self._language_visible_allocation_complete = True
             return False
 
         def populate_in_background():
@@ -889,7 +946,19 @@ class AppWindow(
                 GLib.idle_add(publish_full_featured, full_featured)
 
                 script_cache.populate_from_category_cache(category_cache)
-                GLib.idle_add(publish_completed_runtime)
+
+                prepared_search_results = None
+                if language_search_query:
+                    # SearchEngine.search() is data/backend work (including the Rust
+                    # generic/AppStream indexes) and does not create GTK widgets.
+                    # Keep it off the main loop so Gtk.Spinner continues to animate.
+                    prepared_search_results = search_engine.search(language_search_query)
+
+                GLib.idle_add(
+                    publish_completed_runtime,
+                    language_search_query,
+                    prepared_search_results,
+                )
                 GLib.idle_add(self._refresh_installed_features_view)
             except Exception as e:
                 print(f"Error populating runtime caches: {e}")
@@ -1970,10 +2039,31 @@ class AppWindow(
         return False
 
     def _flush_one_startup_watermark(self):
-        """Ask gui-rs to render one pending category watermark, then yield."""
+        """Render one startup watermark without mistaking unallocated cards for done."""
         flowbox = getattr(self, "categories_flowbox", None)
-        if flowbox is not None and gui_rs.flush_category_watermarks(flowbox, 1):
-            return True
+        if flowbox is None:
+            self._categories_loading_watermark_source = None
+            self._categories_loading_watermarks_flushed = True
+            self._maybe_start_categories_loading_fade()
+            return False
+
+        rendered = gui_rs.flush_category_watermarks(flowbox, 1)
+        pending = gui_rs.has_pending_render_work(flowbox)
+
+        if pending:
+            if rendered:
+                # More paint-ready work exists. Yield through the existing idle
+                # source so GTK can interleave normal drawing/allocation work.
+                return True
+
+            # A registered category surface still needs rendering, but none was
+            # paint-ready in this pass. This can happen when the FlowBox's final
+            # size-allocate arrives before all nested native surfaces receive
+            # theirs. Do not declare startup complete; retry on the next frame.
+            self._categories_loading_watermark_source = GLib.timeout_add(
+                16, self._flush_one_startup_watermark
+            )
+            return False
 
         self._categories_loading_watermark_source = None
         self._categories_loading_watermarks_flushed = True
@@ -1986,6 +2076,81 @@ class AppWindow(
             return False
         return self._maybe_start_categories_loading_fade()
 
+    @staticmethod
+    def _find_named_descendant(root, widget_name):
+        """Find a named GTK descendant without rebuilding or rebinding its card."""
+        if root is None:
+            return None
+        try:
+            if root.get_name() == widget_name:
+                return root
+        except (AttributeError, TypeError):
+            pass
+        if isinstance(root, Gtk.Container):
+            for child in root.get_children():
+                found = AppWindow._find_named_descendant(child, widget_name)
+                if found is not None:
+                    return found
+        return None
+
+    def _refresh_root_category_translations_in_place(self):
+        """Refresh root-menu language strings without invalidating its card widgets.
+
+        Root category identity/artwork is language-independent. A locale switch must
+        therefore never route the persistent root FlowBox through _render_categories().
+        Match existing cards by their stable path and update only translated metadata.
+        """
+        categories = parser.get_categories(self.translations)
+        specials_category = {
+            "name": self.translations.get("specials", "Specials"),
+            "description": self.translations.get(
+                "specials_desc",
+                "LinuxToys-curated software and scripts.",
+            ),
+            "icon": "linuxtoys.svg",
+            "path": "specials://root",
+            "type": "category",
+            "is_script": False,
+            "is_subcategory": False,
+            "is_linuxtoys_specials": True,
+        }
+        translated_by_path = {
+            category.get("path"): category
+            for category in (specials_category, *categories)
+            if category.get("path")
+        }
+
+        for child in self.categories_flowbox.get_children():
+            widget = child.get_child() if isinstance(child, Gtk.FlowBoxChild) else child
+            info = getattr(widget, "info", None)
+            if widget is None or not isinstance(info, dict):
+                continue
+
+            category = translated_by_path.get(info.get("path"))
+            if category is None:
+                # A language switch is not a structural category refresh. Leave an
+                # unmatched existing card intact rather than destroying the root UI.
+                continue
+
+            label = self._find_named_descendant(widget, "linuxtoys-native-name")
+            if isinstance(label, Gtk.Label):
+                escaped = GLib.markup_escape_text(str(category.get("name", "") or ""))
+                label.set_markup(f"<b>{escaped}</b>")
+
+            widget.info = category
+            description = category.get("description", "")
+            widget.set_tooltip_text(description or None)
+
+        # Only the visible root menu needs a geometry barrier for translated text.
+        # No card/watermark state is reset here.
+        if self.main_stack.get_visible_child_name() == "categories":
+            children = self.categories_flowbox.get_children()
+            self._language_categories_expected_children = len(children)
+            self._language_categories_waiting_for_allocation = True
+            self._language_categories_allocation_complete = False
+            self.categories_flowbox.queue_resize()
+            self.categories_view.queue_resize()
+
     def _render_categories(self, categories):
         """Render a parsed category snapshot cooperatively on the GTK thread."""
         # Cancel any older publication that may still be draining. Incrementing the
@@ -1993,7 +2158,10 @@ class AppWindow(
         # source that may currently be dispatching.
         generation = getattr(self, "_category_render_generation", 0) + 1
         self._category_render_generation = generation
-        if getattr(self, "_language_transition_active", False):
+        if (
+            getattr(self, "_language_transition_active", False)
+            and self.main_stack.get_visible_child_name() == "categories"
+        ):
             self._language_categories_render_pending = True
 
         startup_render = not self._categories_startup_transition_complete
@@ -2003,13 +2171,6 @@ class AppWindow(
             self._categories_startup_waiting_for_allocation = False
             self._categories_startup_expected_children = 0
             self._categories_loading_watermarks_flushed = False
-
-        temp_current_category = self.current_category_info
-        self.current_category_info = None
-
-        self.categories_flowbox.foreach(
-            lambda widget: self.categories_flowbox.remove(widget)
-        )
 
         specials_category = {
             "name": self.translations.get("specials", "Specials"),
@@ -2024,7 +2185,73 @@ class AppWindow(
             "is_subcategory": False,
             "is_linuxtoys_specials": True,
         }
-        pending = iter([specials_category, *categories])
+        category_snapshot = [specials_category, *categories]
+
+        # A language change only changes translated card metadata; the root category
+        # structure and artwork normally remain identical. Rebind those native cards
+        # in place so their Rust CategoryWatermarkState (and already-rendered pixbuf)
+        # survives. The existing size-allocate tracking will then invalidate a
+        # watermark only if translated text/scaling actually changes the card size.
+        if getattr(self, "_language_transition_active", False):
+            children = self.categories_flowbox.get_children()
+            existing = []
+            for child in children:
+                widget = child.get_child() if isinstance(child, Gtk.FlowBoxChild) else child
+                info = getattr(widget, "info", None)
+                if widget is None or not isinstance(info, dict):
+                    existing = []
+                    break
+                existing.append((widget, info))
+
+            same_structure = (
+                len(existing) == len(category_snapshot)
+                and all(
+                    old_info.get("path") == new_info.get("path")
+                    for (_, old_info), new_info in zip(existing, category_snapshot)
+                )
+            )
+            if same_structure:
+                # A locale switch does not change category identity, artwork, or
+                # native card structure. Update only the language-driven fields.
+                # In particular, do not call gui_rs.update_item_card(): that generic
+                # rebind unnecessarily touches the complete native card spec.
+                rebound = True
+                translated_cards = []
+                for (widget, _old_info), cat in zip(existing, category_snapshot):
+                    label = self._find_named_descendant(
+                        widget, "linuxtoys-native-name"
+                    )
+                    if not isinstance(label, Gtk.Label):
+                        rebound = False
+                        break
+                    translated_cards.append((widget, label, cat))
+
+                # Validate every card before changing any of them. If the expected
+                # native hierarchy is missing, retain the existing full-rebuild
+                # fallback below.
+                if rebound:
+                    for widget, label, cat in translated_cards:
+                        label.set_text(str(cat.get("name", "") or ""))
+                        widget.info = cat
+                        description = cat.get("description", "")
+                        widget.set_tooltip_text(description or None)
+
+                    if self.main_stack.get_visible_child_name() == "categories":
+                        self._language_categories_render_pending = True
+                        self._language_categories_expected_children = len(children)
+                        self._language_categories_waiting_for_allocation = True
+                        self._language_categories_allocation_complete = False
+                        # Only translated text changed. Let GTK settle any genuine
+                        # geometry change; the native watermark state stays intact.
+                        self.categories_flowbox.queue_resize()
+                        self.categories_view.queue_resize()
+                    return
+
+        self.categories_flowbox.foreach(
+            lambda widget: self.categories_flowbox.remove(widget)
+        )
+
+        pending = iter(category_snapshot)
 
         # Four cards keeps each GTK burst short while normally filling enough of
         # the first viewport to begin the startup transition immediately.
@@ -2035,7 +2262,6 @@ class AppWindow(
             nonlocal first_batch
 
             if self._category_render_generation != generation:
-                self.current_category_info = temp_current_category
                 return False
 
             added = 0
@@ -2043,7 +2269,6 @@ class AppWindow(
                 try:
                     cat = next(pending)
                 except StopIteration:
-                    self.current_category_info = temp_current_category
                     if getattr(self, "_language_transition_active", False):
                         self._language_categories_expected_children = len(
                             self.categories_flowbox.get_children()
@@ -2076,11 +2301,6 @@ class AppWindow(
 
             if first_batch:
                 first_batch = False
-                # Keep current_category_info cleared for the entire cooperative
-                # publication. create_item_widget() uses this state to distinguish
-                # main-menu category cards from ordinary category/app entries.
-                # Restoring it after only the first batch makes later cards use the
-                # ordinary icon layout when a refresh originates from another view.
 
             return True
 
@@ -2941,32 +3161,43 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
         self._last_normal_window_size = (width, height)
         self.set_default_size(width, height)
 
+    def _start_categories_unmaximize_reflow(self):
+        """Reflow the root menu after a maximized allocation becomes stale."""
+        if getattr(self, "random_scripts_flowbox", None) is None:
+            return
+
+        # Do not destroy/reselect cards here. Hiding the fixed-column grid is
+        # enough to stop its maximized natural width influencing the restored
+        # top-level size, while preserving Featured state and history.
+        self.random_scripts_flowbox.hide()
+        self.categories_view.queue_resize()
+        self.categories_flowbox.queue_resize()
+
+        if getattr(self, "_featured_unmaximize_timer", None):
+            GLib.source_remove(self._featured_unmaximize_timer)
+
+        self._featured_unmaximize_timer = GLib.timeout_add(
+            self.FEATURED_RESIZE_DEBOUNCE_MS,
+            self._finish_featured_unmaximize,
+        )
+
     def _on_window_state_changed(self, _widget, event):
-        """Keep Featured out of width negotiation while leaving maximized state."""
+        """Keep stale maximized root-menu geometry out of restored sizing."""
         changed = bool(event.changed_mask & Gdk.WindowState.MAXIMIZED)
         maximized = bool(event.new_window_state & Gdk.WindowState.MAXIMIZED)
         if not changed or maximized:
             return False
 
-        if (
-            hasattr(self, "main_stack")
-            and self.main_stack.get_visible_child_name() == "categories"
-            and getattr(self, "random_scripts_flowbox", None) is not None
-        ):
-            # Do not destroy/reselect cards here. Hiding the fixed-column grid is
-            # enough to stop its maximized natural width influencing the restored
-            # top-level size, while preserving Featured state and history.
-            self.random_scripts_flowbox.hide()
-            self.categories_view.queue_resize()
-            self.categories_flowbox.queue_resize()
+        if not hasattr(self, "main_stack"):
+            return False
 
-            if getattr(self, "_featured_unmaximize_timer", None):
-                GLib.source_remove(self._featured_unmaximize_timer)
-
-            self._featured_unmaximize_timer = GLib.timeout_add(
-                self.FEATURED_RESIZE_DEBOUNCE_MS,
-                self._finish_featured_unmaximize,
-            )
+        if self.main_stack.get_visible_child_name() == "categories":
+            self._categories_geometry_stale = False
+            self._start_categories_unmaximize_reflow()
+        else:
+            # The root menu is hidden, so it will not receive the restored
+            # allocation now. Reflow it when navigation exposes it again.
+            self._categories_geometry_stale = True
 
         return False
 
@@ -2980,6 +3211,7 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
 
         # At this point the category FlowBox has the restored viewport width, so the
         # existing Featured geometry calculation can safely mirror its real columns.
+        self._categories_geometry_stale = False
         self._featured_last_layout = None
         self._featured_layout_metrics = None
         self._refresh_random_scripts_display(force=False)
@@ -3162,6 +3394,62 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
             self._language_featured_allocate_handler = None
         self._language_featured_allocation_complete = True
 
+    def _show_language_search_loading(self):
+        """Replace the old Search snapshot with a centered roller while translating."""
+        if not hasattr(self, "search_language_loading_box"):
+            return
+        if self._language_search_loading_fade_source is not None:
+            GLib.source_remove(self._language_search_loading_fade_source)
+            self._language_search_loading_fade_source = None
+        self._language_search_loading_active = True
+        self.search_view.set_opacity(0.0)
+        self.search_language_loading_box.set_opacity(1.0)
+
+        # The loading box is deliberately no-show-all so the application's startup
+        # show_all() cannot expose it. Its children therefore also need to be shown
+        # explicitly when this transient overlay is activated.
+        self.search_language_loading_spinner.show()
+        self.search_language_loading_box.show()
+        self.search_language_loading_spinner.start()
+
+    def _start_language_search_loading_fade(self):
+        """Cross-fade the completed translated Search view in over its roller."""
+        if not self._language_search_loading_active:
+            return False
+        if self._language_search_loading_fade_source is not None:
+            return False
+        self._language_search_loading_fade_started_us = GLib.get_monotonic_time()
+        self.search_view.set_opacity(0.0)
+        self.search_language_loading_box.set_opacity(1.0)
+        self._language_search_loading_fade_source = GLib.timeout_add(
+            16, self._step_language_search_loading_fade
+        )
+        return False
+
+    def _step_language_search_loading_fade(self):
+        started = self._language_search_loading_fade_started_us
+        if started is None:
+            self._language_search_loading_fade_source = None
+            return False
+
+        elapsed_ms = (GLib.get_monotonic_time() - started) / 1000.0
+        duration = max(1, self._language_search_loading_fade_duration_ms)
+        progress = min(1.0, elapsed_ms / duration)
+        self.search_view.set_opacity(progress)
+        self.search_language_loading_box.set_opacity(1.0 - progress)
+
+        if progress < 1.0:
+            return True
+
+        self._language_search_loading_fade_source = None
+        self._language_search_loading_fade_started_us = None
+        self._language_search_loading_active = False
+        self.search_view.set_opacity(1.0)
+        self.search_language_loading_box.set_opacity(1.0)
+        self.search_language_loading_spinner.stop()
+        self.search_language_loading_box.hide()
+        return False
+
     def on_language_changed(self, new_language_code):
         """Cross-fade a complete language refresh instead of exposing rebuild work."""
         if getattr(self, "_language_transition_active", False):
@@ -3170,6 +3458,16 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
 
         self._language_transition_active = True
         self._language_transition_target = new_language_code
+        self._language_transition_search_query = (
+            self.search_entry.get_text().strip()
+            if self.main_stack.get_visible_child_name() == "search"
+            else ""
+        )
+        self._language_search_transition_owned = (
+            self.main_stack.get_visible_child_name() == "search"
+        )
+        if self._language_search_transition_owned:
+            self._show_language_search_loading()
         self._language_transition_phase = "out"
         self._language_transition_started_us = GLib.get_monotonic_time()
         self._language_transition_duration_ms = 120
@@ -3179,6 +3477,7 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
         self._language_categories_allocation_complete = False
         self._language_featured_refresh_started = False
         self._language_featured_allocation_complete = False
+        self._language_search_refresh_pending = False
         self._language_visible_allocation_complete = False
         self._language_visible_allocate_handler = None
         self._language_visible_allocate_widget = None
@@ -3193,6 +3492,22 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
             16, self._step_language_transition
         )
 
+    def _commit_language_search_refresh(self, query):
+        """Rerun a preserved search after the language transaction is fully committed."""
+        query = str(query or "").strip()
+        if not query:
+            return False
+        if self.main_stack.get_visible_child_name() != "search":
+            return False
+        if self.search_entry.get_text().strip() != query:
+            return False
+
+        # This is deliberately after _language_transition_active becomes False.
+        # Intermediate cache publication may prepare the hidden search view, but
+        # the final visible result must be produced by the committed language state.
+        self._perform_search(query)
+        return False
+
     def _step_language_transition(self):
         """Drive the fade-out/fade-in phases around a hidden translated rebuild."""
         phase = self._language_transition_phase
@@ -3204,14 +3519,20 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
         elapsed_ms = (GLib.get_monotonic_time() - started) / 1000.0
         duration = max(1, self._language_transition_duration_ms)
         progress = min(1.0, elapsed_ms / duration)
-        self.main_stack.set_opacity(1.0 - progress if phase == "out" else progress)
+        search_transition_owned = (
+            self.main_stack.get_visible_child_name() == "search"
+            and self._language_search_transition_owned
+        )
+        if not search_transition_owned:
+            self.main_stack.set_opacity(1.0 - progress if phase == "out" else progress)
 
         if progress < 1.0:
             return True
 
         self._language_transition_source = None
         if phase == "out":
-            self.main_stack.set_opacity(0.0)
+            if not search_transition_owned:
+                self.main_stack.set_opacity(0.0)
             self._language_transition_phase = "waiting"
             self._apply_language_change_hidden(self._language_transition_target)
             GLib.idle_add(self._wait_for_language_render_ready)
@@ -3222,6 +3543,23 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
             self._language_transition_active = False
             self._language_transition_target = None
             self._language_featured_refresh_started = False
+
+            final_search_query = getattr(
+                self, "_language_transition_search_query", ""
+            )
+            self._language_transition_search_query = ""
+            if (
+                final_search_query
+                and self.main_stack.get_visible_child_name() == "search"
+                and not self._language_search_transition_owned
+            ):
+                GLib.idle_add(
+                    self._commit_language_search_refresh,
+                    final_search_query,
+                )
+
+            self._language_search_transition_owned = False
+
             if (
                 self.main_stack.get_visible_child_name() == "categories"
                 and self.should_start_random_timer
@@ -3241,7 +3579,6 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
         self.category_cache = search_helper.CategoryCache()
         self.search_engine.set_cache(self.script_cache)
         self.all_scripts = []
-        self._populate_runtime_caches()
 
         self.search_entry.set_placeholder_text(
             self.translations.get("search_placeholder", "Search features")
@@ -3254,7 +3591,18 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
         # collapsing its revealers, otherwise the SLIDE_DOWN animation changes the
         # menu requisition while translated category geometry is being measured.
         self._prepare_featured_language_rebuild()
+
+        # Establish every visible-view readiness flag before the replacement cache
+        # worker is allowed to publish.  Search in particular sets
+        # _language_search_refresh_pending here; starting the worker first allowed
+        # publish_completed_runtime() to clear the flag and arm its allocation
+        # barrier, only for this refresh to set the flag back to True afterward.
+        # That left the language transaction permanently stuck in the waiting phase.
         self._refresh_ui_with_new_translations()
+        # The root FlowBox has already been translated in place above. Rebuild only
+        # the backing parser/search/Featured data; top_level_ready must not call
+        # _render_categories() for a mere locale change.
+        self._populate_runtime_caches(catalog_refresh=True)
 
     def _wait_for_language_render_ready(self):
         """Reveal only after structural and native allocation-dependent work is done."""
@@ -3271,8 +3619,22 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
             root.queue_resize()
             return True
 
-        if self._language_categories_render_pending:
+        # Category geometry is only a language-transition barrier when Categories
+        # is actually the visible Stack page. Hidden Gtk.Stack children are not
+        # guaranteed to receive a fresh allocation, so allowing their cooperative
+        # rebuild to block Search/utility/app-page transitions can deadlock forever.
+        if visible_name == "categories" and self._language_categories_render_pending:
             return True
+
+        if visible_name == "search" and self._language_search_refresh_pending:
+            return True
+
+        if (
+            visible_name == "search"
+            and self._language_search_loading_active
+            and self._language_search_loading_fade_source is None
+        ):
+            self._start_language_search_loading_fade()
 
         if visible_name == "categories":
             # The translated category snapshot must have received a *new* real
@@ -3348,7 +3710,12 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
         # App pages and utility views own their visible header state. Rebuilding the
         # normal category header while one is visible can expose that header and
         # corrupt the view we are trying to preserve across a language change.
-        if current_view not in ("app_page", "appstream_queue", "installed_features"):
+        if current_view not in (
+            "app_page",
+            "appstream_queue",
+            "installed_features",
+            "search",
+        ):
             self._update_header(self.current_category_info)
 
             # Update title bar
@@ -3365,8 +3732,9 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
         # Refresh the shared updater/AppStream indicator tooltip in the new language.
         self._refresh_status_indicator()
 
-        # Always reload categories with new translations (so they're ready when user navigates back)
-        self.load_categories()
+        # Root category widgets are persistent UI. A language change updates only
+        # their translated strings; it is not a structural category publication.
+        self._refresh_root_category_translations_in_place()
 
         # Refresh footer translations
         self.reveal.update_translations(self.translations)
@@ -3459,6 +3827,29 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
                 new_view.show_all()
                 self.header_widget.hide()
                 self.main_stack.set_visible_child_name("skills_seeker")
+            return
+
+        # Search results are snapshots of the old translated search/category caches.
+        # Keep the search surface active while hidden, then let the runtime-cache
+        # completion callback rerun the exact query against the new language.
+        if current_view == "search":
+            if self.current_category_info:
+                self._refresh_navigation_stack_translations()
+                updated_category_info = self._get_fresh_category_info_with_translations()
+                if updated_category_info:
+                    self.current_category_info = updated_category_info
+                self._search_origin_needs_language_refresh = True
+
+            self._language_search_refresh_pending = bool(
+                self.search_entry.get_text().strip()
+            )
+            self.main_stack.set_visible_child_name("search")
+            self._update_search_header()
+            self.back_button.show()
+            self.reveal.set_reveal_child(False)
+            self._disable_drag_and_drop()
+            if not self._language_search_refresh_pending:
+                self._language_visible_allocation_complete = True
             return
 
         # If we're currently viewing categories, we're done since load_categories() already updated the view
