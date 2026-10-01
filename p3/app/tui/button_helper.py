@@ -124,6 +124,7 @@ class ScriptRunnerMixin:
                 "name": str(button.label),
                 "path": button.path,
                 "is_repo_entry": button.is_repo_entry,
+                "is_appstream_entry": button.is_appstream_entry,
             }
         )
 
@@ -628,7 +629,7 @@ class ScriptRunnerMixin:
 
     def _update_breadcrumb(self) -> None:
         panel = self.query_one("#left-panel-home")
-        base = "Categorias/Scripts"
+        base = "LinuxToys"
         if not self._nav_stack:
             panel.border_title = base
             return
