@@ -4,11 +4,9 @@ import requests
 from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
-from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.screen import ModalScreen
+from textual.widget import Widget
 from textual.widgets import (
-    Footer,
     Rule,
     Static,
     TabbedContent,
@@ -34,13 +32,7 @@ def load_ansi_art(filename: str) -> Text:
         return Text(f"Arte não encontrada: {filename}", style="bold red")
 
 
-class AboutScreen(ModalScreen[None]):
-    BINDINGS = [
-        Binding(
-            "escape", "app.pop_screen", translations.get("script_runner_close")
-        ),
-    ]
-
+class AboutWidget(Widget):
     def compose(self) -> ComposeResult:
         psyicon_art = load_ansi_art("psyicon.ansi")
         linuxtoys_art = load_ansi_art("linuxtoys.ansi")
@@ -101,8 +93,6 @@ class AboutScreen(ModalScreen[None]):
                         yield Static(
                             content=license_text, classes="license-text"
                         )
-
-        yield Footer()
 
     def on_mount(self) -> None:
         self.query_one("#contributors-list").mount(

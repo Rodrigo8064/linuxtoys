@@ -40,7 +40,10 @@ class ConfirmScriptScreen(ModalScreen[bool]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="confirm-dialog"):
-            yield Static(f"Executar '{self.script_name}'?", id="confirm-title")
+            yield Static(
+                f"{translations.get('cancel_btn_label', 'Cancel')} '{self.script_name}'?",
+                id="confirm-title",
+            )
             yield Static(self.description, id="confirm-description")
             with Horizontal(id="confirm-buttons"):
                 yield Button(
@@ -48,7 +51,11 @@ class ConfirmScriptScreen(ModalScreen[bool]):
                     id="cancel-btn",
                     variant="error",
                 )
-                yield Button("Executar", id="execute-btn", variant="success")
+                yield Button(
+                    translations.get("term_view_execute", "Execute"),
+                    id="execute-btn",
+                    variant="success",
+                )
 
     def on_mount(self) -> None:
         self.query_one("#confirm-description").border_title = "Descrição"
@@ -86,7 +93,10 @@ class ConfirmCleanupDialog(ModalScreen[bool]):
         )
 
         with Vertical(id="confirm-dialog"):
-            yield Static("Remover entrada do registro?", id="dialog-title")
+            yield Static(
+                translations.get("registry_cleanup_title", "Cleanup registry"),
+                id="dialog-title",
+            )
             yield Static(secondary_text, id="dialog-message")
 
             with Horizontal(id="dialog-buttons"):
@@ -123,7 +133,10 @@ class RemoveScriptScreen(ModalScreen[bool]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="confirm-dialog"):
-            yield Static(f"Remover '{self.script_name}'?", id="confirm-title")
+            yield Static(
+                f"{translations.get('term_view_remove', 'Remove')} '{self.script_name}'?",
+                id="confirm-title",
+            )
             yield Static(self.description, id="confirm-description")
             with Horizontal(id="confirm-buttons"):
                 yield Button(
@@ -131,7 +144,11 @@ class RemoveScriptScreen(ModalScreen[bool]):
                     id="cancel-btn",
                     variant="error",
                 )
-                yield Button("Remover", id="execute-btn", variant="success")
+                yield Button(
+                    translations.get("term_view_remove", "Remove"),
+                    id="execute-btn",
+                    variant="success",
+                )
 
     def on_mount(self) -> None:
         self.query_one("#confirm-description").border_title = "Descrição"
@@ -161,7 +178,11 @@ class SuccessDialog(ModalScreen[None]):
         with Vertical(id="confirm-dialog"):
             yield Label(f"'{self.script_name}' foi {self.action} com sucesso.")
             with Horizontal(id="confirm-buttons"):
-                yield Button("Concluir", id="execute-btn", variant="success")
+                yield Button(
+                    translations.get("term_view_done", "Done"),
+                    id="execute-btn",
+                    variant="success",
+                )
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "execute-btn":
@@ -185,7 +206,11 @@ class RebootDialog(ModalScreen[bool]):
                 )
             )
             with Horizontal(id="confirm-buttons"):
-                yield Button("Concluir", id="execute-btn", variant="success")
+                yield Button(
+                    translations.get("term_view_done", "Done"),
+                    id="execute-btn",
+                    variant="success",
+                )
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "execute-btn":
@@ -219,9 +244,15 @@ class ErrorDialog(ModalScreen[bool]):
                 f"(código de saída: {self.exit_code})."
             )
             with Horizontal(id="confirm-buttons"):
-                yield Button("Concluir", id="execute-btn", variant="success")
                 yield Button(
-                    "Reportar Bug", id="report-bug", variant="warning"
+                    translations.get("term_view_done", "Done"),
+                    id="execute-btn",
+                    variant="success",
+                )
+                yield Button(
+                    translations.get("report_label", "Report bug"),
+                    id="report-bug",
+                    variant="warning",
                 )
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -266,7 +297,11 @@ class SudoPasswordScreen(ModalScreen[str | None]):
                     id="cancel-btn",
                     variant="error",
                 )
-                yield Button("Confirmar", id="confirm-btn", variant="success")
+                yield Button(
+                    translations.get("confirm_title", "Confirm"),
+                    id="confirm-btn",
+                    variant="success",
+                )
 
     def on_mount(self) -> None:
         self.query_one("#sudo-password-input", Input).focus()
@@ -552,7 +587,11 @@ class UpdateCompleteDialog(ModalScreen[None]):
             yield Label(
                 "O LinuxToys precisa reiniciar para usar a nova versão."
             )
-            yield Button("Reiniciar agora", id="restart", variant="success")
+            yield Button(
+                translations.get("reboot_now_btn", "Reboot now"),
+                id="restart",
+                variant="success",
+            )
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "restart":
