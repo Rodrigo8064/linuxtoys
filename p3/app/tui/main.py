@@ -17,35 +17,32 @@ from textual.widgets import (
     Static,
 )
 
-from app.easy_cli import (
-    is_dev_mode_enabled,
-)
 from app.registry_utils import parse_registry_file
 
 from . import logo
-from .about_lt import AboutScreen
 from .button_helper import ScriptRunnerMixin
-from .dialog_screen import LanguageSelectorDialog, ReportBugDialog
+from .dialog_screen import ReportBugDialog
 from .helper import (
     get_categories,
     get_specials_root_item,
-    invalidate_search_caches,
     is_search_ready,
     make_widget_id,
     search_scripts_fast,
     translations,
     warm_search_and_category_index,
 )
-from .manifest_dialog import ManifestDialog
+from .menu_helper import MenuSelectionMixin
 from .my_widgets import (
     DescButton,
     FocusableLabel,
     Terminal,
 )
-from .registry_screen import RegistryOpenerMixin, RegistryScreen
+from .registry_screen import RegistryOpenerMixin
 
 
-class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
+class HomeScreen(
+    MenuSelectionMixin, ScriptRunnerMixin, RegistryOpenerMixin, Screen
+):
     """main screen for linuxtoys TUI"""
 
     def __init__(self, *args, **kwargs) -> None:
@@ -191,28 +188,6 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
             return
         await self.handle_desc_button(button)
 
-    def on_list_view_selected(self, event: ListView.Selected) -> None:
-        """Get the selected item and push a screen based on its ID."""
-        if event.item.id == "about":
-            self.app.push_screen(AboutScreen())
-        if event.item.id == "registry":
-            self.app.push_screen(RegistryScreen())
-        if event.item.id == "scripts_resync":
-            self._start_scripts_resync()
-        if event.item.id == "language":
-            self.app.push_screen(
-                LanguageSelectorDialog(), callback=self.apply_language_change
-            )
-        if event.item.id == "manifest":
-            self.app.push_screen(
-                ManifestDialog(), callback=self.on_manifest_chosen
-            )
-        if event.item.id == "update":
-            self.notify("LinuxToys Update Checker...")
-            self.run_worker(
-                self._check_for_update, thread=True, exclusive=True
-            )
-
     async def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id != "search-input":
             return
@@ -277,64 +252,6 @@ class HomeScreen(ScriptRunnerMixin, RegistryOpenerMixin, Screen):
         self._nav_stack.clear()
         await self._render_items(self._home_items())
         self._update_breadcrumb()
-
-    def _start_scripts_resync(self) -> None:
-        if is_dev_mode_enabled():
-            self.notify(
-                "Modo de desenvolvedor ativo — sincronização de scripts foi pulada.",
-                severity="warning",
-            )
-            return
-
-        self.notify("Sincronizando scripts...", timeout=3)
-        self.run_worker(
-            self._resync_scripts_worker,
-            thread=True,
-            exclusive=True,
-            name="scripts_resync",
-        )
-
-    def _resync_scripts_worker(self) -> None:
-        from app.git_scripts_manager import force_update_scripts
-
-        def progress(key: str) -> None:
-            message = translations.get(key, key)
-            self.app.call_from_thread(self.notify, message, timeout=3)
-
-        success = force_update_scripts(progress_callback=progress)
-        self.app.call_from_thread(self._on_scripts_resync_done, success)
-
-    def _on_scripts_resync_done(self, success: bool) -> None:
-        if success:
-            self.notify(
-                "Scripts sincronizados com sucesso.", severity="information"
-            )
-            invalidate_search_caches()
-            warm_search_and_category_index(translations)
-            self.run_worker(self.action_reset_to_home())
-        else:
-            self.notify(
-                "Não foi possível sincronizar os scripts agora.",
-                severity="warning",
-            )
-
-    async def apply_language_change(
-        self, new_language_code: str | None
-    ) -> None:
-        if new_language_code is None:
-            return
-
-        from app import lang_utils
-
-        new_translations = lang_utils.load_translations(new_language_code)
-        translations.clear()
-        translations.update(new_translations)  # muta no lugar, não reatribui
-        lang_utils.save_language(new_language_code)
-        invalidate_search_caches()
-        warm_search_and_category_index(translations)
-
-        await self.action_reset_to_home()
-        await self._refresh_fixed_ui_labels()
 
     async def _refresh_fixed_ui_labels(self) -> None:
         self.query_one("#search-input", Input).placeholder = translations.get(

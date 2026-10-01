@@ -80,15 +80,9 @@ Screen {
 /* --------------------- END -------------------------------*/
 
 /* --------------------- ABOUT CSS -------------------------------*/
-AboutScreen {
-    align: center middle;
-}
-
 #about-container {
-    max-width: 40%;
-    height: 60%;
-    background: transparent;
-    border: round $primary;
+    width: 100%;
+    height: 100%;
     content-align: center middle;
 }
 

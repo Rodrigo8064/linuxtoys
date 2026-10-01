@@ -14,7 +14,6 @@ from app.parser import get_breadcrumb_path, script_requires_reboot
 from app.registry_utils import parse_registry_file
 from app.repo_parser import materialize_repo_script
 from app.revert_helper import build_uninstall_script_entry
-from app.updater.update_helper import UpdateHelper
 
 from .dialog_screen import (
     CancelledDialog,
@@ -24,7 +23,6 @@ from .dialog_screen import (
     RemoveScriptScreen,
     SuccessDialog,
     SudoPasswordScreen,
-    UpdateAvailableDialog,
     UpdateCompleteDialog,
 )
 from .helper import (
@@ -592,40 +590,6 @@ class ScriptRunnerMixin:
         else:
             terminal.send_password(password)
         terminal.focus()
-
-    def _check_for_update(self) -> None:
-        """Roda em thread separada — urllib é bloqueante."""
-        helper = UpdateHelper()
-        available = helper._update_available()
-        self.app.call_from_thread(self._on_update_checked, helper, available)
-
-    def _on_update_checked(
-        self, helper: UpdateHelper, available: bool
-    ) -> None:
-        if not available:
-            self.notify("✓ It's already on the latest available version")
-            return
-        tag = helper._latest_ver.get("tag_name", "")
-        body = helper._latest_ver.get("body", "Sem changelog disponível.")
-        self.app.push_screen(
-            UpdateAvailableDialog(tag, body), callback=self._on_update_decision
-        )
-
-    def _on_update_decision(self, wants_update: bool | None) -> None:
-        if not wants_update:
-            return
-
-        self._running_button = None
-        self._running_script_info = None
-        self._running_temp_path = None
-        self._running_dev_mode = False
-        self._running_is_uninstall = False
-        self._running_is_update = True
-        self._show_terminal()
-        terminal = self.query_one("#terminal", Terminal)
-        terminal.run_script(
-            ["sh", "-c", "curl -fsSL https://linux.toys/install.sh | bash"]
-        )
 
     def _update_breadcrumb(self) -> None:
         panel = self.query_one("#left-panel-home")
