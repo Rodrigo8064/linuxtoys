@@ -33,8 +33,8 @@ from .helper import (
 )
 from .menu_helper import MenuSelectionMixin
 from .my_widgets import (
-    DescButton,
     FocusableLabel,
+    InfoButton,
     Terminal,
 )
 from .registry_screen import RegistryOpenerMixin
@@ -80,7 +80,7 @@ class HomeScreen(
                 with VerticalScroll(id="left-panel-home"):
                     registry_data = parse_registry_file()
                     for item in self._home_items():
-                        yield self._make_desc_button(item, registry_data)
+                        yield self._make_info_button(item, registry_data)
             # right panel widgets
             with Vertical(id="menu-panel"):
                 yield Static(linuxtoys_art, id="logo_lt")
@@ -156,12 +156,12 @@ class HomeScreen(
         self.query_one("#menu-panel").border_title = "Menu"
 
         left_panel = self.query_one("#left-panel-home", VerticalScroll)
-        first_button = left_panel.query(DescButton).first()
+        first_button = left_panel.query(InfoButton).first()
         if first_button is not None:
             first_button.focus()
 
-    def _make_desc_button(self, item: dict, registry_data) -> DescButton:
-        return DescButton(
+    def _make_info_button(self, item: dict, registry_data) -> InfoButton:
+        return InfoButton(
             item["name"],
             item["description"],
             item["path"],
@@ -169,7 +169,7 @@ class HomeScreen(
             item.get("is_new", False),
             item["name"] in registry_data,
             item.get("is_repo_entry", False),
-            item.get("is_appstream_entry", False),
+            item.get("has_app_page", False),
             id=make_widget_id(item["path"]),
         )
 
@@ -178,7 +178,7 @@ class HomeScreen(
         await left_panel.remove_children()
         registry_data = parse_registry_file()
         buttons = [
-            self._make_desc_button(item, registry_data) for item in items
+            self._make_info_button(item, registry_data) for item in items
         ]
         await left_panel.mount_all(buttons)
 
@@ -187,10 +187,10 @@ class HomeScreen(
         self.app.push_screen(ReportBugDialog())
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
-        """Check if the pressed button is a DescButton instance
+        """Check if the pressed button is a InfoButton instance
         and forward it to handle_desc_button."""
         button = event.button
-        if not isinstance(button, DescButton):
+        if not isinstance(button, InfoButton):
             return
         await self.handle_desc_button(button)
 

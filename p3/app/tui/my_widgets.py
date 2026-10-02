@@ -58,7 +58,7 @@ class FocusableLabel(Label):
         self.post_message(self.Pressed(self))
 
 
-class DescButton(Button):
+class InfoButton(Button):
     def __init__(
         self,
         label: str,
@@ -68,7 +68,7 @@ class DescButton(Button):
         is_new: bool = False,
         is_installed: bool = False,
         is_repo_entry: bool = False,
-        is_appstream_entry: bool = False,
+        has_app_page: bool = False,
         **kwargs,
     ) -> None:
         super().__init__(label, tooltip=description, **kwargs)
@@ -82,7 +82,7 @@ class DescButton(Button):
             str(label), path, is_repo_entry, is_appstream_entry
         )
         self.is_repo_entry = is_repo_entry
-        self.is_appstream_entry = is_appstream_entry
+        self.has_app_page = has_app_page
 
     def on_mount(self) -> None:
         if self.revert and self.is_installed:

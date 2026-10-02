@@ -37,7 +37,7 @@ from .helper import (
 )
 from .manifest_dialog import ManifestReportDialog
 from .my_widgets import (
-    DescButton,
+    InfoButton,
     PasswordPromptDetected,
     ScriptFinished,
     Terminal,
@@ -47,7 +47,7 @@ TRANSMAP_PATH = "/tmp/linuxtoys/transmap"
 
 
 class ScriptRunnerMixin:
-    _running_button: DescButton | None = None
+    _running_button: InfoButton | None = None
     _running_script_info: dict | None = None
     _running_temp_path: str | None = None
     _running_dev_mode: bool = False
@@ -57,14 +57,16 @@ class ScriptRunnerMixin:
     _manifest_results: list[dict] = []
     _is_manifest_run: bool = False
 
-    async def handle_desc_button(self, button: DescButton) -> None:
+    async def handle_desc_button(self, button: InfoButton) -> None:
         """Call a function based on is script or not."""
-        if button.is_script:
+        if button.is_repo_entry and button.has_app_page:
+            pass
+        elif button.is_script:
             self._handle_script_button(button)
         else:
             await self._navigate_to_category(button)
 
-    def _handle_script_button(self, button: DescButton) -> None:
+    def _handle_script_button(self, button: InfoButton) -> None:
         """Handle script button actions based on its execution state.
 
         Push the confirmation screen if it is the script's first run,
@@ -95,17 +97,17 @@ class ScriptRunnerMixin:
                 ),
             )
 
-    def _on_confirm_install(self, button: DescButton, confirmed: bool) -> None:
+    def _on_confirm_install(self, button: InfoButton, confirmed: bool) -> None:
         if confirmed:
             self.run_script(button)
 
     def _on_confirm_uninstall(
-        self, button: DescButton, confirmed: bool
+        self, button: InfoButton, confirmed: bool
     ) -> None:
         if confirmed:
             self.run_uninstall(button)
 
-    async def _navigate_to_category(self, button: DescButton) -> None:
+    async def _navigate_to_category(self, button: InfoButton) -> None:
         self._nav_stack.append((button.path, str(button.label)))
         await self._render_items(self._items_for_path(button.path))
         self._update_breadcrumb()
@@ -115,7 +117,7 @@ class ScriptRunnerMixin:
             return get_specials_items(path)
         return get_scripts_for_category_cached(path)
 
-    def run_script(self, button: DescButton) -> None:
+    def run_script(self, button: InfoButton) -> None:
         self._running_button = button
         self._execute_script_info(
             {
@@ -289,7 +291,7 @@ class ScriptRunnerMixin:
         script_info = self._manifest_queue.pop(0)
         self._execute_script_info(script_info)
 
-    def run_uninstall(self, button: DescButton) -> None:
+    def run_uninstall(self, button: InfoButton) -> None:
         script_info = {"name": str(button.label), "path": button.path}
         uninstall_entry = build_uninstall_script_entry(
             script_info, translations

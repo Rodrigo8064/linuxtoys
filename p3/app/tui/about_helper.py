@@ -42,9 +42,9 @@ def load_ansi_art(filename: str) -> Text:
         return Text.from_ansi(final_ansi_content)
 
     except FileNotFoundError:
-        return Text(f"Arte não encontrada: {filename}", style="bold red")
+        return Text(f"Art not found: {filename}", style="bold red")
     except Exception as e:
-        return Text(f"Erro ao carregar a arte: {e}", style="bold red")
+        return Text(f"Error downloading the art: {e}", style="bold red")
 
 
 class AboutWidget(Widget):
@@ -109,7 +109,7 @@ class AboutWidget(Widget):
         self.query_one("#contributors-list").mount(
             Static("Loading contributors....")
         )
-        self._load_contributors()
+        self._load_contributor_lts()
 
     def _get_compat_display_string(self) -> str:
         compat_keys = get_system_compat_keys()

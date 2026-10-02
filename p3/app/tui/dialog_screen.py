@@ -58,7 +58,7 @@ class ConfirmScriptScreen(ModalScreen[bool]):
                 )
 
     def on_mount(self) -> None:
-        self.query_one("#confirm-description").border_title = "Descrição"
+        self.query_one("#confirm-description").border_title = "Description"
         self.query_one("#execute-btn", Button).focus()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -151,7 +151,7 @@ class RemoveScriptScreen(ModalScreen[bool]):
                 )
 
     def on_mount(self) -> None:
-        self.query_one("#confirm-description").border_title = "Descrição"
+        self.query_one("#confirm-description").border_title = "Description"
         self.query_one("#execute-btn", Button).focus()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -169,14 +169,16 @@ class SuccessDialog(ModalScreen[None]):
         Binding("escape", "cancel", translations.get("script_runner_close"))
     ]
 
-    def __init__(self, script_name: str, action: str = "instalado") -> None:
+    def __init__(self, script_name: str, action: str = "installed") -> None:
         super().__init__()
         self.script_name = script_name
         self.action = action
 
     def compose(self) -> ComposeResult:
         with Vertical(id="confirm-dialog"):
-            yield Label(f"'{self.script_name}' foi {self.action} com sucesso.")
+            yield Label(
+                f"'{self.script_name}' was successfully {self.action}."
+            )
             with Horizontal(id="confirm-buttons"):
                 yield Button(
                     translations.get("term_view_done", "Done"),
@@ -230,7 +232,7 @@ class ErrorDialog(ModalScreen[bool]):
     ]
 
     def __init__(
-        self, script_name: str, exit_code: int | None, action: str = "instalar"
+        self, script_name: str, exit_code: int | None, action: str = "install"
     ) -> None:
         super().__init__()
         self.script_name = script_name
@@ -240,8 +242,8 @@ class ErrorDialog(ModalScreen[bool]):
     def compose(self) -> ComposeResult:
         with Vertical(id="confirm-dialog"):
             yield Label(
-                f"Falha ao {self.action} '{self.script_name}' "
-                f"(código de saída: {self.exit_code})."
+                f"Failed to {self.action} the '{self.script_name}' "
+                f"(exit code: {self.exit_code})."
             )
             with Horizontal(id="confirm-buttons"):
                 yield Button(
@@ -281,13 +283,12 @@ class SudoPasswordScreen(ModalScreen[str | None]):
     def compose(self) -> ComposeResult:
         with Vertical(id="confirm-dialog"):
             yield Static(
-                f"'{self.script_name}' precisa de privilégios sudo",
+                f"'{self.script_name}' needs sudo privileges",
                 id="confirm-title",
             )
             if self.error_message:
                 yield Static(self.error_message, id="sudo-error")
             yield Input(
-                placeholder="Senha",
                 password=True,
                 id="sudo-password-input",
             )
@@ -340,7 +341,7 @@ class CancelledDialog(ModalScreen[None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="confirm-dialog"):
-            yield Label(f"Execução de '{self.script_name}' cancelada.")
+            yield Label(f"'{self.script_name}' execution cancelled.")
             with Horizontal(id="confirm-buttons"):
                 yield Button(
                     translations.get("ok_btn_label", "OK"),
@@ -563,9 +564,11 @@ class UpdateAvailableDialog(ModalScreen[bool]):
 
     def compose(self) -> ComposeResult:
         with Vertical():
-            yield Label(
-                f"⚡️ A new version {self.tag} of LinuxToys is available."
+            tempalte_test = translations.get(
+                "update_available_message",
+                "A new version ${version} of LinuxToys is available.",
             )
+            yield Label(tempalte_test.replace("${version}", self.tag))
             with VerticalScroll(id="changelog"):
                 yield Static(self.changelog)
             with Horizontal():
@@ -585,7 +588,10 @@ class UpdateCompleteDialog(ModalScreen[None]):
         with Vertical():
             yield Label("Atualização concluída!")
             yield Label(
-                "O LinuxToys precisa reiniciar para usar a nova versão."
+                translations.get(
+                    "update_status_restart",
+                    "Update installed. You can restart the application.",
+                )
             )
             yield Button(
                 translations.get("reboot_now_btn", "Reboot now"),

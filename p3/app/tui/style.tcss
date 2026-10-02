@@ -500,7 +500,7 @@ ReportBugDialog {
     align: center middle;
 }
 
-DescButton {
+InfoButton {
   width: 1fr;
   margin-bottom: 1;
   border: round $primary;
@@ -508,7 +508,7 @@ DescButton {
 }
 /* ------------------------------ END -------------------- */
 
-/* ------------------------------ UPDATE CSSE -------------------- */
+/* ------------------------------ UPDATE CSS -------------------- */
 UpdateAvailableDialog { 
   align: center middle;
 }
