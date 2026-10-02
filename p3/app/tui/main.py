@@ -19,7 +19,7 @@ from textual.widgets import (
 
 from app.registry_utils import parse_registry_file
 
-from . import logo
+from .about_helper import load_ansi_art
 from .button_helper import ScriptRunnerMixin
 from .dialog_screen import ReportBugDialog
 from .helper import (
@@ -65,6 +65,7 @@ class HomeScreen(
         """Empty action for purely informational captions in the footer."""
 
     def compose(self) -> ComposeResult:
+        linuxtoys_art = load_ansi_art("linuxtoystui.ansi")
         yield Header(icon="")
 
         with Horizontal(id="body-home"):
@@ -82,7 +83,7 @@ class HomeScreen(
                         yield self._make_desc_button(item, registry_data)
             # right panel widgets
             with Vertical(id="menu-panel"):
-                yield Static(logo, id="logo")
+                yield Static(linuxtoys_art, id="logo_lt")
                 yield ListView(
                     ListItem(
                         Label(
@@ -153,6 +154,11 @@ class HomeScreen(
         self.query_one("#terminal-conteiner").display = False
         self.query_one("#left-panel-home").border_title = "Categorias/Scripts"
         self.query_one("#menu-panel").border_title = "Menu"
+
+        left_panel = self.query_one("#left-panel-home", VerticalScroll)
+        first_button = left_panel.query(DescButton).first()
+        if first_button is not None:
+            first_button.focus()
 
     def _make_desc_button(self, item: dict, registry_data) -> DescButton:
         return DescButton(
@@ -237,6 +243,16 @@ class HomeScreen(
         ]
 
     async def action_go_back(self) -> None:
+        if self._is_about_showing:
+            self._toggle_about_panel(force_hide=True)
+            logo = self.query_one("#logo_lt")
+            menu = self.query_one("#home-menu")
+            menu_panel = self.query_one("#menu-panel")
+            logo.display = True
+            menu.display = True
+            menu_panel.border_title = "Menu"
+            self._is_about_showing = False
+
         if not self._nav_stack:
             return
         self._nav_stack.pop()

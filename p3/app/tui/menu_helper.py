@@ -1,7 +1,7 @@
 from app.easy_cli import is_dev_mode_enabled
 from app.updater.update_helper import UpdateHelper
 
-from .about_lt import AboutWidget
+from .about_helper import AboutWidget
 from .dialog_screen import LanguageSelectorDialog, UpdateAvailableDialog
 from .helper import (
     invalidate_search_caches,
@@ -53,7 +53,7 @@ class MenuSelectionMixin:
         Mostra ou esconde o painel 'Sobre' no lugar do menu principal.
         """
         menu_panel = self.query_one("#menu-panel")
-        logo = self.query_one("#logo")
+        logo = self.query_one("#logo_lt")
         home_menu = self.query_one("#home-menu")
         terminal_container = self.query_one("#terminal-conteiner")
 
@@ -80,20 +80,6 @@ class MenuSelectionMixin:
             about_content = self.query("#about-content")
             if about_content:
                 about_content.remove()
-
-    async def action_go_back(self) -> None:
-        if self._is_about_showing:
-            self._toggle_about_panel(force_hide=True)
-            return
-        # O resto da função action_go_back original de main.py continua aqui
-        # ... (código original)
-
-    # Adicione esta função para garantir que o painel 'about' seja fechado ao ir para home
-    async def action_reset_to_home(self) -> None:
-        if self._is_about_showing:
-            self._toggle_about_panel(force_hide=True)
-        # O resto da função action_reset_to_home original de main.py continua aqui
-        # ... (código original)
 
     def _trigger_update_check(self) -> None:
         """Inicia a verificação de atualização em uma thread de trabalho."""

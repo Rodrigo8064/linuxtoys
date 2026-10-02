@@ -319,7 +319,7 @@ class ScriptRunnerMixin:
         )
 
     def _show_terminal(self) -> None:
-        logo = self.query_one("#logo")
+        logo = self.query_one("#logo_lt")
         menu = self.query_one("#home-menu")
         terminal_container = self.query_one("#terminal-conteiner")
         terminal = self.query_one("#terminal", Terminal)
@@ -330,7 +330,7 @@ class ScriptRunnerMixin:
         terminal.focus()
 
     def _hide_terminal(self) -> None:
-        logo = self.query_one("#logo")
+        logo = self.query_one("#logo_lt")
         menu = self.query_one("#home-menu")
         terminal_container = self.query_one("#terminal-conteiner")
 

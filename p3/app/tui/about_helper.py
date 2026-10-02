@@ -4,7 +4,7 @@ import requests
 from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
-from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.containers import Vertical, VerticalScroll
 from textual.widget import Widget
 from textual.widgets import (
     Rule,
@@ -27,15 +27,29 @@ def load_ansi_art(filename: str) -> Text:
     file_path = ICONS_DIR / filename
     try:
         ansi_content = file_path.read_text(encoding="utf-8")
-        return Text.from_ansi(ansi_content)
+
+        ansi_content = ansi_content.replace("\\033", "\033")
+        ansi_content = ansi_content.replace("\\x1b", "\x1b")
+        ansi_content = ansi_content.replace("\\e", "\x1b")
+
+        cleaned_lines = []
+        for line in ansi_content.splitlines():
+            cleaned_line = line.lstrip(" '")
+            cleaned_lines.append(cleaned_line)
+
+        final_ansi_content = "\n".join(cleaned_lines)
+
+        return Text.from_ansi(final_ansi_content)
+
     except FileNotFoundError:
         return Text(f"Arte não encontrada: {filename}", style="bold red")
+    except Exception as e:
+        return Text(f"Erro ao carregar a arte: {e}", style="bold red")
 
 
 class AboutWidget(Widget):
     def compose(self) -> ComposeResult:
-        psyicon_art = load_ansi_art("psyicon.ansi")
-        linuxtoys_art = load_ansi_art("linuxtoys.ansi")
+        linuxtoys_art = load_ansi_art("linuxtoystui.ansi")
         compat_display = self._get_compat_display_string()
 
         with Vertical(id="about-container"):
@@ -46,33 +60,30 @@ class AboutWidget(Widget):
                 ):
                     with VerticalScroll(classes="about-scroll"):
                         # logo and info
-                        with Horizontal(id="header-row"):
-                            yield Static(linuxtoys_art)
-                            with Vertical(classes="profile-text"):
-                                yield Static(
-                                    "[bold]LinuxToys[/bold]",
-                                )
-                                yield Static(compat_display)
-                                yield Static(
-                                    translations.get(
-                                        "subtitle",
-                                        "A collection of tools for Linux in a user-friendly way.",
-                                    ),
-                                )
+                        yield Static(linuxtoys_art, id="logo_lt")
+                        with Vertical(classes="profile-text"):
+                            yield Static(
+                                "[bold]LinuxToys[/bold]",
+                            )
+                            yield Static(compat_display)
+                            yield Static(
+                                translations.get(
+                                    "subtitle",
+                                    "A collection of tools for Linux in a user-friendly way.",
+                                ),
+                            )
 
                         yield Rule()
                         # Autor
-                        with Horizontal(id="leader-row"):
-                            yield Static(psyicon_art)
-                            with Vertical(classes="profile-text"):
-                                yield Static(
-                                    "[bold]Victor 'psygreg' Gregory[/bold]"
+                        with Vertical(classes="profile-text"):
+                            yield Static(
+                                "[bold]Victor 'psygreg' Gregory[/bold]"
+                            )
+                            yield Static(
+                                translations.get(
+                                    "project_lead", "Project Lead"
                                 )
-                                yield Static(
-                                    translations.get(
-                                        "project_lead", "Project Lead"
-                                    )
-                                )
+                            )
 
                         yield Rule()
 
@@ -127,7 +138,7 @@ class AboutWidget(Widget):
         return " | ".join(display_parts) if display_parts else "Unknown"
 
     @work(exclusive=True, thread=True)
-    def _load_contributors(self) -> None:
+    def _load_contributor_lts(self) -> None:
         try:
             response = requests.get(
                 "https://api.github.com/repos/psygreg/linuxtoys/contributors",

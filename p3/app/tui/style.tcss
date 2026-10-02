@@ -86,6 +86,13 @@ Screen {
     content-align: center middle;
 }
 
+#logo_lt {
+  width: 100%;
+  height: auto;
+  content-align: center middle;
+  background: transparent;
+}
+
 #license-scroll {
     max-width: 100%;
     height: 1fr;
@@ -94,9 +101,9 @@ Screen {
 
 .about-scroll {
   width: 100%;
-  max-width: 100%;
   height: 1fr;
-  align: center middle;
+  align: center top;
+  padding: 1 2;
 }
 
 #header-row, #leader-row {
@@ -111,25 +118,33 @@ Screen {
 }
 
 .profile-text {
-    width: 1fr;
-    height: 100%;
-    align: left middle;
+    width: 100%;
+    height: auto;
+    align: center middle;
+    margin-bottom: 1;
 }
 
 .profile-text Static {
     width: 100%;
-    text-align: left;
+    text-align: center;
+    content-align: center middle;
+}
+
+Rule {
+  margin: 1 0;
 }
 
 .section-title {
     width: 100%;
     height: auto;
-    content-align: center middle;
+    align: center middle;
+    margin-bottom: 1;
 }
 
 .section-title Static {
     width: 100%;
     text-align: center;
+    content-align: center middle;
 }
 
 .contributors-grid {
