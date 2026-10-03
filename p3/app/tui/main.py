@@ -1,4 +1,5 @@
 import asyncio
+from functools import partial
 
 from textual import on
 from textual.app import App, ComposeResult
@@ -17,13 +18,20 @@ from textual.widgets import (
     Static,
 )
 
+from app.lang_utils import detect_system_language
 from app.registry_utils import parse_registry_file
 
 from .about_helper import load_ansi_art
+from .app_page_translate import (
+    load_cached_translation,
+    save_cached_translation,
+    translate_description_blocks,
+)
 from .button_helper import ScriptRunnerMixin
 from .dialog_screen import ReportBugDialog
 from .helper import (
     get_categories,
+    get_script_info,
     get_specials_root_item,
     is_search_ready,
     make_widget_id,
@@ -38,6 +46,7 @@ from .my_widgets import (
     Terminal,
 )
 from .registry_screen import RegistryOpenerMixin
+from .tui_app_page import AppPageWidget, hide_app_page, show_app_page
 
 
 class HomeScreen(
@@ -160,6 +169,10 @@ class HomeScreen(
         if first_button is not None:
             first_button.focus()
 
+    @property
+    def _is_app_page_showing(self) -> bool:
+        return bool(self.query(AppPageWidget))
+
     def _make_info_button(self, item: dict, registry_data) -> InfoButton:
         return InfoButton(
             item["name"],
@@ -169,6 +182,7 @@ class HomeScreen(
             item.get("is_new", False),
             item["name"] in registry_data,
             item.get("is_repo_entry", False),
+            item.get("is_appstream_entry", False),
             item.get("has_app_page", False),
             id=make_widget_id(item["path"]),
         )
@@ -187,12 +201,85 @@ class HomeScreen(
         self.app.push_screen(ReportBugDialog())
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
-        """Check if the pressed button is a InfoButton instance
-        and forward it to handle_desc_button."""
+        if self._is_about_showing:
+            self._toggle_about_panel(force_hide=True)
+            logo = self.query_one("#logo_lt")
+            menu = self.query_one("#home-menu")
+            menu_panel = self.query_one("#menu-panel")
+            logo.display = True
+            menu.display = True
+            menu_panel.border_title = "Menu"
+            self._is_about_showing = False
+
         button = event.button
         if not isinstance(button, InfoButton):
             return
+
+        if button.is_repo_entry and button.has_app_page:
+            script_name = str(button.label)
+            info = get_script_info(script_name)
+            if info is None:
+                self.notify(
+                    f"app_page: sem info | label={button.label!r}",
+                    severity="warning",
+                )
+                return
+            await show_app_page(
+                self,
+                info,
+                translations=translations,
+                featured=None,
+                installed=False,
+            )
+            return
+
+        if button.is_script and self._is_app_page_showing:
+            await hide_app_page(self)
         await self.handle_desc_button(button)
+
+    async def on_app_page_widget_back_requested(
+        self, message: AppPageWidget.BackRequested
+    ) -> None:
+        await self.action_go_back()
+
+    def on_app_page_widget_url_requested(
+        self, message: AppPageWidget.UrlRequested
+    ) -> None:
+        self.app.open_url(message.url)
+
+    def on_app_page_widget_translate_requested(
+        self, message: AppPageWidget.TranslateRequested
+    ) -> None:
+        page = self.query_one(AppPageWidget)
+        self.run_worker(
+            partial(self._translate_description, page, message.blocks),
+            thread=True,
+            exclusive=True,
+            group="translate",
+        )
+
+    def _translate_description(self, page: AppPageWidget, blocks) -> None:
+        """Roda em thread: não bloqueia a interface durante as requisições."""
+        target = (
+            detect_system_language().split("-")[0].split("_")[0].casefold()
+        )
+        try:
+            translated = load_cached_translation(
+                page.script_info, blocks, target
+            )
+            if translated is None:
+                translated = translate_description_blocks(blocks, target)
+                save_cached_translation(
+                    page.script_info, blocks, target, translated
+                )
+        except Exception:
+            translated = None
+
+        def deliver() -> None:
+            if page.is_attached:
+                page.set_translated_blocks(translated)
+
+        self.app.call_from_thread(deliver)
 
     async def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id != "search-input":
@@ -243,6 +330,10 @@ class HomeScreen(
         ]
 
     async def action_go_back(self) -> None:
+        if self._is_app_page_showing:
+            await hide_app_page(self)
+            return
+
         if self._is_about_showing:
             self._toggle_about_panel(force_hide=True)
             logo = self.query_one("#logo_lt")

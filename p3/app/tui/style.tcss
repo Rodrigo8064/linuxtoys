@@ -547,3 +547,33 @@ UpdateCompleteDialog Button {
   width: 100%;
 }
 /* ------------------------------ END -------------------- */
+/* ----------------------- AppPageWidget ------------------- */
+AppPageWidget { height: 100%; padding: 0 1; }
+AppPageWidget #app-top { height: 3; }
+AppPageWidget #app-back { min-width: 5; width: 5; margin-right: 1; }
+AppPageWidget #app-name { width: 1fr; height: 3; content-align: left middle; color: $accent; }
+AppPageWidget #app-developer,
+AppPageWidget #app-meta { height: 1; }
+AppPageWidget .app-row { height: auto; margin-top: 1; }
+AppPageWidget .app-row > Button { margin-right: 1; }
+AppPageWidget .act-select { width: 28; margin-right: 1; }
+AppPageWidget #app-actions { overflow-x: auto; }
+AppPageWidget #app-rating { height: auto; }
+AppPageWidget #app-rating Label { height: 3; content-align: left middle; margin-right: 1; }
+AppPageWidget #app-rating Button { min-width: 5; width: 5; }
+AppPageWidget #app-tabs { height: 1fr; margin-top: 1; }
+AppPageWidget #app-content { height: 1fr; margin-top: 1; }
+AppPageWidget TabPane { padding: 0; }
+AppPageWidget #app-description { height: auto; }
+AppPageWidget #app-translate-row { height: auto; align-horizontal: right; }
+AppPageWidget #app-description-text { height: auto; }
+AppPageWidget #app-featured { height: auto; margin-top: 1; }
+AppPageWidget #app-featured-title { text-style: bold; color: $accent; margin: 1 0; }
+AppPageWidget #featured-grid { height: auto; grid-gutter: 0 1; }
+AppPageWidget .ext-item { height: auto; margin-bottom: 1; }
+
+FeaturedCard { height: 5; padding: 0 1; overflow: hidden; border: round $primary 60%; }
+FeaturedCard:hover,
+FeaturedCard:focus { border: round $accent; background: $boost; }
+/* ------------------------------ END -------------------- */
+

@@ -68,6 +68,7 @@ class InfoButton(Button):
         is_new: bool = False,
         is_installed: bool = False,
         is_repo_entry: bool = False,
+        is_appstream_entry: bool = False,
         has_app_page: bool = False,
         **kwargs,
     ) -> None:
@@ -78,6 +79,7 @@ class InfoButton(Button):
         self.is_new = is_new
         self.script_name = label
         self.is_installed = is_installed
+        self.is_appstream_entry = is_appstream_entry
         self.revert = is_removable(
             str(label), path, is_repo_entry, is_appstream_entry
         )

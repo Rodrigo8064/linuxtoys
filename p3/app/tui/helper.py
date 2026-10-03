@@ -3,6 +3,7 @@ import threading
 from enum import Enum, auto
 
 from app.lang_utils import load_translations
+from app.parser import get_appstream_entries
 from app.search_helper import (
     CategoryCache,
     ScriptCache,
@@ -33,6 +34,17 @@ def make_widget_id(identifier: str) -> str:
 
 def is_search_ready() -> bool:
     return _search_engine is not None and _category_cache is not None
+
+
+def get_script_info(script_name: str) -> dict | None:
+    return next(
+        (
+            s
+            for s in get_appstream_entries(translations)
+            if s.get("name") == script_name
+        ),
+        None,
+    )
 
 
 def is_removable(
