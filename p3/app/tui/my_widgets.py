@@ -363,7 +363,10 @@ class Terminal(Widget, can_focus=True):
         return marker[:mid], marker[mid:]
 
     def run_script(
-        self, command: str | list, env: dict[str, str] | None = None
+        self,
+        command: str | list,
+        env: dict[str, str] | None = None,
+        pause_on_exit: bool = True,
     ) -> None:
         """Injeta 'bash <script>' no shell persistente, com um marcador
         de saída logo depois pra detectar o fim e capturar o exit code."""
@@ -388,6 +391,11 @@ class Terminal(Widget, can_focus=True):
         self._last_run_marker = f"@@LT_START@@:{uuid.uuid4().hex[:8]}"
         start_left, start_right = self._split_marker(self._last_run_marker)
         exit_left, exit_right = self._split_marker(self.EXIT_MARKER)
+        pause_clause = (
+            'read -rp "Pressione ENTER para continuar..." ; '
+            if pause_on_exit
+            else ": ;"
+        )
         line = (
             f"{prefix}"
             f'_lt_s={shlex.quote(start_left)}; _lt_s="$_lt_s"{shlex.quote(start_right)}; '
@@ -397,7 +405,7 @@ class Terminal(Widget, can_focus=True):
             'if [ "$__lt_code" -eq 130 ] || [ "$__lt_code" -eq 100 ]; then '
             "__lt_code=100; "
             "else "
-            'read -rp "Pressione ENTER para continuar..." ; '
+            f"{pause_clause}"
             "fi; "
             f'_lt_e={shlex.quote(exit_left)}; _lt_e="$_lt_e"{shlex.quote(exit_right)}; '
             f'echo "$_lt_e$__lt_code"\n'

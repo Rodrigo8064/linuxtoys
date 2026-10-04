@@ -9,6 +9,7 @@ from textual import on
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
+from textual.css.query import NoMatches
 from textual.message import Message
 from textual.widget import Widget
 from textual.widgets import (
@@ -185,6 +186,9 @@ class AppPageWidget(Vertical):
         def __init__(self, script_info: Mapping[str, Any]) -> None:
             super().__init__()
             self.script_info = script_info
+
+    class UninstallRequested(InstallRequested):
+        pass
 
     # ---- construção ------------------------------------------------------- #
     def __init__(
@@ -423,6 +427,10 @@ class AppPageWidget(Vertical):
         developer = self._developer_text()
         if developer is not None:
             yield Static(developer, id="app-developer")
+
+        description = self._description_text()
+        if description is not None:
+            yield Static(description, id="app-description-short")
         meta = self._meta_text()
         if meta is not None:
             yield Static(meta, id="app-meta")
@@ -458,18 +466,18 @@ class AppPageWidget(Vertical):
             id="app-install",
         )
         install.display = not self._installed
-        opened = Button(
-            "▶ " + self._t("app_page_open", "Open").strip(),
-            variant="primary",
-            id="app-open",
+        remove = Button(
+            "🗑 " + self._t("app_page_remove", "Remover").strip(),
+            variant="error",
+            id="app-remove",
         )
-        opened.display = self._installed
+        remove.display = self._installed
         revert = Button(
             "↺ " + self._t("app_page_snap_revert", "Revert").strip(),
             id="app-revert",
         )
-        revert.display = False  # host liga via set_snap_revert_visible()
-        widgets: list[Widget] = [install, opened, revert]
+        revert.display = self._installed and self._has_snap_source()
+        widgets: list[Widget] = [install, remove, revert]
 
         if len(self._source_options) >= 2:
             recommended = self._recommended_source()
@@ -568,6 +576,10 @@ class AppPageWidget(Vertical):
         row.display = False
         return row
 
+    def _description_text(self) -> str | None:
+        description = str(self.script_info.get("description") or "").strip()
+        return description or None
+
     # ---- corpo ------------------------------------------------------------ #
     def _build_content(self) -> VerticalScroll:
         children: list[Widget] = []
@@ -656,7 +668,7 @@ class AppPageWidget(Vertical):
     def set_install_state(self, installed: bool) -> None:
         self._installed = installed
         self.query_one("#app-install").display = not installed
-        self.query_one("#app-open").display = installed
+        self.query_one("#app-remove").display = installed
         self._refresh_rating()
 
     def set_snap_revert_visible(self, visible: bool) -> None:
@@ -723,6 +735,15 @@ class AppPageWidget(Vertical):
             )
         else:
             row.tooltip = None
+
+    def _has_snap_source(self) -> bool:
+        info = self.script_info
+        if str(info.get("snap_name") or "").strip():
+            return True
+        for option in info.get("source_options") or ():
+            if str(option.get("snap_name") or "").strip():
+                return True
+        return False
 
     # ---- featured (preenche só o espaço sobrando, como na GUI) ------------ #
     def _schedule_featured(self) -> None:
@@ -794,10 +815,18 @@ class AppPageWidget(Vertical):
         if bid == "app-back":
             self.post_message(self.BackRequested())
         elif bid == "app-install":
+            event.button.disabled = True
+            event.button.label = "..."
             self.post_message(self.InstallRequested(self._selected))
         elif bid == "app-open":
             self.post_message(self.OpenRequested(self._selected))
+        elif bid == "app-remove":
+            event.button.disabled = True
+            event.button.label = "…"
+            self.post_message(self.UninstallRequested(self._selected))
         elif bid == "app-revert":
+            event.button.disabled = True
+            event.button.label = "..."
             self.post_message(self.RevertRequested(self._selected))
         elif bid.startswith("app-rate-"):
             self.post_message(
@@ -814,6 +843,34 @@ class AppPageWidget(Vertical):
                 self.post_message(self.UrlRequested(url))
         elif bid == "app-translate":
             self._on_translate_pressed(event.button)
+
+    def reset_install_button(self) -> None:
+        try:
+            button = self.query_one("#app-install", Button)
+        except NoMatches:
+            return
+        button.disabled = False
+        button.label = (
+            "⬇ " + self._t("skills_install_label", "Install").strip()
+        )
+
+    def reset_remove_button(self) -> None:
+        """Reabilita e restaura o label do botão Remover, usado quando a
+        remoção falha ou é cancelada."""
+        try:
+            button = self.query_one("#app-remove", Button)
+        except NoMatches:
+            return
+        button.disabled = False
+        button.label = "🗑 " + self._t("app_page_remove", "Remover").strip()
+
+    def reset_revert_button(self) -> None:
+        try:
+            button = self.query_one("#app-revert", Button)
+        except NoMatches:
+            return
+        button.disabled = False
+        button.label = "↺ " + self._t("app_page_snap_revert", "Revert").strip()
 
     def _on_translate_pressed(self, button: Button) -> None:
         if self._showing_translation:

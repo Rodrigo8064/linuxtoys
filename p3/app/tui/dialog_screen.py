@@ -602,3 +602,47 @@ class UpdateCompleteDialog(ModalScreen[None]):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "restart":
             self.dismiss()
+
+
+class AurSecurityDialog(ModalScreen[None]):
+    """Diálogo de bloqueio/indisponibilidade da verificação de segurança
+    AUR, exibido antes de qualquer instalação ser sequer iniciada."""
+
+    BINDINGS = [
+        Binding("escape", "cancel", translations.get("script_runner_close"))
+    ]
+
+    def __init__(self, script_name: str, blocked: bool, detail: str) -> None:
+        super().__init__()
+        self.script_name = script_name
+        self.blocked = blocked
+        self.detail = detail
+
+    def compose(self) -> ComposeResult:
+        if self.blocked:
+            title = (
+                f"'{self.script_name}' was not installed: potential security "
+                "risk found in the AUR package sources."
+            )
+        else:
+            title = (
+                f"'{self.script_name}' was not installed: its AUR sources "
+                "could not be verified."
+            )
+        with Vertical(id="confirm-dialog"):
+            yield Label(title)
+            with VerticalScroll(id="aur-security-detail"):
+                yield Static(self.detail)
+            with Horizontal(id="confirm-buttons"):
+                yield Button(
+                    translations.get("ok_btn_label", "OK"),
+                    id="execute-btn",
+                    variant="primary",
+                )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "execute-btn":
+            self.dismiss()
+
+    def action_cancel(self) -> None:
+        self.dismiss()

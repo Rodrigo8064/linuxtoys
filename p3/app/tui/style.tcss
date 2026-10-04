@@ -571,6 +571,9 @@ AppPageWidget #app-featured { height: auto; margin-top: 1; }
 AppPageWidget #app-featured-title { text-style: bold; color: $accent; margin: 1 0; }
 AppPageWidget #featured-grid { height: auto; grid-gutter: 0 1; }
 AppPageWidget .ext-item { height: auto; margin-bottom: 1; }
+#app-description-short {
+    color: $text-muted;
+}
 
 FeaturedCard { height: 5; padding: 0 1; overflow: hidden; border: round $primary 60%; }
 FeaturedCard:hover,

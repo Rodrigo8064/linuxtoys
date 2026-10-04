@@ -48,6 +48,9 @@ from .my_widgets import (
 from .registry_screen import RegistryOpenerMixin
 from .tui_app_page import AppPageWidget, hide_app_page, show_app_page
 
+# info = get_script_info("Steam")
+# breakpoint()
+
 
 class HomeScreen(
     MenuSelectionMixin, ScriptRunnerMixin, RegistryOpenerMixin, Screen
@@ -161,7 +164,7 @@ class HomeScreen(
 
     def on_mount(self) -> None:
         self.query_one("#terminal-conteiner").display = False
-        self.query_one("#left-panel-home").border_title = "Categorias/Scripts"
+        self.query_one("#left-panel-home").border_title = "LinuxToys"
         self.query_one("#menu-panel").border_title = "Menu"
 
         left_panel = self.query_one("#left-panel-home", VerticalScroll)
@@ -229,7 +232,7 @@ class HomeScreen(
                 info,
                 translations=translations,
                 featured=None,
-                installed=False,
+                installed=button.is_installed,
             )
             return
 
@@ -281,6 +284,22 @@ class HomeScreen(
 
         self.app.call_from_thread(deliver)
 
+    @on(AppPageWidget.InstallRequested)
+    async def _on_app_page_install_requested(
+        self, message: AppPageWidget.InstallRequested
+    ) -> None:
+        entry = message.script_info
+        if str(entry.get("path", "")).startswith("aur://"):
+            await self.run_appstream_aur_install(entry)
+        else:
+            self.run_appstream_install(message.script_info)
+
+    @on(AppPageWidget.UninstallRequested)
+    def _on_app_page_uninstall_requested(
+        self, message: AppPageWidget.UninstallRequested
+    ) -> None:
+        self.run_appstream_uninstall(message.script_info)
+
     async def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id != "search-input":
             return
@@ -304,6 +323,12 @@ class HomeScreen(
                 name="search_filter",
             ),
         )
+
+    @on(AppPageWidget.RevertRequested)
+    def _on_app_page_revert_requested(
+        self, message: AppPageWidget.RevertRequested
+    ) -> None:
+        self.run_appstream_snap_revert(message.script_info)
 
     def _execute_search_worker(self, query: str) -> None:
         # If cache is still warming on first keystroke, this ensures it finishes
