@@ -11,6 +11,7 @@ import time
 from . import (
     action_registry,
     appstream_cache,
+    homebrew_catalog,
     appstream_parser,
     aur_cache,
     appstream_queue,
@@ -35,7 +36,8 @@ from . import (
     uri_parser,
     git_scripts_manager,
     gtk_dialogs,
-    gui_rs
+    gui_rs,
+    package_view
 )
 from .gtk_common import Gdk, GLib, Gtk, GdkPixbuf
 from gi.repository import Gio
@@ -64,7 +66,7 @@ class AppWindow(
         self.translations = translations
 
         self.set_title("LinuxToys")
-        self._default_window_size = (920, 630)
+        self._default_window_size = self._calculate_default_window_size()
         self._last_normal_window_size = self._default_window_size
         self.set_default_size(*self._default_window_size)
         # self.set_resizable(False) ## Desabilita o redimensionamento da janela
@@ -85,6 +87,7 @@ class AppWindow(
         self._installed_packages_refresh_started = False
         self._installed_packages_refresh_pending = False
         self._appstream_runner = appstream_runner.AppStreamRunner(self)
+        self._package_view_prev = None
 
         # Initialize search functionality with cache
         self.script_cache = search_helper.ScriptCache()
@@ -368,6 +371,9 @@ class AppWindow(
         # watermark rendering can complete behind the startup roller, but do not let
         # the unfinished menu flash on screen.
         self.categories_view.set_opacity(0.0)
+        # Opacity only changes painting; disable input and hover handling while
+        # the invisible menu remains allocated behind the startup overlay.
+        self.categories_view.set_sensitive(False)
 
         # The parser-backed menu is populated asynchronously. Keep the already-open
         # window visually responsive while the first usable category snapshot is
@@ -490,6 +496,7 @@ class AppWindow(
 
         # Initialize drag-and-drop but don't enable it by default
         self._setup_drag_and_drop()
+        self._setup_package_drag_and_drop()
 
         self._script_running = False
 
@@ -502,6 +509,11 @@ class AppWindow(
         GLib.idle_add(self._refresh_installed_packages_async)
         GLib.idle_add(self._show_ostree_package_deployment_info_on_startup)
         GLib.idle_add(self._check_updates)
+        self._homebrew_source_fingerprint = homebrew_catalog.availability_fingerprint()
+        self._homebrew_refresh_running = False
+        self._homebrew_refresh_pending = False
+        self._homebrew_watch_id = GLib.timeout_add_seconds(3, self._check_homebrew_source)
+        self.connect("destroy", self._stop_homebrew_watch)
         GLib.idle_add(self._start_file_watcher)
         GLib.idle_add(self._check_deepin_immutability_on_startup)
         GLib.idle_add(self._start_startup_recommendation_check)
@@ -584,6 +596,9 @@ class AppWindow(
             if not self._command_succeeds(["pacman", "-Slq", "multilib"]):
                 recommendations.append("multilib")
 
+        if keys.intersection({"steamos", "gnomeos", "dakota", "kde-linux"}) and not homebrew_catalog.enabled():
+            recommendations.append("brew")
+
         return recommendations
 
     def _start_startup_recommendation_check(self):
@@ -663,7 +678,126 @@ class AppWindow(
             return True
         return self._start_appstream_cache()
 
-    def _start_appstream_cache(self):
+    def _activate_homebrew_category(self, widget, event):
+        if not homebrew_catalog.enabled():
+            self._check_homebrew_source()
+            return
+        source = appstream_cache.get_state().get("sources", {}).get("homebrew", {})
+        if (source.get("complete") and homebrew_catalog.binary_snapshot_available()
+                and source.get("fingerprint") == homebrew_catalog.fingerprint()):
+            # Browse the already-published runtime generation immediately.
+            # Refresh/validation stays off GTK and does not gate navigation.
+            self._open_aur_category_view(self._homebrew_category_info(), loading=False)
+            return
+        category_info = self._homebrew_category_info()
+        self._open_aur_category_view(category_info, loading=True)
+        page = self.scripts_view
+        flowbox = self.scripts_flowbox
+        self._refresh_homebrew_catalog()
+
+        def finish_loading():
+            if self.main_stack.get_visible_child() is not page:
+                return False
+            if self._homebrew_refresh_running or self._homebrew_refresh_pending:
+                return True
+            page._linuxtoys_aur_spinner.stop()
+            page._linuxtoys_aur_spinner.hide()
+            page._linuxtoys_category_content.set_sensitive(True)
+            state = appstream_cache.get_state().get("sources", {}).get("homebrew", {})
+            if (state.get("complete") and homebrew_catalog.enabled()
+                    and self._homebrew_refresh_result.get("success")):
+                self._load_scripts_into_flowbox(flowbox, category_info, defer_initial=True)
+            else:
+                gtk_dialogs.run_message_dialog(
+                    self, title="Homebrew",
+                    secondary_text=self.translations.get(
+                        "homebrew_catalog_unavailable", "Homebrew metadata is unavailable. Try again later."),
+                    message_type=Gtk.MessageType.ERROR,
+                    buttons=[("OK", Gtk.ResponseType.OK)],
+                    default_response=Gtk.ResponseType.OK,
+                )
+            return False
+
+        GLib.timeout_add(100, finish_loading)
+
+    def _homebrew_category_info(self):
+        return {
+            "name": "Homebrew",
+            "description": self.translations.get("homebrew_category_desc", "Packages from Homebrew."),
+            "icon": "brew.png", "path": "homebrew://catalog", "type": "category",
+            "is_script": False, "is_subcategory": False, "is_homebrew_category": True,
+        }
+
+    def _stop_homebrew_watch(self, _window):
+        if self._homebrew_watch_id is not None:
+            GLib.source_remove(self._homebrew_watch_id)
+            self._homebrew_watch_id = None
+
+    def _check_homebrew_source(self):
+        """Observe installer/remover signals and externally changed Brew presence."""
+        if not self._categories_startup_transition_complete:
+            return True
+        fingerprint = homebrew_catalog.availability_fingerprint()
+        if fingerprint == self._homebrew_source_fingerprint:
+            return True
+        self._homebrew_source_fingerprint = fingerprint
+        self._homebrew_refresh_pending = True
+        self._discard_retained_category_views()
+        self.load_categories()
+        if not homebrew_catalog.enabled() and (self.current_category_info or {}).get("is_homebrew_category"):
+            self.show_categories_view()
+        if homebrew_catalog.enabled():
+            self._refresh_homebrew_catalog()
+        else:
+            self._homebrew_refresh_pending = False
+            self._apply_appstream_catalog()
+        return True
+
+    def _refresh_homebrew_catalog(self):
+        if self._homebrew_refresh_running or not homebrew_catalog.enabled():
+            return
+        self._homebrew_refresh_pending = False
+        self._homebrew_refresh_running = True
+
+        def worker():
+            try:
+                result = appstream_cache.refresh_homebrew_cache()
+                if result.get("success"):
+                    if result.get("changed"):
+                        appstream_parser.prepare_runtime_cache()
+                    # Warm the binary runtime/category index off GTK, even when
+                    # the published source is unchanged. No entries are decoded.
+                    appstream_parser.get_homebrew_entries()
+            except Exception as error:
+                result = {"success": False, "error": str(error)}
+            GLib.idle_add(finish, result)
+
+        def finish(result):
+            self._homebrew_refresh_result = result
+            self._homebrew_refresh_running = False
+            current = homebrew_catalog.availability_fingerprint()
+            if not homebrew_catalog.enabled():
+                self._homebrew_refresh_pending = False
+            elif current != self._homebrew_source_fingerprint:
+                self._homebrew_refresh_pending = True
+            self._homebrew_source_fingerprint = current
+            if result.get("success") and result.get("changed"):
+                self._apply_appstream_catalog()
+                self._refresh_installed_packages_async(force=True)
+            if self._homebrew_refresh_pending:
+                self._refresh_homebrew_catalog()
+            return False
+
+        threading.Thread(target=worker, daemon=True, name="linuxtoys-homebrew-source").start()
+
+    def _start_homebrew_after_startup(self):
+        """Keep optional-source work outside the initial GTK transition."""
+        if not self._categories_startup_transition_complete:
+            return True
+        self._refresh_homebrew_catalog()
+        return False
+
+    def _start_appstream_cache(self, *, force=False):
         """Refresh AppStream metadata on its background worker."""
         if self._appstream_cache_started:
             return False
@@ -675,7 +809,11 @@ class AppWindow(
 
         def worker():
             initial_build = self._appstream_initial_build_pending
-            result = appstream_cache.refresh_cache(status_callback=report_state)
+            result = appstream_cache.refresh_cache(
+                force=force,
+                status_callback=report_state,
+                starter=initial_build,
+            )
             if not result.get("success"):
                 logger.warning(
                     "AppStream catalog refresh failed: %s",
@@ -705,9 +843,12 @@ class AppWindow(
                     self._finish_initial_appstream_build,
                     changed,
                     prepared,
+                    bool(result.get("starter")),
                 )
             elif changed:
                 GLib.idle_add(self._apply_appstream_catalog)
+            if not initial_build and homebrew_catalog.enabled():
+                GLib.timeout_add(250, self._start_homebrew_after_startup)
 
         threading.Thread(
             target=worker,
@@ -716,9 +857,23 @@ class AppWindow(
         ).start()
         return False
 
-    def _finish_initial_appstream_build(self, catalog_changed, prepared):
+    def _start_appstream_enrichment_after_startup(self):
+        """Keep the starter snapshot until one complete enrichment is ready."""
+        if not self._categories_startup_transition_complete:
+            return True
+        self._appstream_cache_started = False
+        self._start_appstream_cache(force=True)
+        return False
+
+    def _finish_initial_appstream_build(self, catalog_changed, prepared, starter=False):
         """Release first-run startup after AppStream catalog/pickle preparation."""
         self._appstream_initial_build_pending = False
+        if homebrew_catalog.enabled():
+            GLib.timeout_add(250, self._start_homebrew_after_startup)
+        if starter:
+            # Wait for the starter's parser/GTK handoff before allowing the full
+            # generation to replace its on-disk/runtime caches.
+            GLib.timeout_add(250, self._start_appstream_enrichment_after_startup)
         if hasattr(self, "categories_loading_label"):
             self.categories_loading_label.hide()
 
@@ -777,14 +932,6 @@ class AppWindow(
         """
 
         category_cache = self.category_cache
-        language_debug = bool(getattr(self, "_language_transition_active", False))
-        if language_debug:
-            self._language_debug(
-                "runtime cache: generation created",
-                catalog_refresh=catalog_refresh,
-                category_cache_id=id(category_cache),
-                script_cache_id=id(self.script_cache),
-            )
         script_cache = self.script_cache
         translations = self.translations
         search_engine = self.search_engine
@@ -809,7 +956,8 @@ class AppWindow(
 
             def add_items(items):
                 for item in items or ():
-                    if not item.get("is_script") or item.get("is_create_script"):
+                    if (not item.get("is_script") or item.get("is_create_script")
+                            or item.get("appstream_source") == "homebrew"):
                         continue
                     key = item.get("path") or (
                         item.get("name", ""),
@@ -891,20 +1039,9 @@ class AppWindow(
             schedule_git_sync()
 
         def publish_full_featured(featured):
-            if language_debug:
-                self._language_debug(
-                    "runtime cache: publish_full_featured entered",
-                    featured=len(featured),
-                    generation_current=self.category_cache is category_cache,
-                )
             if self.category_cache is not category_cache:
                 return False
             self.all_scripts = featured
-            if language_debug:
-                self._language_debug(
-                    "runtime cache: all_scripts published",
-                    count=len(featured),
-                )
             self._invalidate_featured_eligibility_cache()
             if (
                 self.should_start_random_timer
@@ -916,15 +1053,6 @@ class AppWindow(
 
         def publish_completed_runtime(prepared_search_query="", prepared_search_results=None):
             """Refresh only the currently visible secondary view after cache swap."""
-            if language_debug:
-                self._language_debug(
-                    "runtime cache: publish_completed_runtime entered",
-                    generation_current=(
-                        self.category_cache is category_cache
-                        and self.script_cache is script_cache
-                    ),
-                    visible=self.main_stack.get_visible_child_name(),
-                )
             if self.category_cache is not category_cache or self.script_cache is not script_cache:
                 return False
 
@@ -963,43 +1091,25 @@ class AppWindow(
 
         def populate_in_background():
             try:
-                if language_debug:
-                    self._language_debug("runtime cache worker: CategoryCache.populate begin")
                 category_cache.populate(
                     translations,
                     top_level_ready=top_level_ready,
                     top_level_ready_min_scripts=10,
                 )
-                if language_debug:
-                    self._language_debug(
-                        "runtime cache worker: CategoryCache.populate complete",
-                        categories=len(category_cache.get_categories()),
-                    )
 
                 # A scripts sync/language change may have swapped cache objects while
                 # this worker was parsing the previous source. Never publish stale data.
                 if self.category_cache is not category_cache:
                     return
 
-                if language_debug:
-                    self._language_debug("runtime cache worker: collect full Featured begin")
                 full_featured = collect_featured(
                     category_cache.get_categories(),
                     category_cache.scripts_by_category,
                     include_appstream=True,
                 )
-                if language_debug:
-                    self._language_debug(
-                        "runtime cache worker: collect full Featured complete",
-                        count=len(full_featured),
-                    )
                 GLib.idle_add(publish_full_featured, full_featured)
 
-                if language_debug:
-                    self._language_debug("runtime cache worker: ScriptCache.populate begin")
                 script_cache.populate_from_category_cache(category_cache)
-                if language_debug:
-                    self._language_debug("runtime cache worker: ScriptCache.populate complete")
 
                 prepared_search_results = None
                 if language_search_query:
@@ -1008,8 +1118,6 @@ class AppWindow(
                     # Keep it off the main loop so Gtk.Spinner continues to animate.
                     prepared_search_results = search_engine.search(language_search_query)
 
-                if language_debug:
-                    self._language_debug("runtime cache worker: scheduling completed publication")
                 GLib.idle_add(
                     publish_completed_runtime,
                     language_search_query,
@@ -1017,11 +1125,6 @@ class AppWindow(
                 )
                 GLib.idle_add(self._refresh_installed_features_view)
             except Exception as e:
-                if language_debug:
-                    self._language_debug(
-                        "runtime cache worker: EXCEPTION",
-                        error=repr(e),
-                    )
                 print(f"Error populating runtime caches: {e}")
             finally:
                 # Do not suppress synchronization merely because one parser entry
@@ -1393,6 +1496,7 @@ class AppWindow(
         return False
 
     def _on_installed_packages_changed(self):
+        self._check_homebrew_source()
         # Observed AppStream state participates in ScriptCache and Featured eligibility.
         if self.script_cache.is_populated:
             self.script_cache.refresh_removable_cache()
@@ -1406,6 +1510,10 @@ class AppWindow(
         if app_page is not None and hasattr(app_page, "refresh_install_state"):
             app_page.refresh_install_state()
 
+        local_package_view = self.main_stack.get_child_by_name("package_view")
+        if local_package_view is not None and hasattr(local_package_view, "refresh_install_state"):
+            local_package_view.refresh_install_state()
+
         installed_view = self.main_stack.get_child_by_name("installed_features")
         if installed_view is not None and hasattr(installed_view, "refresh"):
             installed_view.refresh()
@@ -1414,6 +1522,7 @@ class AppWindow(
     def _appstream_registry_managed(self, info):
         registry_data = action_registry.parse_registry_file()
         candidates = (
+            str(info.get("registry_name", "") or "").strip(),
             str(info.get("appstream_id", "") or "").strip(),
             str(info.get("name", "") or "").strip(),
             str(info.get("appstream_canonical_name", "") or "").strip(),
@@ -1479,9 +1588,13 @@ class AppWindow(
             return "available"
 
         session_state = self._appstream_runner.status_for_appstream_id(appstream_id)
-        if session_state is not None:
+        if session_state is not None and (
+            info.get("appstream_source") != "homebrew" or session_state in ("queued", "removing")
+        ):
             return session_state
 
+        if info.get("appstream_source") == "homebrew":
+            return "installed" if installed_packages.match(info) is not None else "available"
         registry_data = action_registry.parse_registry_file()
         # appstream_id is the stable identity used by new background installs.
         # Keep display/canonical-name fallbacks for entries installed by older builds.
@@ -1495,6 +1608,207 @@ class AppWindow(
         if installed_packages.match(info) is not None:
             return "installed"
         return "available"
+
+    @staticmethod
+    def _local_package_extension(path):
+        name = os.path.basename(os.fspath(path)).lower()
+        if name.endswith(".pkg.tar.zst") or name.endswith(".pkg.tar.xz") or name.endswith(".pkg.tar.gz") or name.endswith(".pkg.tar.lz4"):
+            return "arch"
+        for suffix, kind in (
+            (".deb", "deb"), (".rpm", "rpm"), (".pacman", "arch"),
+            (".eopkg", "eopkg"), (".flatpakref", "flatpakref"),
+            (".flatpak", "flatpak"), (".snap", "snap"), (".appimage", "appimage"),
+        ):
+            if name.endswith(suffix):
+                return kind
+        return None
+
+    def _local_package_supported_on_host(self, kind):
+        if kind == "snap":
+            return not {"steamos", "dakota", "gnomeos", "kde-linux"}.intersection(compat.get_system_compat_keys())
+        if kind in ("flatpak", "flatpakref"):
+            return "systemd" in compat.get_system_compat_keys()
+        if kind == "appimage":
+            return True
+        keys = compat.get_system_compat_keys()
+        if kind == "deb":
+            return bool(keys & {"debian", "ubuntu"})
+        if kind == "rpm":
+            return bool(keys & {"fedora", "rhel", "suse", "ostree"})
+        if kind == "arch":
+            return bool(keys & {"arch", "cachy", "manjaro"})
+        if kind == "eopkg":
+            return "solus" in keys
+        return False
+
+    def _create_package_loading_view(self):
+        """Create the same centered roller geometry used by startup loading."""
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.set_halign(Gtk.Align.CENTER)
+        box.set_valign(Gtk.Align.CENTER)
+        box.set_hexpand(True)
+        box.set_vexpand(True)
+
+        spinner = Gtk.Spinner()
+        spinner.set_size_request(64, 64)
+        spinner.start()
+        box.pack_start(spinner, False, False, 0)
+        # Keep a strong reference so the spinner can be stopped explicitly when
+        # inspection finishes or the user navigates away.
+        box._package_loading_spinner = spinner
+        return box
+
+    def handle_package_open_request(self, package_path):
+        """Open a local package without blocking GTK while its metadata is inspected."""
+        package_path = os.path.realpath(os.fspath(package_path))
+        kind = self._local_package_extension(package_path)
+        if not kind or not os.path.isfile(package_path) or not self._local_package_supported_on_host(kind):
+            return False
+
+        current_name = self.main_stack.get_visible_child_name()
+        if current_name not in ("package_view", "package_loading"):
+            self._package_view_prev = {
+                "child": self.main_stack.get_visible_child(),
+                "header_visible": self.header_widget.get_visible(),
+                "title": self.header_bar.props.title,
+                "footer_revealed": self.reveal.get_reveal_child(),
+                "back_visible": self.back_button.get_visible(),
+            }
+
+        # Supersede any older inspection. Workers are intentionally not killed;
+        # their result is simply discarded if a newer request/back navigation wins.
+        request_id = getattr(self, "_package_inspection_request_id", 0) + 1
+        self._package_inspection_request_id = request_id
+
+        for child_name in ("package_view", "package_loading"):
+            old = self.main_stack.get_child_by_name(child_name)
+            if old is not None:
+                spinner = getattr(old, "_package_loading_spinner", None)
+                if spinner is not None:
+                    spinner.stop()
+                gui_rs.stack_remove_child(self.main_stack, old, destroy=True)
+
+        loading = self._create_package_loading_view()
+        gui_rs.stack_attach_child(self.main_stack, loading, "package_loading", make_visible=False)
+        self.main_stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
+        self.main_stack.set_visible_child(loading)
+
+        # Match Terminal View: Package View owns this navigation flow, so prevent
+        # header-menu actions from mutating global UI/application state until the
+        # package/loading view has been closed.
+        self._set_header_actions_sensitive(False)
+
+        self.header_widget.hide()
+        self.reveal.set_reveal_child(False)
+        self.back_button.show()
+        title = self.translations.get("package_view_title", "Install package")
+        self.header_bar.props.title = f"LinuxToys: {title}"
+        self.present()
+
+        def worker():
+            try:
+                metadata = gui_rs.inspect_local_package(package_path) or {}
+            except Exception as exc:
+                logger.warning("Could not inspect local package %s: %s", package_path, exc)
+                metadata = {}
+            metadata.setdefault("kind", kind)
+            metadata.setdefault("name", os.path.basename(package_path))
+            GLib.idle_add(
+                self._finish_package_inspection,
+                request_id,
+                package_path,
+                metadata,
+            )
+
+        threading.Thread(
+            target=worker,
+            daemon=True,
+            name="linuxtoys-package-inspection",
+        ).start()
+        return True
+
+    def _finish_package_inspection(self, request_id, package_path, metadata):
+        """Publish worker metadata and cross-fade the roller into Package View."""
+        if request_id != getattr(self, "_package_inspection_request_id", 0):
+            return False
+
+        loading = self.main_stack.get_child_by_name("package_loading")
+        if loading is None or self.main_stack.get_visible_child_name() != "package_loading":
+            return False
+
+        spinner = getattr(loading, "_package_loading_spinner", None)
+        if spinner is not None:
+            spinner.stop()
+
+        old_package = self.main_stack.get_child_by_name("package_view")
+        if old_package is not None:
+            gui_rs.stack_remove_child(self.main_stack, old_package, destroy=True)
+
+        view = package_view.PackageView(self, package_path, metadata)
+        gui_rs.stack_attach_child(self.main_stack, view, "package_view", make_visible=False)
+        self.main_stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        self.main_stack.set_visible_child(view)
+        gui_rs.stack_remove_child_after_transition(
+            self.main_stack, loading, destroy=True
+        )
+        return False
+
+    def enqueue_local_package(self, package_path, metadata):
+        return self._appstream_runner.enqueue_local_package(package_path, metadata)
+
+    def close_package_view(self, crossfade=False):
+        visible_name = self.main_stack.get_visible_child_name()
+        child = self.main_stack.get_child_by_name(visible_name) if visible_name in ("package_view", "package_loading") else None
+        prev = self._package_view_prev
+        if child is None:
+            return False
+
+        # Package View uses the same header-menu lock as Terminal View. Restore it
+        # before returning to the exact view that opened the package.
+        self._set_header_actions_sensitive(True)
+
+        # Invalidate an in-flight inspector before restoring the previous view.
+        self._package_inspection_request_id = getattr(self, "_package_inspection_request_id", 0) + 1
+        spinner = getattr(child, "_package_loading_spinner", None)
+        if spinner is not None:
+            spinner.stop()
+
+        if prev and prev.get("child") is not None and prev["child"].get_parent() is self.main_stack:
+            transition = Gtk.StackTransitionType.CROSSFADE if crossfade else Gtk.StackTransitionType.SLIDE_LEFT_RIGHT
+            self.main_stack.set_transition_type(transition)
+            self.main_stack.set_visible_child(prev["child"])
+            self.header_bar.props.title = prev.get("title") or "LinuxToys"
+            if prev.get("header_visible"):
+                self.header_widget.show()
+            else:
+                self.header_widget.hide()
+            self.reveal.set_reveal_child(bool(prev.get("footer_revealed")))
+            if prev.get("back_visible"):
+                self.back_button.show()
+            else:
+                self.back_button.hide()
+        else:
+            self.show_categories_view()
+
+        self._package_view_prev = None
+        gui_rs.stack_remove_child_after_transition(self.main_stack, child, destroy=True)
+        return False
+
+    def _setup_package_drag_and_drop(self):
+        target = Gtk.TargetEntry.new("text/uri-list", 0, 0)
+        self.main_stack.drag_dest_set(Gtk.DestDefaults.ALL, [target], Gdk.DragAction.COPY)
+        self.main_stack.connect("drag-data-received", self._on_package_drag_data_received)
+
+    def _on_package_drag_data_received(self, widget, context, x, y, selection, info, event_time):
+        uris = selection.get_uris() or []
+        accepted = False
+        for uri in uris:
+            file = Gio.File.new_for_uri(uri)
+            path = file.get_path()
+            if path and self.handle_package_open_request(path):
+                accepted = True
+                break
+        Gtk.drag_finish(context, accepted, False, event_time)
 
     def _on_appstream_queue_changed(self):
         """Refresh the session queue button and the queue view, if visible."""
@@ -2099,6 +2413,7 @@ class AppWindow(
         # its GTK work cannot contend with the opacity crossfade. Release it only
         # after the final crossfade frame has been committed.
         self._categories_startup_transition_complete = True
+        self.categories_view.set_sensitive(True)
         if self.should_start_random_timer and self.all_scripts:
             GLib.idle_add(self._deferred_start_random_scripts_refresh_timer)
         return False
@@ -2180,13 +2495,7 @@ class AppWindow(
         therefore never route the persistent root FlowBox through _render_categories().
         Match existing cards by their stable path and update only translated metadata.
         """
-        self._language_debug("root translation rebind: begin")
         categories = parser.get_categories(self.translations)
-        self._language_debug(
-            "root translation rebind: parser categories loaded",
-            categories=len(categories),
-            existing_children=len(self.categories_flowbox.get_children()),
-        )
         specials_category = {
             "name": self.translations.get("specials", "Specials"),
             "description": self.translations.get(
@@ -2236,10 +2545,6 @@ class AppWindow(
             self._language_categories_allocation_complete = False
             self.categories_flowbox.queue_resize()
             self.categories_view.queue_resize()
-            self._language_debug(
-                "root translation rebind: allocation barrier armed",
-                expected_children=self._language_categories_expected_children,
-            )
 
 
     def _render_categories(self, categories):
@@ -2277,6 +2582,8 @@ class AppWindow(
             "is_linuxtoys_specials": True,
         }
         category_snapshot = [specials_category, *categories]
+        if homebrew_catalog.enabled():
+            category_snapshot.append(self._homebrew_category_info())
 
         # A language change only changes translated card metadata; the root category
         # structure and artwork normally remain identical. Rebind those native cards
@@ -2412,6 +2719,8 @@ class AppWindow(
     def _category_items_for_display(self, category_info):
         """Return the exact item list used by normal category browsing."""
         category_path = category_info["path"]
+        if category_info.get("is_homebrew_category"):
+            return appstream_parser.get_homebrew_entries()
         if category_info.get("is_aur_category"):
             # Keep AUR as a lazy Rust-backed sequence. Converting this to list()
             # materializes tens of thousands of Python dictionaries at once.
@@ -2457,7 +2766,7 @@ class AppWindow(
         # Available/Installed split would enumerate the complete repository and
         # defeat paged browsing. Individual AUR cards still refresh their normal
         # installed/removable state after transactions.
-        if category_info.get("is_aur_category"):
+        if category_info.get("is_aur_category") or category_info.get("is_homebrew_category"):
             return False
         if (
             category_info.get("is_linuxtoys_specials")
@@ -2553,7 +2862,9 @@ class AppWindow(
 
         scripts = self._category_items_for_display(category_info)
         category_tab = getattr(flowbox, "_linuxtoys_category_tab", None)
-        if category_tab in ("available", "installed"):
+        if category_info.get("is_homebrew_category") and category_tab == "installed":
+            scripts = []
+        elif category_tab in ("available", "installed") and not category_info.get("is_homebrew_category"):
             available, installed = self._partition_category_items(
                 category_info, scripts
             )
@@ -2664,7 +2975,8 @@ class AppWindow(
                 allow_drag=allow_drag,
             )
             if widgets is None:
-                return [add_card(info) for info in batch_infos]
+                fallback = [add_card(info) for info in batch_infos]
+                return fallback
 
             for widget, info in zip(widgets, batch_infos):
                 description = info.get("description", "")
@@ -2894,32 +3206,47 @@ class AppWindow(
                 return
             aur_cache.enable()
 
+        # Navigate immediately after consent so the pending download/build has
+        # a visible destination instead of leaving the category button inert.
+        self._open_aur_category_view(category_info, loading=True)
+        page = self.scripts_view
+        flowbox = self.scripts_flowbox
+
+        def finish_loading(error_message=None):
+            page._linuxtoys_aur_spinner.stop()
+            page._linuxtoys_aur_spinner.hide()
+            page._linuxtoys_category_content.set_sensitive(True)
+            # Back navigation or another category selection must never be undone
+            # by a late worker completion.
+            if self.main_stack.get_visible_child() is not page:
+                return False
+            if error_message is not None:
+                gtk_dialogs.run_message_dialog(
+                    self,
+                    title=self.translations.get("aur_refresh_failed_title", "AUR metadata unavailable"),
+                    secondary_text=error_message,
+                    message_type=Gtk.MessageType.ERROR,
+                    buttons=[("OK", Gtk.ResponseType.OK)],
+                    default_response=Gtk.ResponseType.OK,
+                )
+            else:
+                self._load_scripts_into_flowbox(flowbox, category_info, defer_initial=True)
+            return False
+
         def worker():
             try:
                 # The refresh publishes catalog.bin atomically. Do not materialize
                 # the AUR here: category browsing is paged directly from Rust.
                 aur_cache.refresh_if_stale()
+                # Prewarm the lazy catalog off GTK too: loading/filtering the
+                # binary and querying pacman's repositories can be expensive.
+                aur_cache.browse_entries()
             except Exception as error:
                 logger.warning("AUR catalog refresh failed: %s", error)
-                message = str(error)
-
-                def show_error():
-                    gtk_dialogs.run_message_dialog(
-                        self,
-                        title=self.translations.get(
-                            "aur_refresh_failed_title", "AUR metadata unavailable"
-                        ),
-                        secondary_text=message,
-                        message_type=Gtk.MessageType.ERROR,
-                        buttons=[("OK", Gtk.ResponseType.OK)],
-                        default_response=Gtk.ResponseType.OK,
-                    )
-                    return False
-
-                GLib.idle_add(show_error)
+                GLib.idle_add(finish_loading, str(error))
                 return
 
-            GLib.idle_add(self._open_aur_category_view, category_info)
+            GLib.idle_add(finish_loading)
 
         threading.Thread(
             target=worker,
@@ -2927,7 +3254,7 @@ class AppWindow(
             name="linuxtoys-aur-enable",
         ).start()
 
-    def _open_aur_category_view(self, category_info):
+    def _open_aur_category_view(self, category_info, *, loading=False):
         """Open AUR through the same retained/deferred category-view machinery."""
         self._retain_current_category_view()
 
@@ -2947,7 +3274,20 @@ class AppWindow(
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         category_header = header.create_header(self.translations, category_info)
         page.pack_start(category_header, False, False, 8)
-        page.pack_start(content_view, True, True, 0)
+        if loading:
+            overlay = Gtk.Overlay()
+            overlay.add(content_view)
+            spinner = Gtk.Spinner()
+            spinner.set_size_request(64, 64)
+            spinner.set_halign(Gtk.Align.CENTER)
+            spinner.set_valign(Gtk.Align.CENTER)
+            spinner.set_no_show_all(True)
+            overlay.add_overlay(spinner)
+            page.pack_start(overlay, True, True, 0)
+            page._linuxtoys_aur_spinner = spinner
+            content_view.set_sensitive(False)
+        else:
+            page.pack_start(content_view, True, True, 0)
 
         page._linuxtoys_category_header = category_header
         page._linuxtoys_category_content = content_view
@@ -2962,6 +3302,11 @@ class AppWindow(
         self.scripts_flowbox = new_flowbox
         self.scripts_view = page
         self.show_scripts_view(category_info)
+
+        if loading:
+            spinner.show()
+            spinner.start()
+            return False
 
         # Match normal category navigation: let the slide start with an attached
         # empty destination, then lazily materialize the first viewport.
@@ -3138,7 +3483,15 @@ class AppWindow(
 
     def _run_single_script_install(self, info, close_app_page=False):
         """Run the normal single-entry confirmation and terminal-view flow."""
-        deps = asyncio.run(self._process_needed_scripts([info]))
+        if info.get("appstream_source") == "homebrew":
+            # Brew is already required for exposing the source; formula dependencies
+            # are handled by Brew, and overlay dependencies by the queued runner.
+            if not homebrew_catalog.enabled():
+                self._check_homebrew_source()
+                return
+            deps = [info]
+        else:
+            deps = asyncio.run(self._process_needed_scripts([info]))
         if not deps:
             return
 
@@ -3355,11 +3708,27 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
             cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "linuxtoys")
         return os.path.join(cache_dir, "window-state.json")
 
+    def _calculate_default_window_size(self):
+        """Choose an initial size in GTK logical pixels, keeping desktop margins."""
+        workarea = self._primary_monitor_workarea()
+        if workarea is None or min(workarea) <= 0:
+            return (920, 630)
+        available_width, available_height = workarea
+        width = min(1440, max(920, round(available_width * 0.72)))
+        height = min(960, max(630, round(available_height * 0.78)))
+        # Smaller displays must take precedence over the preferred minimum.
+        return (
+            max(1, min(width, int(available_width * 0.90))),
+            max(1, min(height, int(available_height * 0.90))),
+        )
+
     def _primary_monitor_workarea(self):
         """Return the primary monitor's usable (non-panel) width and height."""
         display = Gdk.Display.get_default()
         if display is not None and hasattr(display, "get_primary_monitor"):
             monitor = display.get_primary_monitor()
+            if monitor is None and display.get_n_monitors() > 0:
+                monitor = display.get_monitor(0)
             if monitor is not None:
                 area = monitor.get_workarea()
                 return area.width, area.height
@@ -3661,56 +4030,6 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
 
         self.get_application().quit()
 
-    def _language_debug(self, event, **state):
-        """Emit focused language-transition diagnostics without changing behavior."""
-        try:
-            elapsed = ""
-            started = getattr(self, "_language_debug_started_us", None)
-            if started is not None:
-                elapsed = f" +{(GLib.get_monotonic_time() - started) / 1000.0:.1f}ms"
-            thread_name = threading.current_thread().name
-            details = " ".join(f"{key}={value!r}" for key, value in state.items())
-            print(
-                f"[LANGDBG]{elapsed} [{thread_name}] {event}"
-                + (f" | {details}" if details else ""),
-                flush=True,
-            )
-        except Exception as exc:
-            print(f"[LANGDBG] debug logging failed: {exc}", flush=True)
-
-    def _language_debug_wait_state(self, blocker, **extra):
-        """Log a wait blocker only when it changes, avoiding per-frame spam."""
-        state = (
-            blocker,
-            self.main_stack.get_visible_child_name(),
-            getattr(self, "_language_transition_phase", None),
-            getattr(self, "_language_categories_render_pending", None),
-            getattr(self, "_language_categories_waiting_for_allocation", None),
-            getattr(self, "_language_categories_allocation_complete", None),
-            len(getattr(self, "all_scripts", ()) or ()),
-            getattr(self, "_language_featured_refresh_started", None),
-            getattr(self, "_language_featured_allocation_complete", None),
-            getattr(self, "_language_search_refresh_pending", None),
-            getattr(self, "_language_visible_allocation_complete", None),
-        )
-        if state == getattr(self, "_language_debug_last_wait_state", None):
-            return
-        self._language_debug_last_wait_state = state
-        self._language_debug(
-            f"WAIT: {blocker}",
-            visible=state[1],
-            phase=state[2],
-            categories_render_pending=state[3],
-            categories_waiting_allocation=state[4],
-            categories_allocation_complete=state[5],
-            all_scripts=state[6],
-            featured_refresh_started=state[7],
-            featured_allocation_complete=state[8],
-            search_refresh_pending=state[9],
-            visible_allocation_complete=state[10],
-            **extra,
-        )
-
     def _on_language_visible_size_allocate(self, widget, allocation):
         """Commit a translated non-category view only after a fresh allocation."""
         if not getattr(self, "_language_transition_active", False):
@@ -3725,12 +4044,6 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
                 pass
             self._language_visible_allocate_handler = None
         self._language_visible_allocation_complete = True
-        self._language_debug(
-            "visible allocation complete",
-            widget=type(widget).__name__,
-            width=allocation.width,
-            height=allocation.height,
-        )
 
     def _arm_language_visible_allocation_barrier(self, widget):
         """Require an allocation produced by the translated rebuild, not an old one."""
@@ -3746,10 +4059,6 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
         self._language_visible_allocate_handler = widget.connect(
             "size-allocate", self._on_language_visible_size_allocate
         )
-        self._language_debug(
-            "armed visible allocation barrier",
-            widget=type(widget).__name__,
-        )
         widget.queue_resize()
 
     def _on_language_featured_size_allocate(self, grid, allocation):
@@ -3763,12 +4072,6 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
             grid.disconnect(handler_id)
             self._language_featured_allocate_handler = None
         self._language_featured_allocation_complete = True
-        self._language_debug(
-            "featured allocation complete",
-            width=allocation.width,
-            height=allocation.height,
-            children=len(grid.get_children()),
-        )
 
     def _show_language_search_loading(self):
         """Replace the old Search snapshot with a centered roller while translating."""
@@ -3829,22 +4132,9 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
     def on_language_changed(self, new_language_code):
         """Cross-fade a complete language refresh instead of exposing rebuild work."""
         if getattr(self, "_language_transition_active", False):
-            self._language_debug(
-                "language change requested while transition is already active",
-                requested=new_language_code,
-                current_target=getattr(self, "_language_transition_target", None),
-                phase=getattr(self, "_language_transition_phase", None),
-            )
             self._language_transition_target = new_language_code
             return
 
-        self._language_debug_started_us = GLib.get_monotonic_time()
-        self._language_debug_last_wait_state = None
-        self._language_debug(
-            "language change requested",
-            requested=new_language_code,
-            visible=self.main_stack.get_visible_child_name(),
-        )
         self._language_transition_active = True
         self._language_transition_target = new_language_code
         self._language_transition_search_query = (
@@ -3919,24 +4209,17 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
             return True
 
         self._language_transition_source = None
-        self._language_debug("fade phase complete", phase=phase)
         if phase == "out":
             if not search_transition_owned:
                 self.main_stack.set_opacity(0.0)
             self._language_transition_phase = "waiting"
-            self._language_debug(
-                "entering hidden language rebuild",
-                target=self._language_transition_target,
-            )
             self._apply_language_change_hidden(self._language_transition_target)
-            self._language_debug("hidden language rebuild scheduled; arming readiness waiter")
             GLib.idle_add(self._wait_for_language_render_ready)
         else:
             self.main_stack.set_opacity(1.0)
             self._language_transition_phase = None
             self._language_transition_started_us = None
             self._language_transition_active = False
-            self._language_debug("language transition committed")
             self._language_transition_target = None
             self._language_featured_refresh_started = False
 
@@ -3969,9 +4252,7 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
         """Apply translations while main-stack content is fully transparent."""
         from . import lang_utils
 
-        self._language_debug("hidden apply: loading translations", target=new_language_code)
         self.translations = lang_utils.load_translations(new_language_code)
-        self._language_debug("hidden apply: translations loaded")
         self.search_engine.translations = self.translations
         self.script_cache = search_helper.ScriptCache()
         self.category_cache = search_helper.CategoryCache()
@@ -3988,9 +4269,7 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
         # The entire stack is already transparent. Reset Featured without
         # collapsing its revealers, otherwise the SLIDE_DOWN animation changes the
         # menu requisition while translated category geometry is being measured.
-        self._language_debug("hidden apply: preparing Featured rebuild")
         self._prepare_featured_language_rebuild()
-        self._language_debug("hidden apply: Featured prepared")
 
         # Establish every visible-view readiness flag before the replacement cache
         # worker is allowed to publish.  Search in particular sets
@@ -3998,20 +4277,11 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
         # publish_completed_runtime() to clear the flag and arm its allocation
         # barrier, only for this refresh to set the flag back to True afterward.
         # That left the language transaction permanently stuck in the waiting phase.
-        self._language_debug("hidden apply: refreshing translated GTK state")
         self._refresh_ui_with_new_translations()
-        self._language_debug(
-            "hidden apply: translated GTK state refreshed",
-            categories_render_pending=self._language_categories_render_pending,
-            categories_waiting_allocation=self._language_categories_waiting_for_allocation,
-            categories_allocation_complete=self._language_categories_allocation_complete,
-        )
         # The root FlowBox has already been translated in place above. Rebuild only
         # the backing parser/search/Featured data; top_level_ready must not call
         # _render_categories() for a mere locale change.
-        self._language_debug("hidden apply: starting replacement runtime-cache worker")
         self._populate_runtime_caches(catalog_refresh=True)
-        self._language_debug("hidden apply: replacement runtime-cache worker started")
 
     def _wait_for_language_render_ready(self):
         """Reveal only after structural and native allocation-dependent work is done."""
@@ -4021,16 +4291,10 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
         visible_name = self.main_stack.get_visible_child_name()
         root = self.main_stack.get_visible_child()
         if root is None:
-            self._language_debug_wait_state("visible root is None")
             return True
 
         allocation = root.get_allocation()
         if allocation.width <= 1 or allocation.height <= 1:
-            self._language_debug_wait_state(
-                "visible root allocation",
-                width=allocation.width,
-                height=allocation.height,
-            )
             root.queue_resize()
             return True
 
@@ -4039,11 +4303,9 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
         # guaranteed to receive a fresh allocation, so allowing their cooperative
         # rebuild to block Search/utility/app-page transitions can deadlock forever.
         if visible_name == "categories" and self._language_categories_render_pending:
-            self._language_debug_wait_state("categories render pending")
             return True
 
         if visible_name == "search" and self._language_search_refresh_pending:
-            self._language_debug_wait_state("search refresh pending")
             return True
 
         if (
@@ -4059,21 +4321,12 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
             # allocations are deliberately insufficient here.
             if not self._language_categories_allocation_complete:
                 allocation = self.categories_flowbox.get_allocation()
-                self._language_debug_wait_state(
-                    "categories allocation incomplete",
-                    width=allocation.width,
-                    height=allocation.height,
-                    children=len(self.categories_flowbox.get_children()),
-                    expected=getattr(self, "_language_categories_expected_children", 0),
-                )
                 self.categories_flowbox.queue_resize()
                 self.categories_view.queue_resize()
                 return True
             if not self.all_scripts:
-                self._language_debug_wait_state("all_scripts is empty")
                 return True
             if not self._language_featured_refresh_started:
-                self._language_debug("readiness: starting Featured language refresh")
                 self._language_featured_refresh_started = True
                 self._language_featured_allocation_complete = False
                 self._language_featured_allocate_handler = (
@@ -4101,10 +4354,6 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
                         self.random_scripts_flowbox.disconnect(handler_id)
                         self._language_featured_allocate_handler = None
                     self._language_featured_allocation_complete = True
-                    self._language_debug(
-                        "Featured intentionally absent: zero layout capacity; "
-                        "language barrier complete"
-                    )
                     return True
 
                 self.random_scripts_flowbox.queue_resize()
@@ -4118,16 +4367,10 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
                     and self._calculate_random_scripts_count() > 0
                 )
             ):
-                self._language_debug_wait_state(
-                    "featured not ready",
-                    children=len(featured_children),
-                    capacity=self._calculate_random_scripts_count(),
-                )
                 return True
 
         if visible_name != "categories":
             if not self._language_visible_allocation_complete:
-                self._language_debug_wait_state("visible allocation incomplete")
                 root.queue_resize()
                 return True
 
@@ -4135,7 +4378,6 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
             # screenshots, extension/body layout, and their adaptive Featured fill.
             if visible_name == "app_page" and hasattr(root, "language_render_ready"):
                 if not root.language_render_ready():
-                    self._language_debug_wait_state("app page language_render_ready is false")
                     root.queue_resize()
                     return True
 
@@ -4143,11 +4385,9 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
         # small batch per main-loop turn and do not reveal zero/stale allocations.
         gui_rs.flush_category_watermarks(root, 2)
         if gui_rs.has_pending_render_work(root):
-            self._language_debug_wait_state("Rust render work pending")
             root.queue_resize()
             return True
 
-        self._language_debug("all language readiness barriers passed; starting fade in")
         self._language_transition_phase = "in"
         self._language_transition_started_us = GLib.get_monotonic_time()
         self._language_transition_duration_ms = 180
@@ -4361,13 +4601,6 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
                         self._language_visible_allocate_handler = None
                     self._language_visible_allocate_widget = None
                     self._language_visible_allocation_complete = True
-                    self._language_debug(
-                        "category language refresh reused valid visible allocation",
-                        widget=type(category_view).__name__,
-                        width=allocation.width,
-                        height=allocation.height,
-                        visible=self.main_stack.get_visible_child_name(),
-                    )
 
         # Update footer if in checklist mode
         if (
@@ -4407,6 +4640,9 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
                 }
             )
             return refreshed
+
+        if self.current_category_info.get("is_homebrew_category"):
+            return self._homebrew_category_info() if homebrew_catalog.enabled() else None
 
         if (
             self.current_category_info.get("is_aur_category")

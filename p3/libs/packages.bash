@@ -1600,19 +1600,23 @@ pkg_appimage () {
     fi
 
     { is_ubuntu || is_debian; } && {
-        if [ "$VERSION_CODENAME" = "bookworm" ]; then
-            pkg_exists libfuse2
-            [[ ! ${#pkg_notfound[@]} -eq 0 ]] && {
-                pkg_install libfuse2  # workaround for debian 12
-            }
-        else
-            pkg_exists libfuse2
-            [[ ! ${#pkg_notfound[@]} -eq 0 ]] && {
-                                if ! apt-cache --no-all-versions show libfuse2t64 >/dev/null 2>&1; then # probably forky/testing
-                    sudo_ mkdir -p /etc/apt/preferences.d /etc/apt/sources.list.d # ensure directories exist
-                    prep_create "/etc/apt/sources.list.d/linuxtoys-trixie-fuse.list" "/etc/apt/preferences.d/linuxtoys-trixie-fuse"
-                    echo 'deb https://deb.debian.org/debian trixie main' | sudo_ tee /etc/apt/sources.list.d/linuxtoys-trixie-fuse.list >/dev/null
-                    sudo_ tee /etc/apt/preferences.d/linuxtoys-trixie-fuse >/dev/null <<'EOF'
+        # FUSE 2 changed package names across Debian/Ubuntu releases. Prefer the
+        # package exposed by the host repositories instead of keying off a codename.
+        if dpkg -s libfuse2t64 >/dev/null 2>&1 || dpkg -s libfuse2 >/dev/null 2>&1; then
+            :
+        elif apt-cache --no-all-versions show libfuse2t64 >/dev/null 2>&1; then
+            pkg_install libfuse2t64
+        elif apt-cache --no-all-versions show libfuse2 >/dev/null 2>&1; then
+            pkg_install libfuse2
+        elif is_debian; then
+            # Debian testing may temporarily lack a FUSE 2 compatibility package.
+            # Expose only Trixie's libfuse2t64 through a narrowly pinned source.
+            sudo_ mkdir -p /etc/apt/preferences.d /etc/apt/sources.list.d
+            prep_create "/etc/apt/sources.list.d/linuxtoys-trixie-fuse.list" \
+                        "/etc/apt/preferences.d/linuxtoys-trixie-fuse"
+            echo 'deb https://deb.debian.org/debian trixie main' | \
+                sudo_ tee /etc/apt/sources.list.d/linuxtoys-trixie-fuse.list >/dev/null
+            sudo_ tee /etc/apt/preferences.d/linuxtoys-trixie-fuse >/dev/null <<'EOF'
 Package: *
 Pin: release n=trixie
 Pin-Priority: -1
@@ -1621,9 +1625,10 @@ Package: libfuse2t64
 Pin: release n=trixie
 Pin-Priority: 990
 EOF
-                fi
-                pkg_install libfuse2t64;
-            }
+            sudo_ apt-get update || die "Failed to refresh APT repositories for FUSE 2 compatibility"
+            pkg_install libfuse2t64
+        else
+            die "No FUSE 2 compatibility package is available from this system's APT repositories"
         fi
     }
     { is_fedora || is_ostree || is_rhel; } && {
@@ -1805,4 +1810,95 @@ pkg_bun () {
             _append_transmap "bun $pkg"
         fi
     done
+}
+
+# Homebrew stays in the user's writable prefix, including on immutable hosts.
+_brew_executable () {
+    local candidate
+    local from_path
+    from_path=$(type -P brew) || from_path=""
+    for candidate in "$from_path" "${HOMEBREW_PREFIX:+$HOMEBREW_PREFIX/bin/brew}" \
+        /home/linuxbrew/.linuxbrew/bin/brew "$HOME/.linuxbrew/bin/brew"; do
+        if [[ -n "$candidate" && -f "$candidate" && -x "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+_brew_source_changed () {
+    local cache_dir="$HOME/.cache/linuxtoys/homebrew-catalog"
+    mkdir -p "$cache_dir" && touch "$cache_dir/source-changed"
+}
+
+_brew_formula_valid () {
+    [[ "$1" =~ ^[[:alnum:]][[:alnum:]+_.@-]*$ ]]
+}
+
+# Record only newly requested formulae; Brew owns their dependency resolution.
+pkg_brew () {
+    (( $# > 0 )) || return 0
+    local brew_bin pak status
+    if ! brew_bin=$(_brew_executable); then
+        call_script brew || return "$?"
+        brew_bin=$(_brew_executable) || die "Homebrew is not installed"
+    fi
+    for pak in "$@"; do
+        _brew_formula_valid "$pak" || die "Invalid Homebrew formula name: $pak"
+        if HOMEBREW_NO_AUTO_UPDATE=1 "$brew_bin" list --formula --versions "$pak" 2>/dev/null | grep -q .; then
+            echo "Homebrew formula $pak already installed, skipping."
+            continue
+        fi
+        runner_lock "package-transaction"
+        status=0
+        HOMEBREW_NO_ASK=1 "$brew_bin" install --formula "$pak" || status=$?
+        runner_unlock
+        # A failed command may nevertheless have installed the requested formula.
+        # Record it before failing so the standard rollback can undo that change.
+        if HOMEBREW_NO_AUTO_UPDATE=1 "$brew_bin" list --formula --versions "$pak" 2>/dev/null | grep -q .; then
+            _append_transmap "homebrew $pak"
+        else
+            (( status != 0 )) || status=1
+        fi
+        (( status == 0 )) || die "Failed to install Homebrew formula $pak"
+    done
+}
+
+pkg_brew_remove () {
+    (( $# > 0 )) || return 0
+    local brew_bin pak status
+    brew_bin=$(_brew_executable) || return 100
+    for pak in "$@"; do
+        _brew_formula_valid "$pak" || return 1
+        if ! HOMEBREW_NO_AUTO_UPDATE=1 "$brew_bin" list --formula --versions "$pak" 2>/dev/null | grep -q .; then
+            continue
+        fi
+        runner_lock "package-transaction"
+        status=0
+        HOMEBREW_NO_ASK=1 HOMEBREW_NO_AUTO_UPDATE=1 "$brew_bin" uninstall --formula "$pak" || status=$?
+        runner_unlock
+        (( status == 0 )) || return "$status"
+        if HOMEBREW_NO_AUTO_UPDATE=1 "$brew_bin" list --formula --versions "$pak" 2>/dev/null | grep -q .; then
+            return 1
+        fi
+    done
+}
+
+_brew_uninstall_manager () {
+    local prefix="$1" brew_bin uninstall_file status=0
+    # The prefix is recorded at installation, not inferred from arbitrary metadata.
+    [[ "$prefix" = /* && "$prefix" != / && "$prefix" != /home && "$prefix" != "$HOME" ]] || return 1
+    brew_bin="$prefix/bin/brew"
+    [[ -x "$brew_bin" ]] || { _brew_source_changed; return 0; }
+    uninstall_file=$(mktemp) || return 1
+    if ! curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/uninstall.sh -o "$uninstall_file"; then
+        rm -f "$uninstall_file"
+        return 1
+    fi
+    askpass || { rm -f "$uninstall_file"; return 1; }
+    NONINTERACTIVE=1 /bin/bash "$uninstall_file" --path "$prefix" --force || status=$?
+    rm -f "$uninstall_file"
+    _brew_source_changed
+    (( status == 0 )) && [[ ! -x "$brew_bin" ]]
 }
