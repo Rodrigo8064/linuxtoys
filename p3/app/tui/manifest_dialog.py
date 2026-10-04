@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 from collections.abc import Iterable
 from pathlib import Path
 
+from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -169,6 +172,99 @@ class ManifestReportDialog(ModalScreen[None]):
                         yield Static(
                             f"• {item['name']} — código de saída: {item['exit_code']}"
                         )
+            with Horizontal(id="confirm-buttons"):
+                yield Button("OK", id="execute-btn", variant="primary")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "execute-btn":
+            self.dismiss()
+
+
+class ManifestPlanDialog(ModalScreen[bool]):
+    """Show a heading and a list of lines.
+
+    Dismisses with ``True`` when the confirm button is pressed and ``False``
+    otherwise (cancel button or Escape). Without ``confirm_label`` it acts as
+    a plain information dialog. Focus starts on the cancel button, matching
+    the ``[y/N]`` default of the CLI.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", translations.get("script_runner_close"))
+    ]
+
+    def __init__(
+        self,
+        results: list[dict],
+        *,
+        dry_run: bool = False,
+        not_run: list[str] | None = None,
+    ) -> None:
+        super().__init__()
+        self.results = results
+        self.dry_run = dry_run
+        self.not_run = not_run or []
+
+    @staticmethod
+    def _describe(item: dict, dry_run: bool) -> str:
+        status = item.get("status")
+        if status == "cancelled":
+            return "cancelado"
+        if status == "closed":
+            return "terminal encerrado"
+        if dry_run:
+            return "validação falhou"
+        return f"código de saída: {item['exit_code']}"
+
+    def compose(self) -> ComposeResult:
+        total = len(self.results)
+        ok = sum(1 for item in self.results if item["success"])
+        failures = [item for item in self.results if not item["success"]]
+        simulated = [
+            item for item in self.results if item.get("status") == "simulated"
+        ]
+
+        sections: list[tuple[str, list[str]]] = []
+        if failures:
+            sections.append(
+                (
+                    "Itens com erro:",
+                    [
+                        f"• {item['name']} — "
+                        f"{self._describe(item, self.dry_run)}"
+                        for item in failures
+                    ],
+                )
+            )
+        if simulated:
+            sections.append(
+                (
+                    "Simulados (não executados):",
+                    [f"• {item['name']}" for item in simulated],
+                )
+            )
+        if self.not_run:
+            sections.append(
+                ("Não executados:", [f"• {name}" for name in self.not_run])
+            )
+
+        with Vertical(id="confirm-dialog"):
+            if self.dry_run:
+                yield Static(
+                    f"Dry-run concluído: {ok}/{total} itens sem problemas."
+                )
+            else:
+                yield Static(
+                    f"Manifesto concluído: {ok}/{total} "
+                    "instalados com sucesso."
+                )
+            if sections:
+                with VerticalScroll(id="manifest-failures"):
+                    for title, lines in sections:
+                        yield Static(title, classes="field-label")
+                        for line in lines:
+                            # Text() avoids Rich markup parsing of item names.
+                            yield Static(Text(line))
             with Horizontal(id="confirm-buttons"):
                 yield Button("OK", id="execute-btn", variant="primary")
 

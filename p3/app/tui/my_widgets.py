@@ -156,7 +156,6 @@ class TerminalPTY:
 
     def start(self) -> None:
         asyncio.create_task(self._run())
-        # asyncio.create_task(self._send_data())
 
     async def _run(self) -> None:
         loop = asyncio.get_running_loop()
@@ -170,13 +169,9 @@ class TerminalPTY:
                     return
                 text = self._decoder.decode(raw)
                 self.send_queue.put_nowait(["stdout", text])
-                # self.data_or_disconnect = self._decoder.decode(raw)
-                # self.event.set()
             except Exception:
                 loop.remove_reader(self.p_out)
                 self.send_queue.put_nowait(["disconnect", 1])
-                # self.data_or_disconnect = None
-                # self.event.set()
 
         loop.add_reader(self.p_out, on_output)
         await self.send_queue.put(["setup", {}])
@@ -187,15 +182,6 @@ class TerminalPTY:
             elif msg[0] == "set_size":
                 winsize = struct.pack("HH", msg[1], msg[2])
                 fcntl.ioctl(self.fd, termios.TIOCSWINSZ, winsize)
-
-    # async def _send_data(self) -> None:
-    #     while True:
-    #         await self.event.wait()
-    #         self.event.clear()
-    #         if self.data_or_disconnect is None:
-    #             await self.send_queue.put(["disconnect", 1])
-    #         else:
-    #             await self.send_queue.put(["stdout", self.data_or_disconnect])
 
 
 class ScriptFinished(Message):
@@ -235,14 +221,6 @@ class Terminal(Widget, can_focus=True):
             "ctrl+z": "\x1a",  # SIGTSTP
             "ctrl+l": "\x0c",  # Clear
         }
-        # self.ctrl_keys = {
-        #     "left": "\u001b[D",
-        #     "right": "\u001b[C",
-        #     "up": "\u001b[A",
-        #     "down": "\u001b[B",
-        #     "enter": "\r",
-        #     "backspace": "\u007f",
-        # }
         self.ncol = ncol
         self.nrow = nrow
         self._display = PyteDisplay([Text()])
@@ -451,26 +429,6 @@ class Terminal(Widget, can_focus=True):
 
             # Cede o loop para processar eventos de teclado/mouse sem lag
             await asyncio.sleep(0.01)
-
-        # while True:
-        #     message = await self.pty.send_queue.get()
-        #     cmd = message[0]
-        #     if cmd == "setup":
-        #         await self.pty.recv_queue.put(
-        #             ["set_size", self.nrow, self.ncol, 567, 573]
-        #         )
-        #     elif cmd == "stdout":
-        #         chars = message[1]
-        #         self._check_exit_marker(chars)
-        #         self._check_password_prompt(chars)
-        #         visible = self._EXIT_LINE_RE.sub("", chars)
-        #         visible = self._START_LINE_RE.sub("", visible)
-        #         self.stream.feed(visible)
-        #         self._render_screen()
-        #     elif cmd == "disconnect":
-        #         self._awaiting_exit_code = False
-        #         self.post_message(ScriptFinished(None))
-        #         self._spawn_pty()
 
     def _check_exit_marker(self, chars: str) -> None:
         if not self._awaiting_exit_code:

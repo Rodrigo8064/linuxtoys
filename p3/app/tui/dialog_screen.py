@@ -41,7 +41,7 @@ class ConfirmScriptScreen(ModalScreen[bool]):
     def compose(self) -> ComposeResult:
         with Vertical(id="confirm-dialog"):
             yield Static(
-                f"{translations.get('cancel_btn_label', 'Cancel')} '{self.script_name}'?",
+                f"{translations.get('term_view_execute', 'Cancel')} '{self.script_name}'?",
                 id="confirm-title",
             )
             yield Static(self.description, id="confirm-description")
@@ -58,7 +58,6 @@ class ConfirmScriptScreen(ModalScreen[bool]):
                 )
 
     def on_mount(self) -> None:
-        self.query_one("#confirm-description").border_title = "Description"
         self.query_one("#execute-btn", Button).focus()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:

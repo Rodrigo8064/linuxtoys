@@ -218,8 +218,16 @@ class HomeScreen(
         if not isinstance(button, InfoButton):
             return
 
+        script_path = button.path
+        script_name = str(button.label)
+        if (
+            script_path.endswith("skills-seeker.sh")
+            or script_name == "Skills Seeker"
+        ):
+            self.notify("ainda nao esta pronto")
+            return
+
         if button.is_repo_entry and button.has_app_page:
-            script_name = str(button.label)
             info = get_script_info(script_name)
             if info is None:
                 self.notify(
@@ -381,6 +389,7 @@ class HomeScreen(
         self._update_breadcrumb()
 
     async def action_reset_to_home(self) -> None:
+        self.query_one("#search-input", Input).value = ""
         self._nav_stack.clear()
         await self._render_items(self._home_items())
         self._update_breadcrumb()

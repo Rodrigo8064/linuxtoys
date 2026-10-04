@@ -2,6 +2,7 @@ import os
 import shlex
 import tempfile
 from collections.abc import Mapping
+from functools import partial
 from typing import Any
 
 from textual.css.query import NoMatches
@@ -48,7 +49,7 @@ from .helper import (
     is_specials_path,
     translations,
 )
-from .manifest_dialog import ManifestReportDialog
+from .manifest_dialog import ManifestPlanDialog, ManifestReportDialog
 from .my_widgets import (
     InfoButton,
     PasswordPromptDetected,
@@ -71,7 +72,14 @@ class ScriptRunnerMixin:
     _running_appstream_action: str | None = None
     _manifest_queue: list[dict] = []
     _manifest_results: list[dict] = []
+    _manifest_temp_files: list[str] = []
+    _manifest_bootstrap: dict | None = None
     _is_manifest_run: bool = False
+
+    _MANIFEST_BOOTSTRAP_LABELS = {
+        "flatpak": "Flatpak/Flathub",
+        "homebrew": "Homebrew",
+    }
 
     async def handle_desc_button(self, button: InfoButton) -> None:
         """Call a function based on is script or not."""
@@ -155,6 +163,10 @@ class ScriptRunnerMixin:
                     severity="error",
                 )
                 self._running_button = None
+                if self._is_manifest_run:
+                    self._advance_manifest(
+                        script_info.get("name", "unknown"), 1
+                    )
                 return
         dev_mode = is_dev_mode_enabled()
 
@@ -175,15 +187,19 @@ class ScriptRunnerMixin:
         self._running_is_uninstall = False
         self._running_is_appstream = False
 
+        env = {
+            "LINUXTOYS_SCRIPT_NAME": script_info.get("name", "unknown"),
+            "DISABLE_ZENITY": "1",
+            "CACHE_DIR": os.environ.get("SCRIPT_DIR", "") + "/scripts",
+        }
+        if self._is_manifest_run and not script_info.get("is_batch"):
+            env.update(self._manifest_script_env(script_info))
+
         self._show_terminal()
         terminal = self.query_one("#terminal", Terminal)
         terminal.run_script(
             temp_path,
-            env={
-                "LINUXTOYS_SCRIPT_NAME": script_info.get("name", "unknown"),
-                "DISABLE_ZENITY": "1",
-                "CACHE_DIR": os.environ.get("SCRIPT_DIR", "") + "/scripts",
-            },
+            env=env,
         )
 
     def run_appstream_install(self, script_info: Mapping[str, Any]) -> None:
@@ -283,110 +299,555 @@ class ScriptRunnerMixin:
     def on_manifest_chosen(self, manifest_path: str | None) -> None:
         if manifest_path is None:
             return
+        if self._is_manifest_run:
+            self.notify(
+                "Já existe uma execução de manifesto em andamento.",
+                severity="warning",
+            )
+            return
         self.notify("Carregando manifesto...", timeout=3)
+        self._start_manifest_classify(manifest_path)
+
+    def _start_manifest_classify(
+        self,
+        manifest_path: str,
+        attempted: tuple[str, ...] = (),
+        refresh_appstream: bool = False,
+    ) -> None:
         self.run_worker(
-            lambda: self._classify_manifest(manifest_path),
+            lambda: self._classify_manifest(
+                manifest_path, attempted, refresh_appstream
+            ),
             thread=True,
             exclusive=True,
             name="manifest_classify",
         )
 
-    def _classify_manifest(self, manifest_path: str) -> None:
-        import asyncio
+    def _classify_manifest(
+        self,
+        manifest_path: str,
+        attempted: tuple[str, ...] = (),
+        refresh_appstream: bool = False,
+    ) -> None:
+        """Resolve the manifest off the UI thread, then hand over the plan."""
+        from app.manifest_helper import load_manifest
 
-        from app.manifest_helper import (
-            check_flatpaks_async,
-            check_package_exists,
-            find_script_by_name,
-            load_manifest,
+        from .manifest_resolver import (
+            refresh_appstream_after_flathub,
+            resolve_manifest,
         )
 
-        names = load_manifest(manifest_path)
+        if refresh_appstream:
+            # Flathub was just enabled: make its AppStream entries visible.
+            try:
+                refresh_appstream_after_flathub()
+            except Exception as exc:  # mirrors the CLI bootstrap helper
+                self.app.call_from_thread(
+                    self.notify,
+                    f"Falha ao atualizar o AppStream: {exc}",
+                    severity="error",
+                )
+                return
+
+        try:
+            names = load_manifest(manifest_path)
+        except (OSError, ValueError):  # ValueError covers UnicodeDecodeError
+            self.app.call_from_thread(
+                self.notify,
+                "Não foi possível ler o manifesto.",
+                severity="error",
+            )
+            return
+
         if not names:
             self.app.call_from_thread(
                 self.notify, "Manifesto vazio ou inválido.", severity="warning"
             )
             return
 
-        results = []
-        potential_flatpaks = []
-        items_to_check = []
-
-        for name in names:
-            script_info = find_script_by_name(name, translations)
-            if script_info is not None:
-                results.append(script_info)
-            elif name.count(".") >= 2:
-                potential_flatpaks.append(name)
-            else:
-                items_to_check.append(name)
-
-        packages_to_install = []
-        flatpaks_to_install = []
-
-        if potential_flatpaks:
-            exists_results = asyncio.run(
-                check_flatpaks_async(potential_flatpaks)
-            )
-            for name, exists in zip(potential_flatpaks, exists_results):
-                if exists:
-                    flatpaks_to_install.append(name)
-                elif check_package_exists(name):
-                    packages_to_install.append(name)
-
-        for name in items_to_check:
-            if check_package_exists(name):
-                packages_to_install.append(name)
-
-        if packages_to_install or flatpaks_to_install:
-            temp_path = self._build_packages_flatpaks_script(
-                packages_to_install, flatpaks_to_install
-            )
-            results.append(
-                {
-                    "name": translations.get(
-                        "packages_flatpaks", "Pacotes e Flatpaks"
-                    ),
-                    "path": temp_path,
-                    "is_script": True,
-                }
-            )
-
-        if not results:
+        try:
+            plan = resolve_manifest(names, translations)
+        except Exception as exc:  # worker boundary: never let it kill the TUI
             self.app.call_from_thread(
                 self.notify,
-                "Nenhum item válido encontrado no manifesto.",
+                f"Erro ao validar o manifesto: {exc}",
+                severity="error",
+            )
+            return
+        self.app.call_from_thread(
+            self._on_manifest_resolved, plan, manifest_path, attempted
+        )
+
+    def _on_manifest_resolved(
+        self, plan, manifest_path: str, attempted: tuple[str, ...]
+    ) -> None:
+        if plan.bootstrap is None:
+            self._review_manifest_plan(plan)
+            return
+
+        label = self._MANIFEST_BOOTSTRAP_LABELS[plan.bootstrap]
+        if plan.bootstrap in attempted:
+            self.notify(
+                f"{label} continua indisponível após a configuração.",
+                severity="error",
+            )
+        elif self._dry_run_enabled():
+            self.notify(
+                f"Pré-requisito ausente: {label}. "
+                "O modo dev não instala pré-requisitos.",
                 severity="warning",
+            )
+        else:
+            self._offer_manifest_bootstrap(plan, manifest_path, attempted)
+
+    @staticmethod
+    def _dry_run_enabled() -> bool:
+        from app.dev_mode import should_dry_run_scripts
+
+        return should_dry_run_scripts()
+
+    def _offer_manifest_bootstrap(
+        self, plan, manifest_path: str, attempted: tuple[str, ...]
+    ) -> None:
+        label = self._MANIFEST_BOOTSTRAP_LABELS[plan.bootstrap]
+        self.app.push_screen(
+            ManifestPlanDialog(
+                f"Este manifesto requer {label}",
+                [
+                    f"{label} não está configurado neste sistema.",
+                    "",
+                    "Configurar agora e continuar a validação do manifesto?",
+                ],
+                confirm_label="Configurar",
+            ),
+            partial(
+                self._on_manifest_bootstrap_answer,
+                plan,
+                manifest_path,
+                attempted,
+            ),
+        )
+
+    def _on_manifest_bootstrap_answer(
+        self,
+        plan,
+        manifest_path: str,
+        attempted: tuple[str, ...],
+        confirmed: bool | None,
+    ) -> None:
+        if not confirmed:
+            self.notify("Operação cancelada.", timeout=3)
+            return
+
+        # Both run in the terminal: they may need sudo.
+        self._manifest_temp_files = []
+        if plan.bootstrap == "homebrew":
+            item = plan.bootstrap_script
+        else:
+            try:
+                item = self._batch_item("Flatpak/Flathub", ["pkg_flat"])
+            except OSError as exc:
+                self.notify(
+                    f"Não foi possível preparar o script: {exc}",
+                    severity="error",
+                )
+                return
+
+        self._manifest_bootstrap = {
+            "path": manifest_path,
+            "kind": plan.bootstrap,
+            "attempted": (*attempted, plan.bootstrap),
+        }
+        self._is_manifest_run = True  # routes ScriptFinished to our handler
+        self._running_button = None
+        self._execute_script_info(item)
+
+    def _after_manifest_bootstrap(self, result, exit_code: int | None) -> None:
+        state = self._manifest_bootstrap
+        self._manifest_bootstrap = None
+        self._is_manifest_run = False
+        self._running_script_info = None
+        self._running_temp_path = None
+        self._hide_terminal()
+        self._discard_manifest_temp_files()
+
+        label = self._MANIFEST_BOOTSTRAP_LABELS[state["kind"]]
+        if result is ScriptResult.SUCCESS:
+            self.notify("Validando manifesto...", timeout=3)
+            self._start_manifest_classify(
+                state["path"],
+                state["attempted"],
+                refresh_appstream=state["kind"] == "flatpak",
+            )
+        elif result is ScriptResult.CANCELLED:
+            self.notify(
+                f"Configuração do {label} cancelada.", severity="warning"
+            )
+        elif result is ScriptResult.ERROR:
+            self.notify(
+                f"Falha ao configurar {label} (código {exit_code}).",
+                severity="error",
+            )
+
+    def _review_manifest_plan(self, plan) -> None:
+        """Mirror the CLI: any rejected item aborts, otherwise ask to go on."""
+        if not plan.is_valid:
+            self.app.push_screen(
+                ManifestPlanDialog(
+                    "Manifesto inválido. Nada será instalado.",
+                    [f"✗ {error}" for error in plan.errors],
+                    cancel_label="Fechar",
+                )
             )
             return
 
-        self.app.call_from_thread(self._start_manifest_queue, results)
+        if plan.total == 0:
+            if plan.warnings:
+                self.app.push_screen(
+                    ManifestPlanDialog(
+                        "Nenhum item para executar",
+                        [f"- {warning}" for warning in plan.warnings],
+                        cancel_label="Fechar",
+                    )
+                )
+            else:
+                self.notify(
+                    "Nenhum item compatível encontrado no manifesto.",
+                    severity="warning",
+                )
+            return
 
-    def _build_packages_flatpaks_script(
-        self, packages: list[str], flatpaks: list[str]
-    ) -> str:
-        import shlex
-        import tempfile
+        dry_run = self._dry_run_enabled()
+        lines = self._manifest_plan_lines(plan)
+        if dry_run:
+            heading = f"DRY-RUN: validar {plan.total} item(ns)?"
+            lines = [
+                "Nada será instalado: scripts são validados; pacotes, "
+                "snaps e flatpaks apenas simulados.",
+                "",
+                *lines,
+            ]
+            confirm_label = "Validar"
+        else:
+            heading = f"Instalar/executar {plan.total} item(ns)?"
+            confirm_label = "Continuar"
 
-        script_dir = resolve_script_dir()
-        lib_path = os.path.join(script_dir, "libs", "linuxtoys.bash")
-        packages_str = " ".join(shlex.quote(p) for p in packages)
-        flatpaks_str = " ".join(shlex.quote(f) for f in flatpaks)
+        self.app.push_screen(
+            ManifestPlanDialog(heading, lines, confirm_label=confirm_label),
+            partial(self._on_manifest_plan_answer, plan, dry_run),
+        )
 
-        script_content = f"""#!/bin/bash
-    source {shlex.quote(lib_path)}
+    @staticmethod
+    def _manifest_plan_lines(plan) -> list[str]:
+        # Same order in which the queue is executed.
+        lines = [f"[PACOTE] {name}" for name in plan.packages]
+        lines += [f"[SNAP] {name}" for name in plan.snaps]
+        lines += [f"[FLATPAK] {name}" for name in plan.flatpaks]
+        lines += [f"[SCRIPT] {script['name']}" for script in plan.scripts]
+        if plan.warnings:
+            lines += ["", "Ignorados:"]
+            lines += [f"  - {warning}" for warning in plan.warnings]
+        return lines
 
-    _packages=({packages_str})
-    [ "${{#_packages[@]}}" -eq 0 ] || {{ sudo_rq; _install_; }}
+    def _on_manifest_plan_answer(
+        self, plan, dry_run: bool, confirmed: bool | None
+    ) -> None:
+        if not confirmed:
+            self.notify("Operação cancelada.", timeout=3)
+            return
+        if dry_run:
+            self._start_manifest_dry_run(plan)
+            return
+        try:
+            queue = self._build_manifest_queue(plan)
+        except (OSError, ValueError) as exc:
+            self._discard_manifest_temp_files()
+            self.notify(
+                f"Não foi possível preparar a execução: {exc}",
+                severity="error",
+            )
+            return
+        self._start_manifest_queue(queue)
 
-    _flatpaks=({flatpaks_str})
-    _flatpak_
-    """
-        tmp = tempfile.NamedTemporaryFile(delete=False, mode="w", suffix=".sh")
-        tmp.write(script_content)
-        tmp.close()
-        os.chmod(tmp.name, 0o700)
-        return tmp.name
+    def _build_manifest_queue(self, plan) -> list[dict]:
+        """Packages, snaps and flatpaks first (one item each), then scripts.
+
+        One item per kind keeps exit codes meaningful: a single combined
+        script would only report the status of its last command.
+        """
+        self._manifest_temp_files = []
+        queue: list[dict] = []
+
+        if plan.packages:
+            values = self._shell_words(plan.packages)
+            queue.append(
+                self._batch_item(
+                    f"Pacotes ({len(plan.packages)})",
+                    ["askpass", f"pkg_install {values}"],
+                )
+            )
+        if plan.snaps:
+            values = self._shell_words(plan.snaps)
+            queue.append(
+                self._batch_item(
+                    f"Snaps ({len(plan.snaps)})", [f"pkg_snap {values}"]
+                )
+            )
+        if plan.flatpaks:
+            values = self._shell_words(plan.flatpaks)
+            queue.append(
+                self._batch_item(
+                    f"Flatpaks ({len(plan.flatpaks)})", [f"pkg_flat {values}"]
+                )
+            )
+
+        queue.extend(self._prepare_queue_script(s) for s in plan.scripts)
+        return queue
+
+    def _prepare_queue_script(self, script: dict) -> dict:
+        """Homebrew entries have a virtual path: materialize like run_script."""
+        if script.get("appstream_source") != "homebrew":
+            return script
+        from app import homebrew_catalog
+
+        materialized = homebrew_catalog.materialize_install(script)
+        self._manifest_temp_files = [
+            *self._manifest_temp_files,
+            materialized["path"],
+        ]
+        return materialized
+
+    @staticmethod
+    def _shell_words(names: list[str]) -> str:
+        return " ".join(shlex.quote(name) for name in names)
+
+    def _batch_item(self, name: str, lines: list[str]) -> dict:
+        return {
+            "name": name,
+            "path": self._write_batch_script(lines),
+            "is_script": True,
+            "is_batch": True,
+        }
+
+    def _write_batch_script(self, lines: list[str]) -> str:
+        """Write a temporary bash script with the given library calls.
+
+        ``create_temp_file`` prepends the preamble that sets SCRIPT_DIR and
+        loads the core library, so nothing is sourced here.
+        """
+        content = "\n".join(["#!/bin/bash", "set -eo pipefail", *lines, ""])
+        fd, path = tempfile.mkstemp(prefix="linuxtoys-manifest-", suffix=".sh")
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        os.chmod(path, 0o700)
+        # Rebinding (not appending) avoids mutating the shared class attribute.
+        self._manifest_temp_files = [*self._manifest_temp_files, path]
+        return path
+
+    def _discard_manifest_temp_files(self) -> None:
+        """Remove generated batch/Homebrew scripts.
+
+        ``_running_temp_path`` is the copy made by ``create_temp_file``; the
+        scripts written above must be removed separately.
+        """
+        dev_mode = getattr(self, "_running_dev_mode", False)
+        for temp_path in self._manifest_temp_files:
+            self._cleanup_temp_file(temp_path, dev_mode)
+        self._manifest_temp_files = []
+
+    def _manifest_script_env(self, script_info: dict) -> dict[str, str]:
+        """Extra variables the CLI exports through ``script_environment``."""
+        from app.manifest_helper import script_environment
+
+        env = script_environment(
+            script_info, {"SCRIPT_DIR": resolve_script_dir()}
+        )
+        # The terminal receives one `export` line: keep every value on it.
+        return {
+            key: str(value).replace("\r", " ").replace("\n", " ")
+            for key, value in env.items()
+        }
+
+    def _manifest_start_failed(self, script_name: str) -> None:
+        """An item could not even start (e.g. repo entry preparation)."""
+        if self._manifest_bootstrap is not None:
+            self._after_manifest_bootstrap(ScriptResult.ERROR, 1)
+        else:
+            self._advance_manifest(script_name, 1)
+
+    def _on_manifest_item_finished(self, message) -> None:
+        script_info = self._running_script_info or {}
+        script_name = script_info.get("name", "item desconhecido")
+        exit_code = message.exit_code
+        result = _classify_exit_code(exit_code)
+        temp_path = self._running_temp_path
+        dev_mode = self._running_dev_mode
+        is_batch = bool(script_info.get("is_batch"))
+
+        if not dev_mode:
+            # Synthetic batch items are not LinuxToys scripts: no registry.
+            if result is ScriptResult.SUCCESS and not is_batch:
+                _save_script_to_registry(script_name, TRANSMAP_PATH)
+                _cleanup_tmp_noram_dirs(TRANSMAP_PATH)
+            self._remove_transmap()
+        self._cleanup_temp_file(temp_path, dev_mode)
+
+        if result is ScriptResult.TERMINAL_CLOSED:
+            self.notify(
+                "O terminal encerrou inesperadamente; uma nova sessão foi "
+                "iniciada automaticamente.",
+                severity="warning",
+            )
+
+        if self._manifest_bootstrap is not None:
+            self._after_manifest_bootstrap(result, exit_code)
+            return
+        self._advance_manifest(script_name, exit_code, is_batch)
+
+    @staticmethod
+    def _manifest_status(result) -> str:
+        if result is ScriptResult.SUCCESS:
+            return "success"
+        if result is ScriptResult.CANCELLED:
+            return "cancelled"
+        if result is ScriptResult.TERMINAL_CLOSED:
+            return "closed"
+        return "error"
+
+    def _advance_manifest(
+        self, script_name: str, exit_code: int | None, is_batch: bool = False
+    ) -> None:
+        """Record a result, then decide how the queue goes on.
+
+        Like the CLI: only a failed *script* asks whether to continue, while
+        failed package/snap/flatpak batches just move on. Cancellation and a
+        closed terminal stop the whole run.
+        """
+        result = _classify_exit_code(exit_code)
+        self._manifest_results.append(
+            {
+                "name": script_name,
+                "exit_code": exit_code,
+                "success": result is ScriptResult.SUCCESS,
+                "status": self._manifest_status(result),
+            }
+        )
+
+        if result in (ScriptResult.CANCELLED, ScriptResult.TERMINAL_CLOSED):
+            self._stop_manifest_run()
+            return
+        if (
+            result is ScriptResult.ERROR
+            and not is_batch
+            and self._manifest_queue
+        ):
+            self._ask_continue_after_failure(script_name, exit_code)
+            return
+        self._run_next_manifest_item()
+
+    def _ask_continue_after_failure(
+        self, script_name: str, exit_code: int
+    ) -> None:
+        remaining = [item["name"] for item in self._manifest_queue]
+        self.app.push_screen(
+            ManifestPlanDialog(
+                f"'{script_name}' falhou (código de saída {exit_code}).",
+                ["Continuar com os itens restantes?", "", *remaining],
+                confirm_label="Continuar",
+                cancel_label="Parar",
+            ),
+            self._on_manifest_continue_answer,
+        )
+
+    def _on_manifest_continue_answer(self, proceed: bool | None) -> None:
+        if proceed:
+            self._run_next_manifest_item()
+            return
+        self._stop_manifest_run()
+
+    def _stop_manifest_run(self) -> None:
+        not_run = [item["name"] for item in self._manifest_queue]
+        self._manifest_queue = []
+        self._finish_manifest_run(not_run)
+
+    def _finish_manifest_run(self, not_run: list[str] | None = None) -> None:
+        self._hide_terminal()
+        results = self._manifest_results
+        self._discard_manifest_temp_files()
+
+        self._is_manifest_run = False
+        self._manifest_queue = []
+        self._manifest_results = []
+        self._running_script_info = None
+        self._running_temp_path = None
+        self.app.push_screen(ManifestReportDialog(results, not_run=not_run))
+
+    def _start_manifest_dry_run(self, plan) -> None:
+        self.notify("Validando itens (dry-run)...", timeout=3)
+        self.run_worker(
+            lambda: self._dry_run_manifest(plan),
+            thread=True,
+            exclusive=True,
+            name="manifest_dry_run",
+        )
+
+    def _dry_run_manifest(self, plan) -> None:
+        """Same order as a real run; only scripts are actually validated."""
+        from app.dev_mode import dry_run_script
+
+        results = []
+        for label, names in (
+            ("Pacotes", plan.packages),
+            ("Snaps", plan.snaps),
+            ("Flatpaks", plan.flatpaks),
+        ):
+            if names:
+                results.append(
+                    {
+                        "name": f"{label} ({len(names)})",
+                        "exit_code": 0,
+                        "success": True,
+                        "status": "simulated",
+                    }
+                )
+        for script in plan.scripts:
+            results.append(self._dry_run_script_item(script, dry_run_script))
+        self.app.call_from_thread(self._finish_manifest_dry_run, results)
+
+    @staticmethod
+    def _dry_run_script_item(script: dict, dry_run_script) -> dict:
+        """Mirror the CLI: pass when syntax and dependencies are valid."""
+        cleanup_path = None
+        try:
+            target = script
+            if script.get("is_repo_entry"):
+                target = materialize_repo_script(script)
+            elif script.get("appstream_source") == "homebrew":
+                from app import homebrew_catalog
+
+                target = homebrew_catalog.materialize_install(script)
+                cleanup_path = target["path"]
+            outcome = dry_run_script(target["path"])
+            ok = bool(
+                outcome["syntax_valid"] and outcome["dependencies_valid"]
+            )
+        except Exception:  # worker boundary: a broken script is a failed item
+            ok = False
+        finally:
+            if cleanup_path:
+                try:
+                    os.unlink(cleanup_path)
+                except OSError:
+                    pass
+        return {
+            "name": script.get("name", "item desconhecido"),
+            "exit_code": 0 if ok else 1,
+            "success": ok,
+            "status": "success" if ok else "error",
+        }
+
+    def _finish_manifest_dry_run(self, results: list[dict]) -> None:
+        self.app.push_screen(ManifestReportDialog(results, dry_run=True))
 
     def _start_manifest_queue(self, items: list[dict]) -> None:
         self._manifest_queue = items
@@ -619,36 +1080,6 @@ class ScriptRunnerMixin:
                     wants_report, script_name, exit_code, terminal_text
                 ),
             )
-
-    def _on_manifest_item_finished(self, message: ScriptFinished) -> None:
-        script_info = self._running_script_info or {}
-        script_name = script_info.get("name", "item desconhecido")
-        exit_code = message.exit_code
-        temp_path = self._running_temp_path
-        dev_mode = self._running_dev_mode
-        success = exit_code == 0
-
-        if not dev_mode:
-            if success:
-                _save_script_to_registry(script_name, TRANSMAP_PATH)
-                _cleanup_tmp_noram_dirs(TRANSMAP_PATH)
-            self._remove_transmap()
-        self._cleanup_temp_file(temp_path, dev_mode)
-
-        self._manifest_results.append(
-            {"name": script_name, "exit_code": exit_code, "success": success}
-        )
-        self._run_next_manifest_item()
-
-    def _finish_manifest_run(self) -> None:
-        self._hide_terminal()
-        results = self._manifest_results
-        self._is_manifest_run = False
-        self._manifest_queue = []
-        self._manifest_results = []
-        self._running_script_info = None
-        self._running_temp_path = None
-        self.app.push_screen(ManifestReportDialog(results))
 
     def _remove_transmap(self) -> None:
         try:
