@@ -338,6 +338,8 @@ class ScriptRunnerMixin:
             resolve_manifest,
         )
 
+        resolve_script_dir()
+
         if refresh_appstream:
             # Flathub was just enabled: make its AppStream entries visible.
             try:
@@ -795,6 +797,8 @@ class ScriptRunnerMixin:
     def _dry_run_manifest(self, plan) -> None:
         """Same order as a real run; only scripts are actually validated."""
         from app.dev_mode import dry_run_script
+
+        resolve_script_dir()
 
         results = []
         for label, names in (
