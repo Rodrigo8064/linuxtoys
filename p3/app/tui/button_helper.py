@@ -299,6 +299,7 @@ class ScriptRunnerMixin:
     def on_manifest_chosen(self, manifest_path: str | None) -> None:
         if manifest_path is None:
             return
+        # resolve_script_dir()
         if self._is_manifest_run:
             self.notify(
                 "Já existe uma execução de manifesto em andamento.",
@@ -529,7 +530,7 @@ class ScriptRunnerMixin:
             ]
             confirm_label = "Validar"
         else:
-            heading = f"Instalar/executar {plan.total} item(ns)?"
+            heading = f"Instalar {plan.total} item(ns)?"
             confirm_label = "Continuar"
 
         self.app.push_screen(
@@ -972,8 +973,8 @@ class ScriptRunnerMixin:
         exit_code = message.exit_code
         result = _classify_exit_code(exit_code)
 
-        action_done = "removido" if is_uninstall else "instalado"
-        action_verb = "remover" if is_uninstall else "instalar"
+        action_done = "removed" if is_uninstall else "installed"
+        action_verb = "remove" if is_uninstall else "install"
 
         if result is ScriptResult.SUCCESS:
             if not dev_mode and not is_uninstall:

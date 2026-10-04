@@ -152,43 +152,6 @@ class ManifestDialog(ModalScreen[str | None]):
 
 
 class ManifestReportDialog(ModalScreen[None]):
-    def __init__(self, results: list[dict]) -> None:
-        super().__init__()
-        self.results = results
-
-    def compose(self) -> ComposeResult:
-        total = len(self.results)
-        successes = [r for r in self.results if r["success"]]
-        failures = [r for r in self.results if not r["success"]]
-
-        with Vertical(id="confirm-dialog"):
-            yield Static(
-                f"Manifesto concluído: {len(successes)}/{total} instalados com sucesso."
-            )
-            if failures:
-                yield Static("Itens com erro:", classes="field-label")
-                with VerticalScroll(id="manifest-failures"):
-                    for item in failures:
-                        yield Static(
-                            f"• {item['name']} — código de saída: {item['exit_code']}"
-                        )
-            with Horizontal(id="confirm-buttons"):
-                yield Button("OK", id="execute-btn", variant="primary")
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "execute-btn":
-            self.dismiss()
-
-
-class ManifestPlanDialog(ModalScreen[bool]):
-    """Show a heading and a list of lines.
-
-    Dismisses with ``True`` when the confirm button is pressed and ``False``
-    otherwise (cancel button or Escape). Without ``confirm_label`` it acts as
-    a plain information dialog. Focus starts on the cancel button, matching
-    the ``[y/N]`` default of the CLI.
-    """
-
     BINDINGS = [
         Binding("escape", "cancel", translations.get("script_runner_close"))
     ]
@@ -271,3 +234,56 @@ class ManifestPlanDialog(ModalScreen[bool]):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "execute-btn":
             self.dismiss()
+
+
+class ManifestPlanDialog(ModalScreen[bool]):
+    """Show a heading and a list of lines.
+
+    Dismisses with ``True`` when the confirm button is pressed and ``False``
+    otherwise (cancel button or Escape). Without ``confirm_label`` it acts as
+    a plain information dialog. Focus starts on the cancel button, matching
+    the ``[y/N]`` default of the CLI.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", translations.get("script_runner_close"))
+    ]
+
+    def __init__(
+        self,
+        heading: str,
+        lines: list[str],
+        *,
+        confirm_label: str | None = None,
+        cancel_label: str = "Cancelar",
+    ) -> None:
+        super().__init__()
+        self._heading = heading
+        self._lines = lines
+        self._confirm_label = confirm_label
+        self._cancel_label = cancel_label
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="confirm-dialog"):
+            yield Static(Text(self._heading), classes="field-label")
+            with VerticalScroll(id="manifest-failures"):
+                # Text() avoids Rich markup parsing of "[SCRIPT]" and friends.
+                yield Static(Text("\n".join(self._lines)))
+            with Horizontal(id="confirm-buttons"):
+                if self._confirm_label:
+                    yield Button(
+                        self._confirm_label,
+                        id="execute-btn",
+                        variant="primary",
+                    )
+                yield Button(self._cancel_label, id="cancel-btn")
+
+    def on_mount(self) -> None:
+        self.query_one("#cancel-btn", Button).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        self.dismiss(event.button.id == "execute-btn")
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)

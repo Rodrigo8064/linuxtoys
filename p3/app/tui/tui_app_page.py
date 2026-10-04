@@ -822,7 +822,7 @@ class AppPageWidget(Vertical):
             self.post_message(self.OpenRequested(self._selected))
         elif bid == "app-remove":
             event.button.disabled = True
-            event.button.label = "…"
+            event.button.label = "..."
             self.post_message(self.UninstallRequested(self._selected))
         elif bid == "app-revert":
             event.button.disabled = True
