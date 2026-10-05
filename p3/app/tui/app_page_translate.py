@@ -10,8 +10,6 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-# AJUSTE o import conforme a estrutura do seu projeto:
-# from linuxtoys.core import appstream_cache
 from app import appstream_cache
 
 

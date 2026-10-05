@@ -18,6 +18,7 @@ from app.easy_cli import (
     resolve_script_dir,
 )
 from app.library_loader import script_command
+from app.manifest_helper import find_script_by_name
 from app.parser import get_breadcrumb_path, script_requires_reboot
 from app.registry_utils import parse_registry_file
 from app.repo_parser import materialize_repo_script
@@ -162,7 +163,7 @@ class ScriptRunnerMixin:
                 )
                 self._running_button = None
                 if self._is_manifest_run:
-                    self._advance_manifest(
+                    self._manifest_start_failed(
                         script_info.get("name", "unknown"), 1
                     )
                 return
@@ -201,20 +202,21 @@ class ScriptRunnerMixin:
         )
 
     def run_uninstall(self, button: InfoButton) -> None:
-        script_info = {"name": str(button.label), "path": button.path}
+        script_name = str(button.label)
+        script_info = find_script_by_name(script_name, translations)
+        # script_info = {"name": str(button.label), "path": button.path}
         uninstall_entry = build_uninstall_script_entry(
             script_info, translations
         )
 
         if not uninstall_entry:
             self.notify(
-                f"✗ No removable registry entry found for "
-                f"'{script_info['name']}'.",
+                f"✗ No removable registry entry found for '{script_name}'.",
                 severity="warning",
             )
             return
 
-        uninstall_path = uninstall_entry["path"]
+        uninstall_path = uninstall_entry.get("path")
         cleanup_path = uninstall_entry.get("cleanup_path")
 
         self._running_button = button

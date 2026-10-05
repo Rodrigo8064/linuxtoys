@@ -27,12 +27,6 @@ from .app_page_translate import (
     save_cached_translation,
     translate_description_blocks,
 )
-from .button_helper import (
-    AppstreamRunnerMixin,
-    ManifestRunnerMixin,
-    ScriptRunnerMixin,
-    UpdateRunnerMixin,
-)
 from .dialog_screen import ReportBugDialog
 from .helper import (
     get_categories,
@@ -51,6 +45,12 @@ from .my_widgets import (
     Terminal,
 )
 from .registry_screen import RegistryOpenerMixin
+from .runner_helper import (
+    AppstreamRunnerMixin,
+    ManifestRunnerMixin,
+    ScriptRunnerMixin,
+    UpdateRunnerMixin,
+)
 from .skills_view_tui import SkillsSeekerView
 from .tui_app_page import AppPageWidget, hide_app_page, show_app_page
 
