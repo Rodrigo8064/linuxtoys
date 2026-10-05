@@ -112,7 +112,7 @@ class HomeScreen(
                 yield ListView(
                     ListItem(
                         Label(
-                            f" {
+                            f"📃 {
                                 translations.get(
                                     'load_manifest', 'Load manifest'
                                 )
@@ -122,7 +122,7 @@ class HomeScreen(
                     ),
                     ListItem(
                         Label(
-                            f" {
+                            f"💬 {
                                 translations.get(
                                     'select_language', 'Select language'
                                 )
@@ -131,17 +131,17 @@ class HomeScreen(
                         id="language",
                     ),
                     ListItem(
-                        Label(f" {translations.get('about', 'About')}"),
+                        Label(f"🐧 {translations.get('about', 'About')}"),
                         id="about",
                     ),
                     ListItem(
-                        Label(f"󰲃 {translations.get('action_registry')}"),
+                        Label(f"🗂️ {translations.get('action_registry')}"),
                         id="registry",
                     ),
-                    ListItem(Label("󰚰 Update LinuxToys"), id="update"),
+                    ListItem(Label("🔃 Update LinuxToys"), id="update"),
                     ListItem(
                         Label(
-                            f" {
+                            f"🔄 {
                                 translations.get(
                                     'scripts_resync', 'Scripts resync'
                                 )

@@ -90,7 +90,7 @@ class InfoButton(Button):
         if self.revert and self.is_installed:
             self.styles.border = ("tall", "red")
             self.styles.border_title_align = "left"
-            self.border_title = ""
+            self.border_title = "🗑"
             self.label = self.script_name
         elif self.is_new:
             self.styles.border = ("tall", "yellow")

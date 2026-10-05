@@ -245,6 +245,7 @@ class ManifestPlanDialog(ModalScreen[bool]):
     the ``[y/N]`` default of the CLI.
     """
 
+    _MAX_BODY_ROWS = 10
     BINDINGS = [
         Binding("escape", "cancel", translations.get("script_runner_close"))
     ]
@@ -279,6 +280,11 @@ class ManifestPlanDialog(ModalScreen[bool]):
                 yield Button(self._cancel_label, id="cancel-btn")
 
     def on_mount(self) -> None:
+        self.query_one("#confirm-dialog").styles.height = "auto"
+        self.query_one("#confirm-buttons").styles.height = "auto"
+        body = self.query_one("#manifest-failures")
+        body.styles.height = "auto"
+        body.styles.max_height = self._MAX_BODY_ROWS
         self.query_one("#cancel-btn", Button).focus()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
