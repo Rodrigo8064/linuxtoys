@@ -9,11 +9,31 @@ else:
     from compat import get_linuxtoys_cache_dir
 
 
+_PARSE_CACHE = {"key": None, "data": {}}
+
+
 def parse_registry_file():
+    """Parse the registry file, memoized by (mtime, size).
+
+    The returned dict is shared between callers and must be treated as
+    read-only. Any write to the registry file changes its key and invalidates
+    the cache automatically.
+    """
+    global _PARSE_CACHE
     registry_file = os.path.join(get_linuxtoys_cache_dir(), "registry")
 
     if not os.path.exists(registry_file):
+        _PARSE_CACHE = {"key": None, "data": {}}
         return {}
+
+    try:
+        stat = os.stat(registry_file)
+        cache_key = (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return {}
+
+    if _PARSE_CACHE["key"] == cache_key:
+        return _PARSE_CACHE["data"]
 
     try:
         with open(registry_file, "r") as f:
@@ -32,6 +52,10 @@ def parse_registry_file():
     for i, match in enumerate(matches):
         script_name = match.group(1).strip()
         if not script_name:
+            continue
+        # Keep noise transactions (sysup system-update runs) out of every
+        # registry view, consistent with normalize_registry_content().
+        if script_name.casefold() in REGISTRY_DROPPED_NAMES:
             continue
 
         entry_start = match.start()
@@ -65,7 +89,100 @@ def parse_registry_file():
             (timestamp, operations)
         )
 
+    _PARSE_CACHE = {"key": cache_key, "data": scripts_registry}
     return scripts_registry
+
+def _is_local_package_operation(operation):
+    """Whether one registry operation records an external package-file install."""
+    text = str(operation).strip()
+    if text.startswith("pkg file "):
+        return True
+    # "appimage rm" operations record removals, not installs.
+    return text.startswith("appimage ") and not text.startswith("appimage rm ")
+
+
+def get_local_package_entries(registry_data=None):
+    """
+    Return registry entries that record external package-file installs.
+
+    Packages installed through the package view are registered like any other
+    transaction, but no catalog entry backs them. Their transactions carry a
+    "pkg file <path>" (deb/rpm/arch/flatpak bundle) or "appimage <name>"
+    operation. Catalog scripts can record the same operations, so callers must
+    exclude registry names that a catalog script already uses.
+
+    Returns a registry-shaped dict: {script_name: [(timestamp, [operations])]}.
+    """
+    if registry_data is None:
+        registry_data = parse_registry_file()
+
+    local_packages = {}
+    for script_name, executions in registry_data.items():
+        matched = [
+            (timestamp, operations)
+            for timestamp, operations in executions
+            if any(_is_local_package_operation(operation) for operation in operations)
+        ]
+        if matched:
+            local_packages[script_name] = matched
+
+    return local_packages
+
+
+# Transactions that are pure maintenance noise and never denote anything the
+# user could remove. sysup.sh (system update) now opts out via `# registry: no`;
+# entries written before that opt-out existed are dropped by the healing step
+# so existing users' registries come clean once they receive the update.
+REGISTRY_DROPPED_NAMES = frozenset({"sysup"})
+
+_ENTRY_HEADER_RE = re.compile(
+    r'\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[^\]]*\] Script: '
+)
+
+
+def normalize_registry_content(content):
+    """
+    Rebuild raw registry text into the canonical entry layout.
+
+    Legacy writers appended entries without a trailing newline (or joined
+    stripped entries with "---"), gluing entry headers and separators onto the
+    previous entry's last operation line. Regex-based consumers still found
+    those headers, but line-based consumers (revert, removability) require
+    every header to start its own line. This rebuilds one entry per header
+    match, drops any non-entry prefix bytes, repairs separator glue, and drops
+    REGISTRY_DROPPED_NAMES transactions (sysup system-update noise written
+    before the `# registry: no` opt-out existed), so it is safe to apply to
+    already-canonical content as well (idempotent).
+
+    Consumers that derive entry INDICES must skip the exact same names — the
+    generated revert/cleanup blocks in revert_helper embed this rule.
+    """
+    matches = list(_ENTRY_HEADER_RE.finditer(content))
+    if not matches:
+        return content
+
+    entries = []
+    for index, match in enumerate(matches):
+        start = match.start()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(content)
+        entry_text = content[start:end].strip()
+        # Repair the separator glued to the entry's last operation line.
+        if entry_text.endswith("---"):
+            entry_text = entry_text[:-3].rstrip()
+        if not entry_text:
+            continue
+        # Drop noise transactions (kept in sync with the generated cleanup
+        # blocks so entry indices stay aligned everywhere).
+        entry_name = entry_text[len(match.group(0)):].split("\n", 1)[0].strip()
+        if entry_name.casefold() in REGISTRY_DROPPED_NAMES:
+            continue
+        entries.append(entry_text)
+
+    if not entries:
+        return content
+
+    return "\n---\n\n".join(entries) + "\n---\n\n"
+
 
 def search_registry_entries(registry_data, query):
     """

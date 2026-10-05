@@ -791,9 +791,18 @@ class AppWindow(
         threading.Thread(target=worker, daemon=True, name="linuxtoys-homebrew-source").start()
 
     def _start_homebrew_after_startup(self):
-        """Keep optional-source work outside the initial GTK transition."""
+        """Keep optional-source work well outside the launch window.
+
+        The refresh holds the GIL through a heavy catalog parse (~1s), which
+        stalls UI interaction if it runs while the user is settling in. Wait
+        briefly after the startup transition before spending that time.
+        """
         if not self._categories_startup_transition_complete:
             return True
+        GLib.timeout_add_seconds(15, self._deferred_homebrew_refresh)
+        return False
+
+    def _deferred_homebrew_refresh(self):
         self._refresh_homebrew_catalog()
         return False
 
@@ -1467,6 +1476,7 @@ class AppWindow(
 
         def worker():
             try:
+                self._prune_registry_removals()
                 installed_packages.refresh()
             except Exception as exc:
                 logger.warning("Installed package refresh failed: %s", exc)
@@ -1482,6 +1492,27 @@ class AppWindow(
             target=worker, daemon=True, name="linuxtoys-installed-packages"
         ).start()
         return False
+
+    def _prune_registry_removals(self):
+        """Prune removal/auto-revert registry entries older than a week.
+
+        Runs inside the installed-packages worker thread: removal transactions
+        are only useful shortly after they happen, while installation entries
+        must stay tracked for possible future removals. Legacy entries written
+        with an already-localized pattern are matched through the current
+        translation templates.
+        """
+        try:
+            from .term_registry import ExecutionRegistry
+
+            removed = ExecutionRegistry.prune_expired_removal_entries(
+                max_age_days=7,
+                extra_prefixes=ExecutionRegistry.localized_removal_prefixes(self.translations),
+            )
+            if removed:
+                logger.info("Pruned %d expired removal registry entries", removed)
+        except Exception as exc:
+            logger.warning("Registry prune failed: %s", exc)
 
     def _refresh_installed_features_view(self):
         # Hidden Installed Features views can be expensive to rebuild and GTK will
@@ -1980,6 +2011,17 @@ class AppWindow(
         current_view = self.main_stack.get_visible_child_name()
         if current_view == "app_page":
             page = self.main_stack.get_child_by_name("app_page")
+            # While the screenshot lightbox is open it owns these keys: Escape
+            # closes the zoom instead of leaving the page, and navigation
+            # keeps cycling the carousel (the lightbox follows along).
+            if page is not None and page.is_screenshot_zoomed():
+                if keyval == Gdk.KEY_Escape:
+                    page.close_screenshot_lightbox()
+                    return True
+                if keyval in (Gdk.KEY_Left, Gdk.KEY_Right):
+                    page.cycle_screenshot(-1 if keyval == Gdk.KEY_Left else 1)
+                    return True
+                return False
             if keyval == Gdk.KEY_Escape:
                 self.on_back_button_clicked(None)
                 return True

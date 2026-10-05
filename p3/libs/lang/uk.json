@@ -724,5 +724,12 @@
   "app_page_snap_revert": " Відкотити ",
   "uri_install_error_title": "Не вдалося відкрити посилання LinuxToys",
   "homebrew_catalog_unavailable": "Метадані Homebrew недоступні. Спробуйте ще раз пізніше.",
-  "homebrew_category_desc": "Переглядайте пакети з Homebrew."
+  "homebrew_category_desc": "Переглядайте пакети з Homebrew.",
+  "mtuprobe": "Увімкнути MTU Probing",
+  "mtuprobe_desc": "MTU probing (Packetization Layer Path MTU Discovery) — це автоматизована мережева технологія для визначення найбільшого розміру пакета, який може пройти мережевим маршрутом без фрагментації або втрати. Її ввімкнення усуває деякі проблеми з іграми, особливо від Ubisoft.",
+  "app_page_screenshot_zoom_hint": "Клацніть або натисніть Esc, щоб повернутися",
+  "app_page_screenshot_zoom": "Клацніть, щоб збільшити",
+  "dependency_block_title": "Видалення заблоковано",
+  "dependency_block_message": "Встановлене програмне забезпечення все ще залежить від «{name}». Спочатку видаліть його:\n\n{blockers}",
+  "dependency_block_button_tooltip": "Видалення заблоковано: встановлене програмне забезпечення все ще залежить від цієї функції"
 }

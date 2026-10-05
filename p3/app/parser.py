@@ -278,7 +278,7 @@ def _parse_metadata_file(file_path, default_values, translations=None):
 
                 if key in metadata:
                     metadata[key] = value
-                elif key in ("negates", "revert"):
+                elif key in ("negates", "revert", "registry"):
                     metadata[key] = value
                 elif key == "needed":
                     metadata["needed"] = value.split() or None
@@ -310,7 +310,7 @@ def _parse_metadata_file(file_path, default_values, translations=None):
 
                     if key in metadata:
                         metadata[key] = value
-                    elif key in ("negates", "revert"):
+                    elif key in ("negates", "revert", "registry"):
                         metadata[key] = value
                     elif key == "needed":
                         metadata["needed"] = value.split() or None
@@ -663,11 +663,49 @@ def get_repository(name):
         str(name).strip().casefold()
     )
 
+_DISPLAY_NAME_CACHE = {"translations": None, "resolved": {}}
+
+
+def clear_display_name_cache():
+    """Drop memoized display names (catalog resync / language change)."""
+    _DISPLAY_NAME_CACHE["translations"] = None
+    _DISPLAY_NAME_CACHE["resolved"] = {}
+
+
 def get_display_name(name, translations=None):
     """Resolve an internal script/repository name to its UI display name."""
     if not name:
         return name
 
+    # Removal/auto-revert registry identities store a stable, untranslated
+    # prefix so maintenance (expiry pruning) never depends on the UI language.
+    # The localized pattern is presentation-only and rendered here.
+    text = str(name)
+    for prefix, template_key, default_template in (
+        ("Remove: ", "remove_action_name", "Remove {name}"),
+        ("Auto-revert: ", "auto_revert_action_name", "Auto-revert {name}"),
+    ):
+        if text.startswith(prefix):
+            target = text[len(prefix):].strip()
+            template = (translations or {}).get(template_key, default_template)
+            return template.format(name=get_display_name(target, translations))
+
+    # Resolution walks the repo lists and the script tree on every call, which
+    # is measurable during startup bursts; memoize per translations object.
+    cache = _DISPLAY_NAME_CACHE
+    if cache["translations"] is not translations:
+        cache["translations"] = translations
+        cache["resolved"] = {}
+    cache_key = text
+    if cache_key in cache["resolved"]:
+        return cache["resolved"][cache_key]
+
+    resolved = _resolve_display_name(text, translations)
+    cache["resolved"][cache_key] = resolved
+    return resolved
+
+
+def _resolve_display_name(name, translations=None):
     normalized_name = str(name).strip().casefold()
 
     for entry in get_repo_entries(translations):

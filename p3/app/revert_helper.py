@@ -12,6 +12,11 @@ import subprocess
 import shlex
 
 from .compat import get_linuxtoys_cache_dir
+from .registry_utils import normalize_registry_content
+
+
+_LOAD_ENTRIES_CACHE = {"key": None, "entries": []}
+_EXECUTED_NAMES_CACHE = {"key": None, "executed": frozenset()}
 
 
 def _run_ok(cmd):
@@ -79,42 +84,17 @@ def _load_last_execution(script_name):
     as terminal remove-button availability checks) working without making the
     registry itself language-dependent.
     """
-    registry_file = os.path.join(get_linuxtoys_cache_dir(), "registry")
-
-    if not os.path.exists(registry_file):
+    registry_entries = _load_registry_entries()
+    if not registry_entries:
         return []
 
-    try:
-        with open(registry_file, "r") as f:
-            content = f.read()
-    except Exception:
-        return []
+    parsed_entries = [
+        (entry["name"], entry) for entry in reversed(registry_entries)
+    ]
 
-    entries = content.split("---\n")
-    entries.reverse()
-
-    def extract_operations(entry):
-        operations = []
-        for line in entry.split("\n")[1:]:
-            line = line.strip()
-            if line.startswith("- "):
-                op_line = line[2:].strip()
-                if op_line and op_line not in ("Changes:", "Changes: (none)"):
-                    operations.append(op_line)
-        return operations
-
-    parsed_entries = []
-    for entry in entries:
-        entry = entry.strip()
-        if not entry:
-            continue
-        lines = entry.split("\n")
-        if not lines or "Script: " not in lines[0]:
-            continue
-        stored_name = lines[0].split("Script: ", 1)[1].strip()
-        parsed_entries.append((stored_name, entry))
+    for stored_name, entry in parsed_entries:
         if stored_name == script_name:
-            return extract_operations(entry)
+            return list(entry["operations"])
 
     # A caller may still pass the localized pretty name. Resolve stored stable IDs
     # to their current display names only for lookup; never rewrite registry data.
@@ -127,7 +107,7 @@ def _load_last_execution(script_name):
         for stored_name, entry in parsed_entries:
             display_name = get_display_name(stored_name, translations)
             if str(display_name).strip().casefold() == target:
-                return extract_operations(entry)
+                return list(entry["operations"])
     except Exception:
         pass
 
@@ -135,11 +115,22 @@ def _load_last_execution(script_name):
 
 
 def _load_registry_entries():
-    """Load registry transactions in chronological order."""
+    """Load registry transactions in chronological order (mtime-memoized)."""
+    global _LOAD_ENTRIES_CACHE
     registry_file = os.path.join(get_linuxtoys_cache_dir(), "registry")
 
     if not os.path.exists(registry_file):
+        _LOAD_ENTRIES_CACHE = {"key": None, "entries": []}
         return []
+
+    try:
+        stat = os.stat(registry_file)
+        cache_key = (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return []
+
+    if _LOAD_ENTRIES_CACHE["key"] == cache_key:
+        return _LOAD_ENTRIES_CACHE["entries"]
 
     try:
         with open(registry_file, "r") as f:
@@ -149,7 +140,7 @@ def _load_registry_entries():
 
     entries = []
 
-    for raw_entry in content.split("---\n"):
+    for raw_entry in normalize_registry_content(content).split("---\n"):
         raw_entry = raw_entry.strip()
         if not raw_entry:
             continue
@@ -176,6 +167,7 @@ def _load_registry_entries():
             "operations": operations,
         })
 
+    _LOAD_ENTRIES_CACHE = {"key": cache_key, "entries": entries}
     return entries
 
 
@@ -203,11 +195,22 @@ def _get_executed_script_names():
     script when only the presence of a record is needed (e.g. caching the
     removable state of many scripts at once).
     """
+    global _EXECUTED_NAMES_CACHE
     registry_file = os.path.join(get_linuxtoys_cache_dir(), "registry")
     executed = set()
 
     if not os.path.exists(registry_file):
+        _EXECUTED_NAMES_CACHE = {"key": None, "executed": frozenset()}
         return executed
+
+    try:
+        stat = os.stat(registry_file)
+        cache_key = (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return executed
+
+    if _EXECUTED_NAMES_CACHE["key"] == cache_key:
+        return set(_EXECUTED_NAMES_CACHE["executed"])
 
     try:
         with open(registry_file, "r") as f:
@@ -215,7 +218,7 @@ def _get_executed_script_names():
     except Exception:
         return executed
 
-    entries = content.split("---\n")
+    entries = normalize_registry_content(content).split("---\n")
 
     for entry in entries:
         entry = entry.strip()
@@ -247,7 +250,10 @@ def _get_executed_script_names():
         if has_operations:
             executed.add(script_name)
 
-    return executed
+    _EXECUTED_NAMES_CACHE = {
+        "key": cache_key, "executed": frozenset(executed),
+    }
+    return set(executed)
 
 
 def _parse_operation(op_line):
@@ -1174,6 +1180,7 @@ def build_uninstall_script_entry(script_info, translations=None):
 
     lines.append("python3 - <<'PY'")
     lines.append("import os")
+    lines.append("import re")
     lines.append(f"reg = {os.path.join(get_linuxtoys_cache_dir(), 'registry')!r}")
     lines.append(f"remove_indices = set({reverted_indices_repr})")
     lines.append("")
@@ -1181,28 +1188,33 @@ def build_uninstall_script_entry(script_info, translations=None):
     lines.append("    with open(reg, 'r') as f:")
     lines.append("        content = f.read()")
     lines.append("")
-    lines.append("    raw_entries = content.split('---\\n')")
-    lines.append("    kept_entries = []")
-    lines.append("    registry_index = 0")
-    lines.append("")
-    lines.append("    for raw_entry in raw_entries:")
-    lines.append("        entry = raw_entry.strip()")
-    lines.append("        if not entry:")
+    lines.append("    # Rebuild entries from header matches so legacy glued writes")
+    lines.append("    # (missing trailing newlines) cannot shift the entry indices.")
+    lines.append("    pattern = re.compile(r'\\[\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}[^\\]]*\\] Script: ')")
+    lines.append("    matches = list(pattern.finditer(content))")
+    lines.append("    entries = []")
+    lines.append("    for index, match in enumerate(matches):")
+    lines.append("        start = match.start()")
+    lines.append("        end = matches[index + 1].start() if index + 1 < len(matches) else len(content)")
+    lines.append("        text = content[start:end].strip()")
+    lines.append("        if text.endswith('---'):")
+    lines.append("            text = text[:-3].rstrip()")
+    lines.append("        if not text:")
     lines.append("            continue")
+    lines.append("        # Skip noise transactions so indices stay aligned with the")
+    lines.append("        # normalized readers (registry_utils.REGISTRY_DROPPED_NAMES).")
+    lines.append("        name = text[len(match.group(0)):].split('\\n', 1)[0].strip()")
+    lines.append("        if name.strip().casefold() in ('sysup',):")
+    lines.append("            continue")
+    lines.append("        entries.append(text)")
     lines.append("")
-    lines.append("        entry_lines = entry.splitlines()")
-    lines.append("")
-    lines.append("        # Keep indexing consistent with _load_registry_entries().")
-    lines.append("        if entry_lines and 'Script: ' in entry_lines[0]:")
-    lines.append("            if registry_index not in remove_indices:")
-    lines.append("                kept_entries.append(entry)")
-    lines.append("            registry_index += 1")
-    lines.append("        else:")
-    lines.append("            # Preserve anything that is not a normal registry block.")
-    lines.append("            kept_entries.append(entry)")
+    lines.append("    kept_entries = [")
+    lines.append("        text for index, text in enumerate(entries)")
+    lines.append("        if index not in remove_indices")
+    lines.append("    ]")
     lines.append("")
     lines.append("    if kept_entries:")
-    lines.append("        cleaned_content = '\\n---\\n'.join(kept_entries) + '\\n---\\n'")
+    lines.append("        cleaned_content = '\\n---\\n\\n'.join(kept_entries) + '\\n---\\n\\n'")
     lines.append("        with open(reg, 'w') as f:")
     lines.append("            f.write(cleaned_content)")
     lines.append("    else:")
@@ -1231,9 +1243,17 @@ def build_uninstall_script_entry(script_info, translations=None):
         else "Remove {name}"
     ).format(name=script_name_display)
 
+    # The registry identity keeps a stable, untranslated prefix so removal
+    # entries stay pattern-matchable (expiry pruning) in every language; the
+    # localized "Remove {name}" is presentation-only (see get_display_name).
+    registry_identity = str(
+        script_info.get("registry_name") or script_name_display
+    ).strip()
+
     return {
         "icon": script_info.get("icon", "application-x-executable"),
         "name": remove_name,
+        "registry_name": f"Remove: {registry_identity}",
         "description": translations.get(
             "remove_action_desc",
             "Automatically removes components installed by this script using the registry.",
@@ -1312,6 +1332,7 @@ def build_auto_revert_script_entry(script_info, transmap_path, translations=None
 
     lines.append("python3 - <<'PY'")
     lines.append("import os")
+    lines.append("import re")
     lines.append(f"reg = {os.path.join(get_linuxtoys_cache_dir(), 'registry')!r}")
     lines.append(f"remove_indices = set({reverted_indices_repr})")
     lines.append("")
@@ -1319,26 +1340,33 @@ def build_auto_revert_script_entry(script_info, transmap_path, translations=None
     lines.append("    with open(reg, 'r') as f:")
     lines.append("        content = f.read()")
     lines.append("")
-    lines.append("    raw_entries = content.split('---\\n')")
-    lines.append("    kept_entries = []")
-    lines.append("    registry_index = 0")
-    lines.append("")
-    lines.append("    for raw_entry in raw_entries:")
-    lines.append("        entry = raw_entry.strip()")
-    lines.append("        if not entry:")
+    lines.append("    # Rebuild entries from header matches so legacy glued writes")
+    lines.append("    # (missing trailing newlines) cannot shift the entry indices.")
+    lines.append("    pattern = re.compile(r'\\[\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}[^\\]]*\\] Script: ')")
+    lines.append("    matches = list(pattern.finditer(content))")
+    lines.append("    entries = []")
+    lines.append("    for index, match in enumerate(matches):")
+    lines.append("        start = match.start()")
+    lines.append("        end = matches[index + 1].start() if index + 1 < len(matches) else len(content)")
+    lines.append("        text = content[start:end].strip()")
+    lines.append("        if text.endswith('---'):")
+    lines.append("            text = text[:-3].rstrip()")
+    lines.append("        if not text:")
     lines.append("            continue")
+    lines.append("        # Skip noise transactions so indices stay aligned with the")
+    lines.append("        # normalized readers (registry_utils.REGISTRY_DROPPED_NAMES).")
+    lines.append("        name = text[len(match.group(0)):].split('\\n', 1)[0].strip()")
+    lines.append("        if name.strip().casefold() in ('sysup',):")
+    lines.append("            continue")
+    lines.append("        entries.append(text)")
     lines.append("")
-    lines.append("        entry_lines = entry.splitlines()")
-    lines.append("")
-    lines.append("        if entry_lines and 'Script: ' in entry_lines[0]:")
-    lines.append("            if registry_index not in remove_indices:")
-    lines.append("                kept_entries.append(entry)")
-    lines.append("            registry_index += 1")
-    lines.append("        else:")
-    lines.append("            kept_entries.append(entry)")
+    lines.append("    kept_entries = [")
+    lines.append("        text for index, text in enumerate(entries)")
+    lines.append("        if index not in remove_indices")
+    lines.append("    ]")
     lines.append("")
     lines.append("    if kept_entries:")
-    lines.append("        cleaned_content = '\\n---\\n'.join(kept_entries) + '\\n---\\n'")
+    lines.append("        cleaned_content = '\\n---\\n\\n'.join(kept_entries) + '\\n---\\n\\n'")
     lines.append("        with open(reg, 'w') as f:")
     lines.append("            f.write(cleaned_content)")
     lines.append("    else:")
@@ -1367,9 +1395,15 @@ def build_auto_revert_script_entry(script_info, transmap_path, translations=None
         else "Auto-revert {name}"
     ).format(name=script_name_display)
 
+    # Stable, untranslated registry identity — see build_uninstall_script_entry.
+    registry_identity = str(
+        script_info.get("registry_name") or script_name_display
+    ).strip()
+
     return {
         "icon": script_info.get("icon", "application-x-executable"),
         "name": revert_name,
+        "registry_name": f"Auto-revert: {registry_identity}",
         "description": translations.get(
             "auto_revert_action_desc",
             "Automatically reverts components installed by this script before it failed.",

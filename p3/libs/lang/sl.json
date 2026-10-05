@@ -724,5 +724,12 @@
   "app_page_snap_revert": " Povrni ",
   "uri_install_error_title": "Povezave LinuxToys ni mogoče odpreti",
   "homebrew_catalog_unavailable": "Metapodatki Homebrew niso na voljo. Poskusite znova pozneje.",
-  "homebrew_category_desc": "Brskajte po paketih iz Homebrew."
+  "homebrew_category_desc": "Brskajte po paketih iz Homebrew.",
+  "mtuprobe": "Omogoči MTU Probing",
+  "mtuprobe_desc": "MTU probing (Packetization Layer Path MTU Discovery) je samodejna omrežna tehnika za ugotavljanje največje velikosti paketa, ki lahko potuje po omrežni poti brez fragmentacije ali zavrženja. Omogočanje odpravi nekatere težave z igrami, zlasti Ubisoftovimi.",
+  "app_page_screenshot_zoom_hint": "Kliknite ali pritisnite Esc za vrnitev",
+  "app_page_screenshot_zoom": "Kliknite za povečavo",
+  "dependency_block_title": "Odstranitev je blokirana",
+  "dependency_block_message": "Nameščena programska oprema je še vedno odvisna od »{name}«. Najprej jo odstranite:\n\n{blockers}",
+  "dependency_block_button_tooltip": "Odstranitev je blokirana: nameščena programska oprema je še vedno odvisna od te funkcije"
 }

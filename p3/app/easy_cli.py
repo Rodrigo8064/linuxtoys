@@ -17,6 +17,7 @@ from .manifest_helper import (
 from .library_loader import script_command, script_preamble
 from .dev_mode import is_dev_mode_enabled
 from .compat import get_system_compat_keys, get_linuxtoys_cache_dir
+from . import installed_packages
 from .revert_helper import build_auto_revert_script_entry, build_uninstall_script_entry
 from .repo_parser import materialize_repo_script
 
@@ -119,6 +120,19 @@ def _save_script_to_registry(script_name, transmap_path):
             entry += "Changes: (none)\n"
         entry += "---\n\n"
         
+        # A legacy writer could leave the file without a trailing newline;
+        # appending after that would glue this entry's header onto the
+        # previous entry's last line and hide it from line-based parsing.
+        try:
+            if os.path.exists(registry_file) and os.path.getsize(registry_file) > 0:
+                with open(registry_file, "rb") as handle:
+                    handle.seek(-1, os.SEEK_END)
+                    if handle.read(1) != b"\n":
+                        with open(registry_file, "a") as fixup:
+                            fixup.write("\n")
+        except OSError:
+            pass
+
         # Append to registry file
         with open(registry_file, "a") as f:
             f.write(entry)
@@ -301,10 +315,18 @@ def easy_cli_run_script(script_info):
         run_info["path"] = temp_file_path
         code = _run_script_with_registry_name(run_info)
 
+        # Scripts with `# registry: no` never track their own transaction
+        # (e.g. sysup.sh only updates the system); call_script children keep
+        # registering independently.
+        registry_disabled = str(
+            script_info.get("registry", "") or ""
+        ).strip().lower() == "no"
+
         # Save to registry and wipe transmap file if script executed successfully
         if code == 0:
             transmap_path = "/tmp/linuxtoys/transmap"
-            _save_script_to_registry(registry_name, transmap_path)
+            if not registry_disabled:
+                _save_script_to_registry(registry_name, transmap_path)
             # Clean up any temp directories created by prep_tmp_noram before removing transmap
             _cleanup_tmp_noram_dirs(transmap_path)
             try:
@@ -465,6 +487,16 @@ def scripts_install(args: list, skip_confirmation, translations):
 
 def _run_uninstall_entry(script_info, translations):
     """Build and execute the registry-based uninstall entry for one script."""
+    # Provider features (Homebrew, Flathub, Snapcraft, Paru, Gear Lever)
+    # cannot be removed while anything installed through them remains.
+    blockers = installed_packages.dependency_blockers(script_info)
+    if blockers:
+        name = script_info.get("name", "unknown")
+        print(f"✗ Cannot remove '{name}' yet — installed software still depends on it:")
+        for blocker in blockers:
+            print(f"   • {blocker}")
+        return 1
+
     uninstall_entry = build_uninstall_script_entry(script_info, translations)
     if not uninstall_entry:
         print(f"✗ No removable registry entry found for '{script_info.get('name', 'unknown')}'.")
