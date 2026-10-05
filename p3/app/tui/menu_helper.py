@@ -1,15 +1,13 @@
 from app.easy_cli import is_dev_mode_enabled
-from app.updater.update_helper import UpdateHelper
 
 from .about_helper import AboutWidget
-from .dialog_screen import LanguageSelectorDialog, UpdateAvailableDialog
+from .dialog_screen import LanguageSelectorDialog
 from .helper import (
     invalidate_search_caches,
     translations,
     warm_search_and_category_index,
 )
 from .manifest_dialog import ManifestDialog
-from .my_widgets import Terminal
 from .registry_screen import RegistryScreen
 
 
@@ -18,7 +16,6 @@ class MenuSelectionMixin:
     Mixin para lidar com a lógica de seleção de itens no menu principal da HomeScreen.
     """
 
-    _running_is_update: bool = False
     _is_about_showing: bool = False
 
     def on_list_view_selected(self, event) -> None:
@@ -80,48 +77,6 @@ class MenuSelectionMixin:
             about_content = self.query("#about-content")
             if about_content:
                 about_content.remove()
-
-    def _trigger_update_check(self) -> None:
-        """Inicia a verificação de atualização em uma thread de trabalho."""
-        self.notify("LinuxToys Update Checker...")
-        self.run_worker(self._check_for_update, thread=True, exclusive=True)
-
-    def _check_for_update(self) -> None:
-        """
-        Executa a verificação de atualização e chama o callback na thread principal.
-        (Este método roda em uma thread de trabalho)
-        """
-        helper = UpdateHelper()
-        available = helper._update_available()
-        self.app.call_from_thread(self._on_update_checked, helper, available)
-
-    def _on_update_checked(
-        self, helper: UpdateHelper, available: bool
-    ) -> None:
-        """
-        Callback executado após a verificação de atualização.
-        Abre o diálogo de confirmação se uma atualização estiver disponível.
-        """
-        if not available:
-            self.notify("✓ It's already on the latest available version")
-            return
-        tag = helper._latest_ver.get("tag_name", "")
-        body = helper._latest_ver.get("body", "Sem changelog disponível.")
-        self.app.push_screen(
-            UpdateAvailableDialog(tag, body), callback=self._on_update_decision
-        )
-
-    def _on_update_decision(self, wants_update: bool | None) -> None:
-        """Inicia o processo de atualização se o usuário confirmar."""
-        if not wants_update:
-            return
-
-        self._running_is_update = True
-        self._show_terminal()
-        terminal = self.query_one("#terminal", Terminal)
-        terminal.run_script(
-            ["sh", "-c", "curl -fsSL https://linux.toys/install.sh | bash"]
-        )
 
     def _start_scripts_resync(self) -> None:
         """Inicia a ressincronização dos scripts se o modo de desenvolvedor não estiver ativo."""

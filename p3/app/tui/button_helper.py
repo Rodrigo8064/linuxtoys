@@ -1,3 +1,4 @@
+import asyncio
 import os
 import shlex
 import tempfile
@@ -21,8 +22,11 @@ from app.parser import get_breadcrumb_path, script_requires_reboot
 from app.registry_utils import parse_registry_file
 from app.repo_parser import materialize_repo_script
 from app.revert_helper import build_uninstall_script_entry
+from app.updater.update_helper import UpdateHelper
 
 from .appstream_executor import (
+    AUR_SECURITY_BLOCKED,
+    AUR_SECURITY_OK,
     build_aur_install_script,
     build_install_script,
     build_snap_revert_command,
@@ -37,6 +41,7 @@ from .dialog_screen import (
     RemoveScriptScreen,
     SuccessDialog,
     SudoPasswordScreen,
+    UpdateAvailableDialog,
     UpdateCompleteDialog,
 )
 from .helper import (
@@ -62,24 +67,17 @@ TRANSMAP_PATH = "/tmp/linuxtoys/transmap"
 
 
 class ScriptRunnerMixin:
+    """Instalação/desinstalação de scripts.
+
+    Também mantém o estado de execução comum e os helpers/handlers
+    compartilhados (terminal, limpeza, ``on_script_finished``).
+    """
+
     _running_button: InfoButton | None = None
     _running_script_info: dict | None = None
     _running_temp_path: str | None = None
     _running_dev_mode: bool = False
     _running_is_uninstall: bool = False
-    _running_is_update: bool = False
-    _running_is_appstream: bool = False
-    _running_appstream_action: str | None = None
-    _manifest_queue: list[dict] = []
-    _manifest_results: list[dict] = []
-    _manifest_temp_files: list[str] = []
-    _manifest_bootstrap: dict | None = None
-    _is_manifest_run: bool = False
-
-    _MANIFEST_BOOTSTRAP_LABELS = {
-        "flatpak": "Flatpak/Flathub",
-        "homebrew": "Homebrew",
-    }
 
     async def handle_desc_button(self, button: InfoButton) -> None:
         """Call a function based on is script or not."""
@@ -202,6 +200,352 @@ class ScriptRunnerMixin:
             env=env,
         )
 
+    def run_uninstall(self, button: InfoButton) -> None:
+        script_info = {"name": str(button.label), "path": button.path}
+        uninstall_entry = build_uninstall_script_entry(
+            script_info, translations
+        )
+
+        if not uninstall_entry:
+            self.notify(
+                f"✗ No removable registry entry found for "
+                f"'{script_info['name']}'.",
+                severity="warning",
+            )
+            return
+
+        uninstall_path = uninstall_entry["path"]
+        cleanup_path = uninstall_entry.get("cleanup_path")
+
+        self._running_button = button
+        self._running_script_info = script_info
+        self._running_temp_path = cleanup_path
+        self._running_dev_mode = False
+        self._running_is_uninstall = True
+        self._running_is_appstream = False
+
+        self._show_terminal()
+        terminal = self.query_one("#terminal", Terminal)
+        terminal.run_script(
+            script_command(uninstall_path, resolve_script_dir())
+        )
+
+    def _show_terminal(self) -> None:
+        logo = self.query_one("#logo_lt")
+        menu = self.query_one("#home-menu")
+        terminal_container = self.query_one("#terminal-conteiner")
+        terminal = self.query_one("#terminal", Terminal)
+
+        logo.display = False
+        menu.display = False
+        terminal_container.display = True
+        terminal.focus()
+
+    def _hide_terminal(self) -> None:
+        logo = self.query_one("#logo_lt")
+        menu = self.query_one("#home-menu")
+        terminal_container = self.query_one("#terminal-conteiner")
+
+        terminal_container.display = False
+        logo.display = True
+        menu.display = True
+
+    async def on_script_finished(self, message: ScriptFinished) -> None:
+        if self._running_is_update:
+            self._running_is_update = False
+            self._finish_update_run(message.exit_code)
+            return
+
+        if self._is_manifest_run:
+            self._on_manifest_item_finished(message)
+            return
+        script_info = self._running_script_info or {}
+        script_name = script_info.get("name", "Script")
+
+        # verify if is reboot
+        script_path = script_info.get("path", "")
+        system_compat_keys = get_system_compat_keys()
+        reboot = script_requires_reboot(script_path, system_compat_keys)
+
+        temp_path = self._running_temp_path
+        dev_mode = self._running_dev_mode
+        is_uninstall = self._running_is_uninstall
+        is_appstream = self._running_is_appstream
+        exit_code = message.exit_code
+        result = _classify_exit_code(exit_code)
+
+        action_done = "removed" if is_uninstall else "installed"
+        action_verb = "remove" if is_uninstall else "install"
+
+        if result is ScriptResult.SUCCESS:
+            if not dev_mode and not is_uninstall:
+                _save_script_to_registry(script_name, TRANSMAP_PATH)
+                _cleanup_tmp_noram_dirs(TRANSMAP_PATH)
+                self._remove_transmap()
+            self._cleanup_temp_file(temp_path, dev_mode)
+
+            if is_appstream:
+                page = self._current_app_page()
+                if page is not None:
+                    await show_app_page(
+                        self,
+                        script_info,
+                        translations=translations,
+                        featured=None,
+                        installed=not is_uninstall,
+                    )
+            if reboot:
+                self.app.push_screen(
+                    RebootDialog(), callback=self._finish_script_run
+                )
+            else:
+                self.app.push_screen(
+                    SuccessDialog(script_name, action=action_done),
+                    callback=self._finish_script_run,
+                )
+
+        elif result is ScriptResult.CANCELLED:
+            if not dev_mode and not is_uninstall:
+                self._remove_transmap()
+            self._cleanup_temp_file(temp_path, dev_mode)
+            if is_appstream:
+                page = self._current_app_page()
+                if page is not None:
+                    action = self._running_appstream_action
+                    if action == "uninstall":
+                        page.reset_remove_button()
+                    elif action == "revert":
+                        page.reset_revert_button()
+                    else:
+                        page.reset_install_button()
+            self.app.push_screen(
+                CancelledDialog(script_name), callback=self._finish_script_run
+            )
+
+        elif result is ScriptResult.TERMINAL_CLOSED:
+            self.notify(
+                "O terminal encerrou inesperadamente; uma nova sessão foi "
+                "iniciada automaticamente.",
+                severity="warning",
+            )
+            self._cleanup_temp_file(temp_path, dev_mode)
+            if is_appstream:
+                page = self._current_app_page()
+                if page is not None:
+                    action = self._running_appstream_action
+                    if action == "uninstall":
+                        page.reset_remove_button()
+                    elif action == "revert":
+                        page.reset_revert_button()
+                    else:
+                        page.reset_install_button()
+            self._finish_script_run()
+
+        else:  # ScriptResult.ERROR
+            if is_appstream and not is_uninstall:
+                _save_script_to_registry(script_path, TRANSMAP_PATH)
+                self._remove_transmap()
+            elif not dev_mode and not is_uninstall:
+                revert_info = {
+                    "name": script_name,
+                    "icon": "application-x-executable",
+                    "repo": "",
+                }
+                reverted = _try_execute_auto_revert(revert_info, TRANSMAP_PATH)
+                if reverted:
+                    self.notify(
+                        f"'{script_name}' failed, but automatic reversion  "
+                        "completed successfully.",
+                        severity="warning",
+                    )
+                else:
+                    self.notify("✗ Automatic reversion failed with exit code")
+                self._remove_transmap()
+
+            if is_appstream:
+                page = self._current_app_page()
+                if page is not None:
+                    action = self._running_appstream_action
+                    if action == "uninstall":
+                        page.reset_remove_button()
+                    elif action == "revert":
+                        page.reset_revert_button()
+                    else:
+                        page.reset_install_button()
+
+            terminal = self.query_one("#terminal", Terminal)
+            terminal_text = terminal.get_full_text()
+            self._cleanup_temp_file(temp_path, dev_mode)
+            self.app.push_screen(
+                ErrorDialog(script_name, exit_code, action=action_verb),
+                callback=lambda wants_report: self._on_error_dialog_closed(
+                    wants_report, script_name, exit_code, terminal_text
+                ),
+            )
+
+    def _remove_transmap(self) -> None:
+        try:
+            if os.path.exists(TRANSMAP_PATH):
+                os.remove(TRANSMAP_PATH)
+        except (IOError, OSError):
+            pass
+
+    def _cleanup_temp_file(
+        self, temp_path: str | None, dev_mode: bool
+    ) -> None:
+        if dev_mode or not temp_path:
+            return
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+
+    def _finish_script_run(self, _result=None) -> None:
+        if not self._running_is_appstream:
+            self._hide_terminal()
+        self._running_button = None
+        self._running_script_info = None
+        self._running_temp_path = None
+        self._running_is_uninstall = False
+        self._running_is_appstream = False
+        self._running_appstream_action = None
+
+    def _on_error_dialog_closed(
+        self,
+        wants_report: bool,
+        script_name: str,
+        exit_code: int,
+        terminal_text: str,
+    ) -> None:
+        self._finish_script_run()
+        if wants_report:
+            self.run_worker(
+                lambda: self._submit_bug_report(
+                    script_name, exit_code, terminal_text
+                ),
+                thread=True,
+                exclusive=False,
+            )
+
+    def _submit_bug_report(
+        self, script_name: str, exit_code: int, terminal_text: str
+    ) -> None:
+        from requests.exceptions import ConnectionError, Timeout
+
+        from app.antenna import antenna
+
+        try:
+            context_parts = [f"Script: {script_name} | exit code: {exit_code}"]
+            system_context = antenna.get_system_context()
+            if system_context:
+                context_parts.append(system_context)
+            history_context = antenna.get_history_context()
+            if history_context:
+                context_parts.append(history_context)
+            context = " | ".join(context_parts)
+
+            result = antenna.submit_issue(
+                title="Bug Report from LinuxToys (TUI)",
+                logs=terminal_text,
+                context=context,
+            )
+            if result:
+                issue_number = result.get("issue_number", "")
+                self.app.call_from_thread(
+                    self.notify,
+                    f"Bug reportado com sucesso (issue #{issue_number}).",
+                    severity="information",
+                )
+            else:
+                self.app.call_from_thread(
+                    self.notify,
+                    "Não foi possível enviar o relatório de bug.",
+                    severity="error",
+                )
+        except ConnectionError:
+            self.app.call_from_thread(
+                self.notify,
+                "Sem conexão com a internet — não foi possível reportar o bug.",
+                severity="error",
+            )
+        except Timeout:
+            self.app.call_from_thread(
+                self.notify,
+                "Tempo esgotado ao tentar reportar o bug.",
+                severity="error",
+            )
+        except Exception as exc:
+            self.app.call_from_thread(
+                self.notify,
+                f"Erro ao reportar bug: {exc}",
+                severity="error",
+            )
+
+    def on_password_prompt_detected(
+        self, message: PasswordPromptDetected
+    ) -> None:
+        """O terminal detectou algo parecido com um prompt de senha —
+        mostra o diálogo em vez de deixar o usuário digitar no terminal cru."""
+        script_name = (
+            str(self._running_button.label)
+            if self._running_button
+            else "o script"
+        )
+        self.app.push_screen(
+            SudoPasswordScreen(script_name),
+            callback=self._on_password_submitted,
+        )
+
+    def _on_password_submitted(self, password: str | None) -> None:
+        terminal = self.query_one("#terminal", Terminal)
+        if password is None:
+            terminal.cancel_password_prompt()
+            terminal.send_interrupt()
+        else:
+            terminal.send_password(password)
+        terminal.focus()
+
+    def _update_breadcrumb(self) -> None:
+        panel = self.query_one("#left-panel-home")
+        base = "LinuxToys"
+        if not self._nav_stack:
+            panel.border_title = base
+            return
+
+        current_path, current_name = self._nav_stack[-1]
+        if is_specials_path(current_path):
+            specials_label = translations.get("specials", "Specials")
+            if current_path == SPECIALS_ROOT:
+                panel.border_title = specials_label
+            else:
+                panel.border_title = f"{specials_label} > {current_name}"
+            return
+
+        crumbs = get_breadcrumb_path(current_path, translations)
+        names = " › ".join(
+            translations.get(c["name"], c["name"]) for c in crumbs
+        )
+        panel.border_title = names if names else base
+
+    def _current_app_page(self) -> AppPageWidget | None:
+        try:
+            return self.query_one(AppPageWidget)
+        except NoMatches:
+            return None
+
+
+class AppstreamRunnerMixin:
+    """Instalação, remoção e reversão de itens via AppStream."""
+
+    _running_is_appstream: bool = False
+    _running_appstream_action: str | None = None
+
+    _running_button: InfoButton | None
+    _running_script_info: dict | None
+    _running_temp_path: str | None
+    _running_dev_mode: bool
+    _running_is_uninstall: bool
+
     def run_appstream_install(self, script_info: Mapping[str, Any]) -> None:
         entry = dict(script_info)
         raw_script_path = build_install_script(entry)
@@ -295,6 +639,123 @@ class ScriptRunnerMixin:
             },
             pause_on_exit=False,
         )
+
+    def run_appstream_uninstall(self, script_info: Mapping[str, Any]) -> None:
+        entry = dict(script_info)
+        name = entry.get("name", "")
+        plain_script_info = {"name": name, "path": entry.get("path", "")}
+        uninstall_entry = build_uninstall_script_entry(
+            plain_script_info, translations
+        )
+
+        if not uninstall_entry:
+            self.notify(
+                f"✗ No removable registry entry found for '{name}'.",
+                severity="warning",
+            )
+            page = self._current_app_page()
+            if page is not None:
+                page.reset_remove_button()
+            return
+
+        uninstall_path = uninstall_entry["path"]
+        cleanup_path = uninstall_entry.get("cleanup_path")
+
+        self._running_button = None
+        self._running_script_info = entry
+        self._running_temp_path = cleanup_path
+        self._running_dev_mode = False
+        self._running_is_uninstall = True
+        self._running_is_appstream = True
+        self._running_appstream_action = "uninstall"
+
+        terminal = self.query_one("#terminal", Terminal)
+        terminal.run_script(
+            script_command(uninstall_path, resolve_script_dir()),
+            pause_on_exit=False,
+        )
+
+    async def run_appstream_aur_install(
+        self, script_info: Mapping[str, Any]
+    ) -> None:
+        entry = dict(script_info)
+        name = entry.get("name", "")
+        package = str(entry.get("package-name") or "").strip()
+
+        if not package:
+            self.notify(
+                f"✗ '{name}' has no AUR package name.", severity="error"
+            )
+            page = self._current_app_page()
+            if page is not None:
+                page.reset_install_button()
+            return
+
+        status, detail = await asyncio.to_thread(
+            check_aur_package_security, package
+        )
+
+        if status != AUR_SECURITY_OK:
+            page = self._current_app_page()
+            if page is not None:
+                page.reset_install_button()
+            self.app.push_screen(
+                AurSecurityDialog(
+                    name,
+                    blocked=(status == AUR_SECURITY_BLOCKED),
+                    detail=detail,
+                )
+            )
+            return
+
+        raw_path = build_aur_install_script(package)
+        resolve_script_dir()
+        script_path = create_temp_file(raw_path)
+        try:
+            os.remove(raw_path)
+        except OSError:
+            pass
+
+        try:
+            with open(TRANSMAP_PATH, "w"):
+                pass
+        except (IOError, OSError):
+            pass
+
+        self._running_button = None
+        self._running_script_info = entry
+        self._running_temp_path = script_path
+        self._running_dev_mode = False
+        self._running_is_uninstall = False
+        self._running_is_appstream = True
+        self._running_appstream_action = "install"
+
+        terminal = self.query_one("#terminal", Terminal)
+        terminal.run_script(
+            script_path,
+            env={
+                "LINUXTOYS_SCRIPT_NAME": name or "unknown",
+                "DISABLE_ZENITY": "1",
+                "CACHE_DIR": os.environ.get("SCRIPT_DIR", "") + "/scripts",
+                "TRANSMAP_PATH": TRANSMAP_PATH,
+            },
+            pause_on_exit=False,
+        )
+
+
+class ManifestRunnerMixin:
+    """Instalação de scripts via manifesto."""
+
+    _manifest_queue: list[dict] = []
+    _manifest_results: list[dict] = []
+    _manifest_temp_files: list[str] = []
+    _manifest_bootstrap: dict | None = None
+    _is_manifest_run: bool = False
+
+    _MANIFEST_BOOTSTRAP_LABELS = {
+        "flatpak": "Flatpak/Flathub",
+        "homebrew": "Homebrew",
+    }
 
     def on_manifest_chosen(self, manifest_path: str | None) -> None:
         if manifest_path is None:
@@ -868,250 +1329,53 @@ class ScriptRunnerMixin:
         script_info = self._manifest_queue.pop(0)
         self._execute_script_info(script_info)
 
-    def run_uninstall(self, button: InfoButton) -> None:
-        script_info = {"name": str(button.label), "path": button.path}
-        uninstall_entry = build_uninstall_script_entry(
-            script_info, translations
+
+class UpdateRunnerMixin:
+    """Atualização do projeto."""
+
+    _running_is_update: bool = False
+
+    def _trigger_update_check(self) -> None:
+        """Inicia a verificação de atualização em uma thread de trabalho."""
+        self.notify("LinuxToys Update Checker...")
+        self.run_worker(self._check_for_update, thread=True, exclusive=True)
+
+    def _check_for_update(self) -> None:
+        """
+        Executa a verificação de atualização e chama o callback na thread principal.
+        (Este método roda em uma thread de trabalho)
+        """
+        helper = UpdateHelper()
+        available = helper._update_available()
+        self.app.call_from_thread(self._on_update_checked, helper, available)
+
+    def _on_update_checked(
+        self, helper: UpdateHelper, available: bool
+    ) -> None:
+        """
+        Callback executado após a verificação de atualização.
+        Abre o diálogo de confirmação se uma atualização estiver disponível.
+        """
+        if not available:
+            self.notify("✓ It's already on the latest available version")
+            return
+        tag = helper._latest_ver.get("tag_name", "")
+        body = helper._latest_ver.get("body", "Sem changelog disponível.")
+        self.app.push_screen(
+            UpdateAvailableDialog(tag, body), callback=self._on_update_decision
         )
 
-        if not uninstall_entry:
-            self.notify(
-                f"✗ No removable registry entry found for "
-                f"'{script_info['name']}'.",
-                severity="warning",
-            )
+    def _on_update_decision(self, wants_update: bool | None) -> None:
+        """Inicia o processo de atualização se o usuário confirmar."""
+        if not wants_update:
             return
 
-        uninstall_path = uninstall_entry["path"]
-        cleanup_path = uninstall_entry.get("cleanup_path")
-
-        self._running_button = button
-        self._running_script_info = script_info
-        self._running_temp_path = cleanup_path
-        self._running_dev_mode = False
-        self._running_is_uninstall = True
-        self._running_is_appstream = False
-
+        self._running_is_update = True
         self._show_terminal()
         terminal = self.query_one("#terminal", Terminal)
         terminal.run_script(
-            script_command(uninstall_path, resolve_script_dir())
+            ["sh", "-c", "curl -fsSL https://linux.toys/install.sh | bash"]
         )
-
-    def run_appstream_uninstall(self, script_info: Mapping[str, Any]) -> None:
-        entry = dict(script_info)
-        name = entry.get("name", "")
-        plain_script_info = {"name": name, "path": entry.get("path", "")}
-        uninstall_entry = build_uninstall_script_entry(
-            plain_script_info, translations
-        )
-
-        if not uninstall_entry:
-            self.notify(
-                f"✗ No removable registry entry found for '{name}'.",
-                severity="warning",
-            )
-            page = self._current_app_page()
-            if page is not None:
-                page.reset_remove_button()
-            return
-
-        uninstall_path = uninstall_entry["path"]
-        cleanup_path = uninstall_entry.get("cleanup_path")
-
-        self._running_button = None
-        self._running_script_info = entry
-        self._running_temp_path = cleanup_path
-        self._running_dev_mode = False
-        self._running_is_uninstall = True
-        self._running_is_appstream = True
-        self._running_appstream_action = "uninstall"
-
-        terminal = self.query_one("#terminal", Terminal)
-        terminal.run_script(
-            script_command(uninstall_path, resolve_script_dir()),
-            pause_on_exit=False,
-        )
-
-    def _show_terminal(self) -> None:
-        logo = self.query_one("#logo_lt")
-        menu = self.query_one("#home-menu")
-        terminal_container = self.query_one("#terminal-conteiner")
-        terminal = self.query_one("#terminal", Terminal)
-
-        logo.display = False
-        menu.display = False
-        terminal_container.display = True
-        terminal.focus()
-
-    def _hide_terminal(self) -> None:
-        logo = self.query_one("#logo_lt")
-        menu = self.query_one("#home-menu")
-        terminal_container = self.query_one("#terminal-conteiner")
-
-        terminal_container.display = False
-        logo.display = True
-        menu.display = True
-
-    async def on_script_finished(self, message: ScriptFinished) -> None:
-        if self._running_is_update:
-            self._running_is_update = False
-            self._finish_update_run(message.exit_code)
-            return
-
-        if self._is_manifest_run:
-            self._on_manifest_item_finished(message)
-            return
-        script_info = self._running_script_info or {}
-        script_name = script_info.get("name", "Script")
-
-        # verify if is reboot
-        script_path = script_info.get("path", "")
-        system_compat_keys = get_system_compat_keys()
-        reboot = script_requires_reboot(script_path, system_compat_keys)
-
-        temp_path = self._running_temp_path
-        dev_mode = self._running_dev_mode
-        is_uninstall = self._running_is_uninstall
-        is_appstream = self._running_is_appstream
-        exit_code = message.exit_code
-        result = _classify_exit_code(exit_code)
-
-        action_done = "removed" if is_uninstall else "installed"
-        action_verb = "remove" if is_uninstall else "install"
-
-        if result is ScriptResult.SUCCESS:
-            if not dev_mode and not is_uninstall:
-                _save_script_to_registry(script_name, TRANSMAP_PATH)
-                _cleanup_tmp_noram_dirs(TRANSMAP_PATH)
-                self._remove_transmap()
-            self._cleanup_temp_file(temp_path, dev_mode)
-
-            if is_appstream:
-                page = self._current_app_page()
-                if page is not None:
-                    await show_app_page(
-                        self,
-                        script_info,
-                        translations=translations,
-                        featured=None,
-                        installed=not is_uninstall,
-                    )
-            if reboot:
-                self.app.push_screen(
-                    RebootDialog(), callback=self._finish_script_run
-                )
-            else:
-                self.app.push_screen(
-                    SuccessDialog(script_name, action=action_done),
-                    callback=self._finish_script_run,
-                )
-
-        elif result is ScriptResult.CANCELLED:
-            if not dev_mode and not is_uninstall:
-                self._remove_transmap()
-            self._cleanup_temp_file(temp_path, dev_mode)
-            if is_appstream:
-                page = self._current_app_page()
-                if page is not None:
-                    action = self._running_appstream_action
-                    if action == "uninstall":
-                        page.reset_remove_button()
-                    elif action == "revert":
-                        page.reset_revert_button()
-                    else:
-                        page.reset_install_button()
-            self.app.push_screen(
-                CancelledDialog(script_name), callback=self._finish_script_run
-            )
-
-        elif result is ScriptResult.TERMINAL_CLOSED:
-            self.notify(
-                "O terminal encerrou inesperadamente; uma nova sessão foi "
-                "iniciada automaticamente.",
-                severity="warning",
-            )
-            self._cleanup_temp_file(temp_path, dev_mode)
-            if is_appstream:
-                page = self._current_app_page()
-                if page is not None:
-                    action = self._running_appstream_action
-                    if action == "uninstall":
-                        page.reset_remove_button()
-                    elif action == "revert":
-                        page.reset_revert_button()
-                    else:
-                        page.reset_install_button()
-            self._finish_script_run()
-
-        else:  # ScriptResult.ERROR
-            if is_appstream and not is_uninstall:
-                _save_script_to_registry(script_path, TRANSMAP_PATH)
-                self._remove_transmap()
-            elif not dev_mode and not is_uninstall:
-                revert_info = {
-                    "name": script_name,
-                    "icon": "application-x-executable",
-                    "repo": "",
-                }
-                reverted = _try_execute_auto_revert(revert_info, TRANSMAP_PATH)
-                if reverted:
-                    self.notify(
-                        f"'{script_name}' failed, but automatic reversion  "
-                        "completed successfully.",
-                        severity="warning",
-                    )
-                else:
-                    self.notify("✗ Automatic reversion failed with exit code")
-                self._remove_transmap()
-
-            if is_appstream:
-                page = self._current_app_page()
-                if page is not None:
-                    action = self._running_appstream_action
-                    if action == "uninstall":
-                        page.reset_remove_button()
-                    elif action == "revert":
-                        page.reset_revert_button()
-                    else:
-                        page.reset_install_button()
-
-            terminal = self.query_one("#terminal", Terminal)
-            terminal_text = terminal.get_full_text()
-            self._cleanup_temp_file(temp_path, dev_mode)
-            self.app.push_screen(
-                ErrorDialog(script_name, exit_code, action=action_verb),
-                callback=lambda wants_report: self._on_error_dialog_closed(
-                    wants_report, script_name, exit_code, terminal_text
-                ),
-            )
-
-    def _remove_transmap(self) -> None:
-        try:
-            if os.path.exists(TRANSMAP_PATH):
-                os.remove(TRANSMAP_PATH)
-        except (IOError, OSError):
-            pass
-
-    def _cleanup_temp_file(
-        self, temp_path: str | None, dev_mode: bool
-    ) -> None:
-        if dev_mode or not temp_path:
-            return
-        try:
-            os.remove(temp_path)
-        except OSError:
-            pass
-
-    def _finish_script_run(self, _result=None) -> None:
-        if not self._running_is_appstream:
-            self._hide_terminal()
-        self._running_button = None
-        self._running_script_info = None
-        self._running_temp_path = None
-        self._running_is_uninstall = False
-        self._running_is_appstream = False
-        self._running_appstream_action = None
 
     def _finish_update_run(self, exit_code: int | None) -> None:
         if exit_code == 0:
@@ -1129,193 +1393,3 @@ class ScriptRunnerMixin:
 
         self.app.exit()
         os.execv(sys.executable, [sys.executable] + sys.argv)
-
-    def _on_error_dialog_closed(
-        self,
-        wants_report: bool,
-        script_name: str,
-        exit_code: int,
-        terminal_text: str,
-    ) -> None:
-        self._finish_script_run()
-        if wants_report:
-            self.run_worker(
-                lambda: self._submit_bug_report(
-                    script_name, exit_code, terminal_text
-                ),
-                thread=True,
-                exclusive=False,
-            )
-
-    def _submit_bug_report(
-        self, script_name: str, exit_code: int, terminal_text: str
-    ) -> None:
-        from requests.exceptions import ConnectionError, Timeout
-
-        from app.antenna import antenna
-
-        try:
-            context_parts = [f"Script: {script_name} | exit code: {exit_code}"]
-            system_context = antenna.get_system_context()
-            if system_context:
-                context_parts.append(system_context)
-            history_context = antenna.get_history_context()
-            if history_context:
-                context_parts.append(history_context)
-            context = " | ".join(context_parts)
-
-            result = antenna.submit_issue(
-                title="Bug Report from LinuxToys (TUI)",
-                logs=terminal_text,
-                context=context,
-            )
-            if result:
-                issue_number = result.get("issue_number", "")
-                self.app.call_from_thread(
-                    self.notify,
-                    f"Bug reportado com sucesso (issue #{issue_number}).",
-                    severity="information",
-                )
-            else:
-                self.app.call_from_thread(
-                    self.notify,
-                    "Não foi possível enviar o relatório de bug.",
-                    severity="error",
-                )
-        except ConnectionError:
-            self.app.call_from_thread(
-                self.notify,
-                "Sem conexão com a internet — não foi possível reportar o bug.",
-                severity="error",
-            )
-        except Timeout:
-            self.app.call_from_thread(
-                self.notify,
-                "Tempo esgotado ao tentar reportar o bug.",
-                severity="error",
-            )
-        except Exception as exc:
-            self.app.call_from_thread(
-                self.notify,
-                f"Erro ao reportar bug: {exc}",
-                severity="error",
-            )
-
-    def on_password_prompt_detected(
-        self, message: PasswordPromptDetected
-    ) -> None:
-        """O terminal detectou algo parecido com um prompt de senha —
-        mostra o diálogo em vez de deixar o usuário digitar no terminal cru."""
-        script_name = (
-            str(self._running_button.label)
-            if self._running_button
-            else "o script"
-        )
-        self.app.push_screen(
-            SudoPasswordScreen(script_name),
-            callback=self._on_password_submitted,
-        )
-
-    def _on_password_submitted(self, password: str | None) -> None:
-        terminal = self.query_one("#terminal", Terminal)
-        if password is None:
-            terminal.cancel_password_prompt()
-            terminal.send_interrupt()
-        else:
-            terminal.send_password(password)
-        terminal.focus()
-
-    def _update_breadcrumb(self) -> None:
-        panel = self.query_one("#left-panel-home")
-        base = "LinuxToys"
-        if not self._nav_stack:
-            panel.border_title = base
-            return
-
-        current_path, current_name = self._nav_stack[-1]
-        if is_specials_path(current_path):
-            specials_label = translations.get("specials", "Specials")
-            if current_path == SPECIALS_ROOT:
-                panel.border_title = specials_label
-            else:
-                panel.border_title = f"{specials_label} > {current_name}"
-            return
-
-        crumbs = get_breadcrumb_path(current_path, translations)
-        names = " › ".join(
-            translations.get(c["name"], c["name"]) for c in crumbs
-        )
-        panel.border_title = names if names else base
-
-    def _current_app_page(self) -> AppPageWidget | None:
-        try:
-            return self.query_one(AppPageWidget)
-        except NoMatches:
-            return None
-
-    async def run_appstream_aur_install(
-        self, script_info: Mapping[str, Any]
-    ) -> None:
-        entry = dict(script_info)
-        name = entry.get("name", "")
-        package = str(entry.get("package-name") or "").strip()
-
-        if not package:
-            self.notify(
-                f"✗ '{name}' has no AUR package name.", severity="error"
-            )
-            page = self._current_app_page()
-            if page is not None:
-                page.reset_install_button()
-            return
-
-        status, detail = await asyncio.to_thread(
-            check_aur_package_security, package
-        )
-
-        if status != AUR_SECURITY_OK:
-            page = self._current_app_page()
-            if page is not None:
-                page.reset_install_button()
-            self.app.push_screen(
-                AurSecurityDialog(
-                    name,
-                    blocked=(status == AUR_SECURITY_BLOCKED),
-                    detail=detail,
-                )
-            )
-            return
-
-        raw_path = build_aur_install_script(package)
-        resolve_script_dir()
-        script_path = create_temp_file(raw_path)
-        try:
-            os.remove(raw_path)
-        except OSError:
-            pass
-
-        try:
-            with open(TRANSMAP_PATH, "w"):
-                pass
-        except (IOError, OSError):
-            pass
-
-        self._running_button = None
-        self._running_script_info = entry
-        self._running_temp_path = script_path
-        self._running_dev_mode = False
-        self._running_is_uninstall = False
-        self._running_is_appstream = True
-        self._running_appstream_action = "install"
-
-        terminal = self.query_one("#terminal", Terminal)
-        terminal.run_script(
-            script_path,
-            env={
-                "LINUXTOYS_SCRIPT_NAME": name or "unknown",
-                "DISABLE_ZENITY": "1",
-                "CACHE_DIR": os.environ.get("SCRIPT_DIR", "") + "/scripts",
-                "TRANSMAP_PATH": TRANSMAP_PATH,
-            },
-            pause_on_exit=False,
-        )

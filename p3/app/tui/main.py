@@ -27,7 +27,12 @@ from .app_page_translate import (
     save_cached_translation,
     translate_description_blocks,
 )
-from .button_helper import ScriptRunnerMixin
+from .button_helper import (
+    AppstreamRunnerMixin,
+    ManifestRunnerMixin,
+    ScriptRunnerMixin,
+    UpdateRunnerMixin,
+)
 from .dialog_screen import ReportBugDialog
 from .helper import (
     get_categories,
@@ -53,7 +58,13 @@ from .tui_app_page import AppPageWidget, hide_app_page, show_app_page
 
 
 class HomeScreen(
-    MenuSelectionMixin, ScriptRunnerMixin, RegistryOpenerMixin, Screen
+    MenuSelectionMixin,
+    ScriptRunnerMixin,
+    AppstreamRunnerMixin,
+    UpdateRunnerMixin,
+    ManifestRunnerMixin,
+    RegistryOpenerMixin,
+    Screen,
 ):
     """main screen for linuxtoys TUI"""
 
