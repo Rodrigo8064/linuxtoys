@@ -51,6 +51,7 @@ from .my_widgets import (
     Terminal,
 )
 from .registry_screen import RegistryOpenerMixin
+from .skills_view_tui import SkillsSeekerView
 from .tui_app_page import AppPageWidget, hide_app_page, show_app_page
 
 # info = get_script_info("Steam")
@@ -71,6 +72,7 @@ class HomeScreen(
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._nav_stack: list[tuple[str, str]] = []
+        self._is_skills_seeker_showing = False
 
     CSS_PATH = "style.tcss"
     _search_timer: asyncio.TimerHandle | None = None
@@ -187,6 +189,11 @@ class HomeScreen(
     def _is_app_page_showing(self) -> bool:
         return bool(self.query(AppPageWidget))
 
+    @property
+    def is_skills_seeker_showing(self) -> bool:
+        """Verifica se a tela de Skills Seeker está sendo exibida."""
+        return self._is_skills_seeker_showing
+
     def _make_info_button(self, item: dict, registry_data) -> InfoButton:
         return InfoButton(
             item["name"],
@@ -235,7 +242,11 @@ class HomeScreen(
             script_path.endswith("skills-seeker.sh")
             or script_name == "Skills Seeker"
         ):
-            self.notify("ainda nao esta pronto")
+            self.query_one("#logo_lt").display = False
+            self.query_one("#home-menu").display = False
+            menu_panel = self.query_one("#menu-panel")
+            await menu_panel.mount(SkillsSeekerView(translations=translations))
+            self._is_skills_seeker_showing = True
             return
 
         if button.is_repo_entry and button.has_app_page:
@@ -378,6 +389,20 @@ class HomeScreen(
             await hide_app_page(self)
             return
 
+        if self.is_skills_seeker_showing:
+            # Remove o widget do Skills Seeker
+            skills_view = self.query(SkillsSeekerView)
+            if skills_view:
+                await skills_view.remove()
+
+            # Restaura o menu principal
+            self.query_one("#logo_lt").display = True
+            self.query_one("#home-menu").display = True
+            self.query_one("#menu-panel").border_title = "Menu"
+
+            self._is_skills_seeker_showing = False
+            return
+
         if self._is_about_showing:
             self._toggle_about_panel(force_hide=True)
             logo = self.query_one("#logo_lt")
@@ -400,6 +425,8 @@ class HomeScreen(
         self._update_breadcrumb()
 
     async def action_reset_to_home(self) -> None:
+        if self.is_skills_seeker_showing:
+            await self.action_go_back()
         self.query_one("#search-input", Input).value = ""
         self._nav_stack.clear()
         await self._render_items(self._home_items())
