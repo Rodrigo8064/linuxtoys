@@ -18,6 +18,7 @@ from textual.widgets import (
     Static,
 )
 
+from app import homebrew_catalog
 from app.lang_utils import detect_system_language
 from app.registry_utils import parse_registry_file
 
@@ -192,7 +193,7 @@ class HomeScreen(
     @property
     def is_skills_seeker_showing(self) -> bool:
         """Verifica se a tela de Skills Seeker está sendo exibida."""
-        return self._is_skills_seeker_showing
+        return bool(self.query(SkillsSeekerView))
 
     def _make_info_button(self, item: dict, registry_data) -> InfoButton:
         return InfoButton(
@@ -236,6 +237,9 @@ class HomeScreen(
         if not isinstance(button, InfoButton):
             return
 
+        if self.is_skills_seeker_showing:
+            await self.action_go_back()
+
         script_path = button.path
         script_name = str(button.label)
         if (
@@ -245,8 +249,7 @@ class HomeScreen(
             self.query_one("#logo_lt").display = False
             self.query_one("#home-menu").display = False
             menu_panel = self.query_one("#menu-panel")
-            await menu_panel.mount(SkillsSeekerView(translations=translations))
-            self._is_skills_seeker_showing = True
+            await menu_panel.mount(SkillsSeekerView())
             return
 
         if button.is_repo_entry and button.has_app_page:
@@ -379,10 +382,27 @@ class HomeScreen(
 
     def _home_items(self) -> list[dict]:
         """Top-level items: Specials button first, then the cached categories."""
-        return [
+        category_snapshot = [
             get_specials_root_item(translations),
             *get_categories(translations),
         ]
+        if homebrew_catalog.enabled():
+            category_snapshot.append(self._homebrew_category_info())
+        return category_snapshot
+
+    def _homebrew_category_info(self):
+        return {
+            "name": "Homebrew",
+            "description": translations.get(
+                "homebrew_category_desc", "Packages from Homebrew."
+            ),
+            "icon": "brew.png",
+            "path": "homebrew://catalog",
+            "type": "category",
+            "is_script": False,
+            "is_subcategory": False,
+            "is_homebrew_category": True,
+        }
 
     async def action_go_back(self) -> None:
         if self._is_app_page_showing:
@@ -390,17 +410,13 @@ class HomeScreen(
             return
 
         if self.is_skills_seeker_showing:
-            # Remove o widget do Skills Seeker
             skills_view = self.query(SkillsSeekerView)
             if skills_view:
                 await skills_view.remove()
 
-            # Restaura o menu principal
             self.query_one("#logo_lt").display = True
             self.query_one("#home-menu").display = True
             self.query_one("#menu-panel").border_title = "Menu"
-
-            self._is_skills_seeker_showing = False
             return
 
         if self._is_about_showing:

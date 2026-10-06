@@ -1,11 +1,12 @@
 import json
 import os
+import shutil
 import subprocess
 from functools import partial
 
 from textual import on
 from textual.app import ComposeResult
-from textual.containers import Vertical
+from textual.containers import Grid, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
@@ -18,28 +19,83 @@ from textual.widgets import (
     TabPane,
 )
 
+from .helper import translations
 
 # --- Reusable Business Logic ---
-# This function is a direct adaptation from skills_view.py, ensuring
-# the same business logic is used.
+
+
 def _run_fetcher(command: str, *args: str) -> str | None:
     """Runs the skills_fetcher.py script to get data."""
-    fetcher_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "../../skills_fetcher.py"
+    # This path assumes skills_fetcher.py is at the project root.
+    fetcher_path = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "../..", "skills_fetcher.py")
     )
-    python = os.environ.get("PYTHON", "python3")
+    if not os.path.exists(fetcher_path):
+        return None
+    python = shutil.which("python3") or shutil.which("python")
+    if not python:
+        return None
     cmd = [python, fetcher_path, command, *args]
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=15, check=False
         )
         return result.stdout if result.returncode == 0 else None
-    except (subprocess.TimeoutExpired, FileNotFoundError):
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        # Log the error for debugging, but don't crash.
+        print(f"Error running fetcher: {e}", flush=True)
         return None
+
+
+def _run_npx_command(*args: str) -> tuple[bool, str]:
+    """Runs an npx command and returns (success, output)."""
+    npx = shutil.which("npx")
+    if not npx:
+        return False, "Error: 'npx' is not installed or not in PATH."
+    cmd = [npx, *args]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=120, check=False
+        )
+        output = result.stdout.strip() or result.stderr.strip()
+        return result.returncode == 0, output
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        return False, f"Error executing npx command: {e}"
+
+
+def _detect_agents() -> list[str]:
+    """
+    Detects installed AI agents based on directory presence.
+    Reused directly from skills_view.py logic.
+    """
+    home = os.path.expanduser("~")
+    agents = []
+    checks = [
+        (os.path.join(home, ".claude"), "claude-code"),
+        (os.path.join(home, ".codex"), "codex"),
+        (os.path.join(home, ".config", "opencode"), "opencode"),
+        (os.path.join(home, ".cursor"), "cursor"),
+        (os.path.join(home, ".windsurf"), "windsurf"),
+        (os.path.join(home, ".gemini"), "gemini-cli"),
+        (os.path.join(home, ".agents"), "cline"),
+        (os.path.join(home, ".roo"), "roo"),
+        (os.path.join(home, ".trae"), "trae"),
+        (os.path.join(home, ".kilocode"), "kilo"),
+        (os.path.join(home, ".factory"), "droid"),
+        (os.path.join(home, ".copilot"), "github-copilot"),
+    ]
+    for path, name in checks:
+        if os.path.isdir(path):
+            agents.append(name)
+    return agents
 
 
 def _format_installs(count: int) -> str:
     """Formats install counts (e.g., 1200 -> 1.2K)."""
+    try:
+        count = int(count)
+    except (TypeError, ValueError):
+        return "0"
     if count >= 1_000_000:
         return f"{count / 1_000_000:.1f}M"
     if count >= 1_000:
@@ -47,7 +103,64 @@ def _format_installs(count: int) -> str:
     return str(count)
 
 
-# --- TUI Components ---
+# --- TUI Modal Screens ---
+
+
+class ActionDialog(ModalScreen[str]):
+    """A modal dialog to ask for skill actions."""
+
+    def __init__(self, skill_name: str):
+        super().__init__()
+        self.skill_name = skill_name
+
+    def compose(self) -> ComposeResult:
+        with Grid(id="dialog"):
+            yield Label(f"Action for [b]{self.skill_name}[/b]")
+            yield Button(
+                translations.get("skills_install_label", "Install"),
+                variant="success",
+                id="install",
+            )
+            yield Button(
+                translations.get("skills_detail_label", "View Details"),
+                id="details",
+                disabled=True,
+            )
+            yield Button(
+                translations.get("skills_back_label", "Back"),
+                variant="primary",
+                id="back",
+            )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id)
+
+
+class AgentChoiceDialog(ModalScreen[str]):
+    """A modal to choose which agent to install a skill for."""
+
+    def __init__(self, agents: list[str]):
+        super().__init__()
+        self.agents = agents
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label(
+                translations.get("skills_choose_agent_title", "Choose Agent")
+            )
+            for agent in self.agents:
+                yield Button(agent, id=agent, classes="agent_button")
+            yield Button(
+                translations.get("skills_back_label", "Cancel"),
+                id="cancel",
+                variant="error",
+            )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id)
+
+
+# --- TUI Main View and Components ---
 
 
 class SkillCard(ListItem):
@@ -87,80 +200,162 @@ class InstalledCard(ListItem):
         self.on_remove(self.skill)
 
 
-class ActionDialog(ModalScreen):
-    """A modal dialog to ask for skill actions."""
-
-    def __init__(self, skill_name: str):
-        super().__init__()
-        self.skill_name = skill_name
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="dialog"):
-            yield Label(f"Action for [b]{self.skill_name}[/b]")
-            yield Button("Install", variant="success", id="install")
-            yield Button("View Details", id="details")
-            yield Button("Back", variant="primary", id="back")
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        self.dismiss(event.button.id)
-
-
 class SkillsSeekerView(Static):
     """The main view for browsing and managing skills."""
-
-    def __init__(self, translations: dict):
-        super().__init__()
-        self.translations = translations
 
     def compose(self) -> ComposeResult:
         with TabbedContent(initial="discover") as tc:
             with TabPane("Discover", id="discover"):
                 yield LoadingIndicator()
-                yield ListView(id="discover_list")
+                yield ListView(id="discover_list", classes="hidden")
+                yield Label(
+                    "Could not load skills.",
+                    id="discover_error",
+                    classes="hidden",
+                )
             with TabPane("Installed", id="installed"):
                 yield LoadingIndicator()
-                yield ListView(id="installed_list")
+                yield ListView(id="installed_list", classes="hidden")
+                yield Label(
+                    "Could not load installed skills.",
+                    id="installed_error",
+                    classes="hidden",
+                )
         tc.border_title = "Skills Seeker"
 
     def on_mount(self) -> None:
-        """Load initial data when the widget is mounted."""
         self.load_popular()
         self.load_installed()
+
+    @on(TabbedContent.TabActivated)
+    def on_tab_activated(self, event: TabbedContent.TabActivated) -> None:
+        """Reload content when a tab is activated, if needed."""
+        if event.pane.id == "installed":
+            self.load_installed()
 
     @on(ListView.Selected, "#discover_list")
     async def on_discover_skill_selected(
         self, event: ListView.Selected
     ) -> None:
-        """Handle selection of a skill in the discover list."""
         card = event.item
         if not isinstance(card, SkillCard):
             return
 
-        def handle_dialog(result: str):
-            if result == "install":
+        action = await self.app.push_screen_wait(ActionDialog(card.name))
+        if action == "install":
+            self.run_install_flow(card.skill)
+
+    def run_install_flow(self, skill: dict) -> None:
+        """Full flow to install a skill for a chosen agent."""
+        agents = _detect_agents()
+        if not agents:
+            self.notify(
+                "No supported AI agents found on your system.",
+                severity="error",
+                timeout=5,
+            )
+            return
+
+        async def on_agent_chosen(agent: str):
+            if agent != "cancel":
                 self.notify(
-                    f"Install action for '{card.name}' (not implemented)."
+                    f"Installing '{skill['name']}' for agent '{agent}'..."
                 )
-            elif result == "details":
-                self.notify(
-                    f"Details action for '{card.name}' (not implemented)."
+                self.parent.add_class("installing")
+                self.run_worker(
+                    partial(
+                        _run_npx_command,
+                        "skills",
+                        "add",
+                        skill["source"],
+                        "--skill",
+                        skill["skillId"],
+                        "-a",
+                        agent,
+                        "-g",
+                        "-y",
+                    ),
+                    partial(self._on_install_done, skill["name"]),
+                    thread=True,
                 )
 
-        self.app.push_screen(ActionDialog(card.name), handle_dialog)
+        self.app.push_screen(AgentChoiceDialog(agents), on_agent_chosen)
+
+    def _on_install_done(
+        self, skill_name: str, result: tuple[bool, str]
+    ) -> None:
+        self.parent.remove_class("installing")
+        success, output = result
+        if success:
+            self.notify(f"Skill '{skill_name}' installed successfully.")
+            self.load_installed()
+        else:
+            self.notify(
+                f"Failed to install '{skill_name}': {output}",
+                severity="error",
+                timeout=10,
+            )
 
     def _handle_remove_skill(self, skill: dict) -> None:
-        self.notify(
-            f"Remove action for '{skill.get('name')}' (not implemented)."
+        """Initiates the skill removal process."""
+        skill_name = skill.get("name", "Unknown")
+        self.notify(f"Removing '{skill_name}'...")
+        self.parent.add_class("installing")  # Reuse loading style
+        self.run_worker(
+            partial(
+                _run_npx_command, "skills", "remove", skill_name, "-g", "-y"
+            ),
+            partial(self._on_remove_done, skill_name),
+            thread=True,
         )
-        # In a real scenario, this would call _run_fetcher('remove', ...)
-        # and refresh the list upon completion.
+
+    def _on_remove_done(
+        self, skill_name: str, result: tuple[bool, str]
+    ) -> None:
+        self.parent.remove_class("installing")
+        success, output = result
+        if success:
+            self.notify(f"Skill '{skill_name}' removed successfully.")
+            self.load_installed()
+        else:
+            self.notify(
+                f"Failed to remove '{skill_name}': {output}",
+                severity="error",
+                timeout=10,
+            )
 
     # --- Data Loading Methods ---
 
+    def _set_list_state(
+        self, list_id: str, state: str, data: list | None = None
+    ):
+        """Helper to manage UI states: loading, error, success."""
+        list_view = self.query_one(f"#{list_id}_list", ListView)
+        loading = self.query_one(f"#{list_id} LoadingIndicator")
+        error_label = self.query_one(f"#{list_id}_error", Label)
+
+        loading.display = state == "loading"
+        error_label.display = state == "error"
+        list_view.display = state == "success"
+
+        if state == "success":
+            list_view.clear()
+            if not data:
+                # Can't append to listview, so we show the error label with a different message
+                error_label.display = True
+                error_label.update("No skills found.")
+                list_view.display = False
+            elif list_id == "discover":
+                for skill in data:
+                    list_view.append(SkillCard(skill))
+            elif list_id == "installed":
+                for skill in data:
+                    list_view.append(
+                        InstalledCard(skill, self._handle_remove_skill)
+                    )
+
     def load_popular(self) -> None:
-        """Load popular skills in a background thread."""
-        self.query_one("#discover_list").display = False
-        self.query_one("#discover LoadingIndicator").display = "block"
+        self._set_list_state("discover", "loading")
         self.run_worker(
             partial(_run_fetcher, "popular", "50"),
             self._on_popular_loaded,
@@ -168,52 +363,40 @@ class SkillsSeekerView(Static):
         )
 
     def _on_popular_loaded(self, result: str | None) -> None:
-        """Callback to populate the list with popular skills."""
-        list_view = self.query_one("#discover_list", ListView)
-        list_view.clear()
         if result:
             try:
                 data = json.loads(result)
-                skills = data.get("skills", [])
-                for skill in skills:
-                    list_view.append(SkillCard(skill))
+                self._set_list_state("discover", "success", data.get("skills"))
             except json.JSONDecodeError:
-                self.notify(
-                    "Failed to parse popular skills data.", severity="error"
-                )
+                self._set_list_state("discover", "error")
         else:
-            self.notify("Could not load popular skills.", severity="error")
-
-        self.query_one("#discover LoadingIndicator").display = "none"
-        list_view.display = True
+            self._set_list_state("discover", "error")
 
     def load_installed(self) -> None:
-        """Load installed skills in a background thread."""
-        self.query_one("#installed_list").display = False
-        self.query_one("#installed LoadingIndicator").display = "block"
+        self._set_list_state("installed", "loading")
         self.run_worker(
-            partial(_run_fetcher, "list", "--json", "-g"),
+            partial(_run_npx_command, "skills", "list", "--json", "-g"),
             self._on_installed_loaded,
             thread=True,
         )
 
-    def _on_installed_loaded(self, result: str | None) -> None:
-        """Callback to populate the list with installed skills."""
-        list_view = self.query_one("#installed_list", ListView)
-        list_view.clear()
-        if result:
+    def _on_installed_loaded(self, result: tuple[bool, str]) -> None:
+        success, output = result
+        if success:
             try:
-                skills = json.loads(result or "[]")
-                for skill in skills:
-                    list_view.append(
-                        InstalledCard(skill, self._handle_remove_skill)
-                    )
+                skills = json.loads(output or "[]")
+                self._set_list_state("installed", "success", skills)
             except json.JSONDecodeError:
-                self.notify(
-                    "Failed to parse installed skills data.", severity="error"
-                )
+                self._set_list_state("installed", "error")
         else:
-            self.notify("Could not load installed skills.", severity="error")
+            self._set_list_state("installed", "error")
 
-        self.query_one("#installed LoadingIndicator").display = "none"
-        list_view.display = True
+    def do_search(self, query: str):
+        """Public method to trigger a search from the parent screen."""
+        self.query_one(TabbedContent).active = "discover"
+        self._set_list_state("discover", "loading")
+        self.run_worker(
+            partial(_run_fetcher, "search", query),
+            self._on_popular_loaded,
+            thread=True,
+        )
