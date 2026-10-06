@@ -30,6 +30,7 @@ from . import (
     parser,
     reboot_helper,
     revealer,
+    revert_helper,
     search_helper,
     skills_view,
     repo_parser,
@@ -44,6 +45,7 @@ from gi.repository import Gio
 from .window_items import ItemWidgetFactory
 from .window_search import SearchCtl
 from .window_nav import NavCtl
+from .window_sidebar import SidebarCtl
 from .featured_scripts import FeaturedCtl
 from .local_scripts import LocalScriptsCtl
 from .updater.update_dialog import UpdateDialog
@@ -56,6 +58,7 @@ logger = logging.getLogger(__name__)
 class AppWindow(
     SearchCtl,
     NavCtl,
+    SidebarCtl,
     FeaturedCtl,
     LocalScriptsCtl,
     ItemWidgetFactory,
@@ -64,6 +67,11 @@ class AppWindow(
     def __init__(self, application, translations, *args, **kwargs):
         super().__init__(application=application, *args, **kwargs)
         self.translations = translations
+
+        # Sidebar preference; the stored value is restored with the window state.
+        self._sidebar_preferred = False
+        self._sidebar_updating = False
+        self._sidebar_width_ok_last = None
 
         self.set_title("LinuxToys")
         self._default_window_size = self._calculate_default_window_size()
@@ -181,9 +189,7 @@ class AppWindow(
         self._language_categories_waiting_for_allocation = False
         self._language_categories_expected_children = 0
         self._language_categories_allocation_complete = False
-        self._language_featured_refresh_started = False
-        self._language_featured_allocation_complete = False
-        self._language_featured_allocate_handler = None
+        self._language_featured_refresh_pending = False
         self._language_search_loading_active = False
         self._language_search_transition_owned = False
         self._language_search_loading_fade_source = None
@@ -195,7 +201,11 @@ class AppWindow(
         self.add(main_vbox)
 
         self.header_widget = header.create_header(self.translations)
-        main_vbox.pack_start(self.header_widget, False, False, 8)
+        # The root header is intentionally invisible. Protect it from the
+        # recursive self.show_all() used later during window initialization.
+        self.header_widget.set_no_show_all(True)
+        self.header_widget.hide()
+        main_vbox.pack_start(self.header_widget, False, False, 0)
 
         # HeaderBar setup with Hyprland/Wayland compatibility
         self.header_bar = Gtk.HeaderBar()
@@ -219,6 +229,26 @@ class AppWindow(
             print(f"Warning: Could not detect display backend: {e}")
 
         self.set_titlebar(self.header_bar)
+
+        # Retractable sidebar toggle. Kept leftmost so it sits to the left of
+        # the back button and the search box.
+        self.sidebar_toggle_button = Gtk.ToggleButton()
+        sidebar_icon_name = "sidebar-show-symbolic"
+        if not Gtk.IconTheme.get_default().has_icon(sidebar_icon_name):
+            sidebar_icon_name = "view-sidebar-symbolic"
+        if not Gtk.IconTheme.get_default().has_icon(sidebar_icon_name):
+            sidebar_icon_name = "open-menu-symbolic"
+        self.sidebar_toggle_button.set_image(
+            Gtk.Image.new_from_icon_name(sidebar_icon_name, Gtk.IconSize.BUTTON)
+        )
+        self.sidebar_toggle_button.set_relief(Gtk.ReliefStyle.NONE)
+        self.sidebar_toggle_button.set_tooltip_text(
+            self.translations.get("sidebar_toggle", "Toggle category sidebar")
+        )
+        self.sidebar_toggle_button.connect(
+            "toggled", self._on_sidebar_toggle_clicked
+        )
+        self.header_bar.pack_start(self.sidebar_toggle_button)
 
         self.back_button = Gtk.Button.new_from_icon_name(
             "go-previous-symbolic", Gtk.IconSize.BUTTON
@@ -273,7 +303,21 @@ class AppWindow(
         self.main_stack.set_transition_duration(
             200
         )  # Set a reasonable transition duration
-        main_vbox.pack_start(self.main_stack, True, True, 0)
+
+        # Retractable category sidebar: an overlay DRAWER above the content.
+        # It is deliberately NOT a layout column of the window body — overlay
+        # children never reserve layout space, so a closed sidebar cannot leave
+        # a dead strip behind and open/close never re-negotiates the stack.
+        self._build_sidebar()
+        self._window_overlay = Gtk.Overlay()
+        self._window_overlay.add(self.main_stack)
+        self._window_overlay.add_overlay(self._sidebar_revealer)
+        main_vbox.pack_start(self._window_overlay, True, True, 0)
+
+        self.main_stack.connect(
+            "notify::visible-child-name", self._on_main_stack_view_changed
+        )
+        self.connect("size-allocate", self._on_window_size_for_sidebar)
 
         # Create categories view with random scripts section. Keep the complete
         # menu anchored to the top of the viewport: its natural content height is
@@ -517,6 +561,28 @@ class AppWindow(
         GLib.idle_add(self._start_file_watcher)
         GLib.idle_add(self._check_deepin_immutability_on_startup)
         GLib.idle_add(self._start_startup_recommendation_check)
+
+
+
+    def _maybe_refresh_featured_after_language(self):
+        """Swap Featured to the new locale once the rebuilt pool has landed.
+
+        Background half of the language transaction: the reveal no longer
+        waits for the cache rebuild, so Featured crossfades to translated
+        cards from here (eligibility was pre-warmed on the parser worker,
+        keeping the swap itself off the main-thread scan).
+        """
+        if getattr(self, "_language_transition_active", False):
+            return False
+        if not getattr(self, "_language_featured_refresh_pending", False):
+            return False
+        if self.main_stack.get_visible_child_name() != "categories":
+            return False  # stays pending; _apply_featured_resize consumes it
+        if not self.all_scripts:
+            return False  # publish_full_featured retries when the pool lands
+        self._language_featured_refresh_pending = False
+        self._refresh_random_scripts_display(force=True)
+        return False
 
     def _startup_recommendations_suppressed(self):
         marker = os.path.join(
@@ -1051,7 +1117,17 @@ class AppWindow(
             if self.category_cache is not category_cache:
                 return False
             self.all_scripts = featured
-            self._invalidate_featured_eligibility_cache()
+            # The parser worker pre-warms the eligibility cache for exactly
+            # this pool; only invalidate when it does not match, so the
+            # post-language Featured refresh never pays a main-thread scan.
+            cached = getattr(self, "_featured_eligibility_cache", None)
+            if not (cached and cached[0] is featured):
+                self._invalidate_featured_eligibility_cache()
+            if (
+                getattr(self, "_language_featured_refresh_pending", False)
+                and not self._language_transition_active
+            ):
+                self._maybe_refresh_featured_after_language()
             if (
                 self.should_start_random_timer
                 and featured
@@ -1116,9 +1192,48 @@ class AppWindow(
                     category_cache.scripts_by_category,
                     include_appstream=True,
                 )
-                GLib.idle_add(publish_full_featured, full_featured)
 
                 script_cache.populate_from_category_cache(category_cache)
+
+                # Warm the Installed-Features data path so the first open of
+                # the view skips the AppStream materialization cost, and
+                # pre-resolve the row icons (get_icon_path decodes each image
+                # once to validate it; warmed here instead of on the UI
+                # thread when the view first opens).
+                try:
+                    installed_snapshot = installed_packages.snapshot()
+                    installed_entries = parser.get_installed_appstream_entries(
+                        installed_snapshot.get("native", ()),
+                        installed_snapshot.get("flatpak", {}).keys(),
+                        executed_names=revert_helper._get_executed_script_names(),
+                        translations=translations,
+                    )
+                    for info in (
+                        *script_cache.get_all_scripts(),
+                        *installed_entries,
+                    ):
+                        icon_value = str(info.get("icon") or "")
+                        if (
+                            "/" not in icon_value
+                            and icon_value.lower().endswith((".png", ".svg", ".webp"))
+                        ):
+                            get_icon_path(icon_value)
+                except Exception as error:
+                    print(f"Error warming installed entries: {error}")
+
+                # Warm Featured eligibility off the UI thread and publish the
+                # pool together with it. The scan is a full-pool pass that
+                # measured ~600 ms on the main thread after a language swap;
+                # here it hides inside the same background parse.
+                try:
+                    self._featured_eligibility_cache = (
+                        full_featured,
+                        self._compute_eligible_featured_scripts(full_featured),
+                    )
+                except Exception as error:
+                    print(f"Error warming featured eligibility: {error}")
+
+                GLib.idle_add(publish_full_featured, full_featured)
 
                 prepared_search_results = None
                 if language_search_query:
@@ -3796,6 +3911,9 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
         except (OSError, ValueError, TypeError):
             state = {}
 
+        # Sidebar preference rides along with the window geometry state.
+        self._sidebar_preferred = bool(state.get("sidebar_visible", False))
+
         if state.get("maximized") is True:
             self.maximize()
             return
@@ -4032,6 +4150,7 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
             "width": int(width),
             "height": int(height),
             "maximized": maximized,
+            "sidebar_visible": bool(getattr(self, "_sidebar_preferred", False)),
         }
 
         state_path = self._window_state_path()
@@ -4102,18 +4221,6 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
             "size-allocate", self._on_language_visible_size_allocate
         )
         widget.queue_resize()
-
-    def _on_language_featured_size_allocate(self, grid, allocation):
-        """Commit the hidden language Featured rebuild after its real allocation."""
-        if not getattr(self, "_language_transition_active", False):
-            return
-        if allocation.width <= 1 or allocation.height <= 1 or not grid.get_children():
-            return
-        handler_id = getattr(self, "_language_featured_allocate_handler", None)
-        if handler_id is not None:
-            grid.disconnect(handler_id)
-            self._language_featured_allocate_handler = None
-        self._language_featured_allocation_complete = True
 
     def _show_language_search_loading(self):
         """Replace the old Search snapshot with a centered roller while translating."""
@@ -4196,16 +4303,11 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
         self._language_categories_waiting_for_allocation = False
         self._language_categories_expected_children = 0
         self._language_categories_allocation_complete = False
-        self._language_featured_refresh_started = False
-        self._language_featured_allocation_complete = False
+        self._language_featured_refresh_pending = False
         self._language_search_refresh_pending = False
         self._language_visible_allocation_complete = False
         self._language_visible_allocate_handler = None
         self._language_visible_allocate_widget = None
-        handler_id = getattr(self, "_language_featured_allocate_handler", None)
-        if handler_id is not None:
-            self.random_scripts_flowbox.disconnect(handler_id)
-            self._language_featured_allocate_handler = None
 
         if self._language_transition_source is not None:
             GLib.source_remove(self._language_transition_source)
@@ -4263,7 +4365,11 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
             self._language_transition_started_us = None
             self._language_transition_active = False
             self._language_transition_target = None
-            self._language_featured_refresh_started = False
+            # Featured is background work now: rebuild it after the reveal
+            # (or when the cache publish lands) instead of gating the fade-in
+            # on the full cache rebuild.
+            self._language_featured_refresh_pending = True
+            GLib.idle_add(self._maybe_refresh_featured_after_language)
 
             final_search_query = getattr(
                 self, "_language_transition_search_query", ""
@@ -4280,6 +4386,13 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
                 )
 
             self._language_search_transition_owned = False
+
+            # A category view visible during the transaction flagged its cards:
+            # reload now that it is revealed and has real allocations.
+            visible_child = self.main_stack.get_visible_child()
+            if getattr(visible_child, "_linuxtoys_language_cards_pending", False):
+                visible_child._linuxtoys_language_cards_pending = False
+                self._reload_category_view_cards(visible_child)
 
             if (
                 self.main_stack.get_visible_child_name() == "categories"
@@ -4300,6 +4413,44 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
         self.category_cache = search_helper.CategoryCache()
         self.search_engine.set_cache(self.script_cache)
         self.all_scripts = []
+
+        # Warm the visible category's cold parse on a worker right away: with
+        # the fresh (empty) caches, _category_items_for_display falls back to
+        # parser.get_scripts_for_category, whose first pass is expensive
+        # (~1.1 s on the UI thread when the reload was synchronous). Warming
+        # its memoizations here lets the flagged card reload happen hidden and
+        # fast, so the reveal shows the new locale directly instead of
+        # blinking old cards first. Parser functions are already invoked from
+        # multiple threads by the cache workers.
+        self._category_warmup_done = True
+        current_info = getattr(self, "current_category_info", None)
+        if (
+            current_info
+            and self.main_stack.get_visible_child_name() not in (
+                "app_page",
+                "running_scripts",
+                "installed_features",
+                "appstream_queue",
+                "package_view",
+                "package_loading",
+                "search",
+            )
+            and current_info.get("path")
+            and "://" not in str(current_info.get("path"))
+        ):
+            self._category_warmup_done = False
+            warm_path = str(current_info.get("path"))
+            warm_translations = self.translations
+
+            def _warm_current_category():
+                try:
+                    parser.get_scripts_for_category(warm_path, warm_translations)
+                except Exception:
+                    pass
+                finally:
+                    self._category_warmup_done = True
+
+            threading.Thread(target=_warm_current_category, daemon=True).start()
 
         self.search_entry.set_placeholder_text(
             self.translations.get("search_placeholder", "Search features")
@@ -4358,60 +4509,39 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
             self._start_language_search_loading_fade()
 
         if visible_name == "categories":
-            # The translated category snapshot must have received a *new* real
-            # allocation before Featured is allowed to measure it.  Positive old
-            # allocations are deliberately insufficient here.
+            # The translated category snapshot must receive a *new* real
+            # allocation before the reveal, so native decoration measures real
+            # geometry. Positive old allocations are deliberately insufficient.
             if not self._language_categories_allocation_complete:
                 allocation = self.categories_flowbox.get_allocation()
                 self.categories_flowbox.queue_resize()
                 self.categories_view.queue_resize()
                 return True
-            if not self.all_scripts:
-                return True
-            if not self._language_featured_refresh_started:
-                self._language_featured_refresh_started = True
-                self._language_featured_allocation_complete = False
-                self._language_featured_allocate_handler = (
-                    self.random_scripts_flowbox.connect(
-                        "size-allocate", self._on_language_featured_size_allocate
-                    )
-                )
-                # Language refresh owns Featured while hidden.  Bypass the normal
-                # startup/resize entry points so only one calculation can consume
-                # this settled category geometry.
-                self._refresh_random_scripts_display(force=True)
-
-                # A zero-capacity Featured layout is a valid completed state. The
-                # Featured controller intentionally leaves the grid empty when no
-                # complete row fits; do not wait for children/allocation that cannot
-                # exist in that case.
-                if (
-                    not self.random_scripts_flowbox.get_children()
-                    and self._calculate_random_scripts_count() <= 0
-                ):
-                    handler_id = getattr(
-                        self, "_language_featured_allocate_handler", None
-                    )
-                    if handler_id is not None:
-                        self.random_scripts_flowbox.disconnect(handler_id)
-                        self._language_featured_allocate_handler = None
-                    self._language_featured_allocation_complete = True
-                    return True
-
-                self.random_scripts_flowbox.queue_resize()
-                self.featured_scripts_container.queue_resize()
-                return True
-            featured_children = self.random_scripts_flowbox.get_children()
-            if (
-                not self._language_featured_allocation_complete
-                or (
-                    not featured_children
-                    and self._calculate_random_scripts_count() > 0
-                )
-            ):
-                return True
+            # all_scripts / Featured are deliberately NOT reveal gates: they are
+            # background work now (_maybe_refresh_featured_after_language),
+            # otherwise the fade-in waits for the entire cache rebuild.
 
         if visible_name != "categories":
+            # A visible category browser flagged its cards for reload. Wait
+            # (bounded) for the worker's warm parse of the category, then swap
+            # the cards while still hidden so the reveal shows the new locale
+            # directly instead of blinking the old cards first. If the warm-up
+            # misses the budget, leave the flag for the post-reveal fallback.
+            visible_child = self.main_stack.get_visible_child()
+            if getattr(visible_child, "_linuxtoys_language_cards_pending", False):
+                warm_done = getattr(self, "_category_warmup_done", True)
+                warm_timed_out = (
+                    GLib.get_monotonic_time()
+                    - self._language_transition_started_us
+                ) > 700000
+                if not warm_done and not warm_timed_out:
+                    return True
+                if warm_done:
+                    visible_child._linuxtoys_language_cards_pending = False
+                    self._reload_category_view_cards(
+                        visible_child, defer_initial=False
+                    )
+
             if not self._language_visible_allocation_complete:
                 root.queue_resize()
                 return True
@@ -4480,6 +4610,12 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
         # their translated strings; it is not a structural category publication.
         self._refresh_root_category_translations_in_place()
 
+        # The sidebar is persistent overlay UI built from self.translations.
+        # Refresh it before the per-view returns below so its rows, toggle
+        # tooltip and Main Menu shortcut follow the new locale regardless of
+        # which view is visible during the switch.
+        self._refresh_sidebar_translations()
+
         # Refresh footer translations
         self.reveal.update_translations(self.translations)
 
@@ -4540,6 +4676,24 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
             # start the app-page-specific Stack crossfade inside it; replace the page
             # while the whole stack is transparent and wait for the new page itself.
             self.open_app_page(fresh_info or app_page_info, preserve_previous=True)
+            # The category view behind the page survives this transaction as the
+            # Back origin. Refresh its chrome in place (embedded header, footer
+            # tab titles) and flag its card lists; the cards themselves reload
+            # when Back makes the view visible again, so population runs with
+            # real allocations instead of against a hidden widget.
+            behind = (getattr(self, "_app_page_prev", None) or {}).get("child")
+            if getattr(behind, "_linuxtoys_category_info", None) is not None:
+                self._refresh_navigation_stack_translations()
+                updated_category_info = (
+                    self._get_fresh_category_info_with_translations()
+                )
+                if updated_category_info:
+                    self.current_category_info = updated_category_info
+                self._update_embedded_category_header(
+                    behind, self.current_category_info
+                )
+                self._refresh_category_tab_translations(behind)
+                behind._linuxtoys_language_cards_pending = True
             page = self.main_stack.get_child_by_name("app_page")
             if page is not None:
                 self._arm_language_visible_allocation_barrier(page)
@@ -4615,16 +4769,25 @@ npx skills add "{source}" -a "{agent}" -g -y --skill "{slug}"
                 category_name = self.current_category_info.get("name", "Unknown")
                 self.header_bar.props.title = f"LinuxToys: {category_name}"
 
-            # Reload the scripts view with new translations. Category views are
-            # retained native GtkScrolledWindow/FlowBox surfaces rather than rebuilt
-            # here, so unlike app pages they may keep exactly the same allocation.
-            # Arm the language barrier before rebinding their children, then accept
-            # the already-valid allocation if GTK has no geometry change to emit.
+            # The visible category browser keeps its native chrome across the
+            # language transaction; its footer tab titles are static strings
+            # captured at build time and must be re-translated in place.
+            self._refresh_category_tab_translations(self.scripts_view)
+
+            # Cards stay untouched here (flagged above); only the allocation
+            # barrier is armed, so unlike app pages the retained native
+            # browser may keep exactly the same allocation. Accept the
+            # already-valid allocation if GTK has no geometry change to emit.
             category_view = self.main_stack.get_visible_child()
             if category_view is not None:
                 self._arm_language_visible_allocation_barrier(category_view)
 
-            self.load_scripts(self.current_category_info)
+            # Cards reload after the reveal (same contract as the app-page
+            # Back-origin view): the synchronous populate measured ~1.1 s on a
+            # populated category and stalled the entire transaction. Flagging
+            # also covers the Installed tab, which load_scripts never reloaded.
+            if category_view is not None:
+                category_view._linuxtoys_language_cards_pending = True
 
             if (
                 category_view is not None

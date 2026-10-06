@@ -226,6 +226,59 @@ class NavCtl:
         GLib.idle_add(start_next_job, priority=GLib.PRIORITY_LOW)
         return False
 
+    def _refresh_category_tab_translations(self, view):
+        """Re-translate a category browser's Available/Installed footer tabs.
+
+        Tab labels are GtkStack page titles captured at build time; the
+        StackSwitcher buttons bind their labels to those titles, so updating
+        the two page titles re-translates the footer in place. Views without
+        a tab stack (checklist mode, plain scrolled views) are ignored.
+        """
+        if view is None:
+            return
+        tabs = getattr(view, "_linuxtoys_category_tabs", None)
+        if tabs is None:
+            return
+        for name, key, fallback in (
+            ("available", "category_available", "Available"),
+            ("installed", "app_page_installed", "Installed"),
+        ):
+            child = tabs.get_child_by_name(name)
+            if child is not None:
+                tabs.child_set_property(
+                    child, "title", self.translations.get(key, fallback)
+                )
+
+    def _reload_category_view_cards(self, view, defer_initial=True):
+        """Reload a category browser's card lists with current state.
+
+        Used when a hidden category view needs its cards refreshed (the
+        language transaction flags the Back origin, and the visible browser
+        when its warm parse has landed). defer_initial matches
+        _open_category_browser's visible-destination population; the
+        hidden-phase swap passes False so cards land before the reveal.
+        """
+        if view is None or self.current_category_info is None:
+            return
+        available_flowbox = getattr(view, "_linuxtoys_available_flowbox", None)
+        if available_flowbox is None and self.scripts_view is view:
+            available_flowbox = getattr(self, "scripts_flowbox", None)
+        installed_flowbox = getattr(view, "_linuxtoys_installed_flowbox", None)
+        if available_flowbox is not None:
+            self._load_scripts_into_flowbox(
+                available_flowbox,
+                self.current_category_info,
+                defer_initial=defer_initial,
+                animate_initial=False,
+            )
+        if installed_flowbox is not None:
+            self._load_scripts_into_flowbox(
+                installed_flowbox,
+                self.current_category_info,
+                defer_initial=defer_initial,
+                animate_initial=False,
+            )
+
     def _create_category_browser_view(self, category_info, view_name):
         """Create one complete animated category page: header plus browser content."""
         available_flowbox = self.create_flowbox()
@@ -331,47 +384,55 @@ class NavCtl:
                 self.open_term_view([info], removable_script_info=info, auto_run=True)
         else:
             # This is a category or subcategory - navigate to show its contents.
-            # Keep the fully-built parent view alive so Back can return to it
-            # immediately without reparsing or rebuilding its cards.
-            self._retain_current_category_view()
+            self._open_category_browser(info)
 
-            # Create a new view for the subcategory to enable proper animation
-            self.view_counter += 1
-            new_view_name = f"scripts_{self.view_counter}"
+    def _open_category_browser(self, info):
+        """Navigate into a category/subcategory with a fresh browser page.
 
-            # Rust owns the repetitive GTK container lifecycle for category
-            # levels. Python retains the configured FlowBox because card loading,
-            # callbacks and navigation policy remain here.
-            new_scrolled_view, new_flowbox = self._create_category_browser_view(
-                info, new_view_name
-            )
+        Shared by main-menu cards and sidebar rows so both entry points build
+        and attach the destination before it becomes visible.
+        """
+        # Keep the fully-built parent view alive so Back can return to it
+        # immediately without reparsing or rebuilding its cards.
+        self._retain_current_category_view()
 
-            # The empty destination is attached and shown before the transition.
-            # Card construction remains deferred so the initial layout cannot
-            # stall the slide animation on larger categories.
+        # Create a new view for the subcategory to enable proper animation
+        self.view_counter += 1
+        new_view_name = f"scripts_{self.view_counter}"
 
-            self.main_stack.set_transition_type(
-                Gtk.StackTransitionType.SLIDE_LEFT_RIGHT
-            )
+        # Rust owns the repetitive GTK container lifecycle for category
+        # levels. Python retains the configured FlowBox because card loading,
+        # callbacks and navigation policy remain here.
+        new_scrolled_view, new_flowbox = self._create_category_browser_view(
+            info, new_view_name
+        )
 
-            self.scripts_flowbox = new_flowbox
-            self.scripts_view = new_scrolled_view
-            self.show_scripts_view(info)
+        # The empty destination is attached and shown before the transition.
+        # Card construction remains deferred so the initial layout cannot
+        # stall the slide animation on larger categories.
 
+        self.main_stack.set_transition_type(
+            Gtk.StackTransitionType.SLIDE_LEFT_RIGHT
+        )
+
+        self.scripts_flowbox = new_flowbox
+        self.scripts_view = new_scrolled_view
+        self.show_scripts_view(info)
+
+        self._load_scripts_into_flowbox(
+            new_flowbox,
+            info,
+            defer_initial=True,
+        )
+        installed_flowbox = getattr(
+            new_scrolled_view, "_linuxtoys_installed_flowbox", None
+        )
+        if installed_flowbox is not None:
             self._load_scripts_into_flowbox(
-                new_flowbox,
+                installed_flowbox,
                 info,
                 defer_initial=True,
             )
-            installed_flowbox = getattr(
-                new_scrolled_view, "_linuxtoys_installed_flowbox", None
-            )
-            if installed_flowbox is not None:
-                self._load_scripts_into_flowbox(
-                    installed_flowbox,
-                    info,
-                    defer_initial=True,
-                )
 
     def open_app_page(self, info, preserve_previous=False):
         """Open a repository entry's optional details page without altering checklist state."""
@@ -661,6 +722,16 @@ class NavCtl:
                     self._enable_drag_and_drop()
                 else:
                     self._disable_drag_and_drop()
+
+                # The language transaction flagged this origin's cards while the
+                # view was hidden. Reload now that it is visible and has a real
+                # allocation, mirroring how _open_category_browser populates a
+                # destination after starting its transition.
+                if getattr(
+                    prev["child"], "_linuxtoys_language_cards_pending", False
+                ):
+                    prev["child"]._linuxtoys_language_cards_pending = False
+                    self._reload_category_view_cards(prev["child"])
             elif self.current_category_info and self.scripts_view is not None:
                 # Defensive fallback for app pages created before origin state was
                 # captured or for callers that deliberately omit it.
@@ -958,6 +1029,14 @@ class NavCtl:
         self._discard_retained_category_views()
         self.current_category_info = None
         self.navigation_stack.clear()  # Clear navigation history
+
+        # Returning to the root resets the sidebar tree as well. No category is
+        # active there, so keeping manually opened cascades serves no navigation
+        # purpose and makes the root menu look stateful after Back.
+        self._sidebar_expanded_keys.clear()
+        self._sidebar_deferred_collapses.clear()
+        self._refresh_sidebar_rows()
+
         self.main_stack.set_visible_child_name("categories")
 
         # If the window was restored while a category page was visible, the hidden
@@ -986,8 +1065,14 @@ class NavCtl:
         self.should_start_random_timer = False
         self._stop_random_scripts_refresh_timer()
 
-        # If we have current category info, push it to navigation stack
-        if self.current_category_info:
+        # Ordinary card navigation retains the existing history behavior.
+        # Sidebar navigation supplies the canonical menu-tree ancestry instead,
+        # so Back follows parent categories rather than the sequence of sidebar
+        # destinations the user happened to visit.
+        sidebar_path = getattr(self, "_sidebar_navigation_path", None)
+        if sidebar_path is not None:
+            self.navigation_stack[:] = sidebar_path
+        elif self.current_category_info:
             self.navigation_stack.append(self.current_category_info)
 
         self.current_category_info = category_info
@@ -1050,6 +1135,10 @@ class NavCtl:
         self.header_widget.destroy()
 
         self.header_widget = header.create_header(self.translations)
-        main_vbox.pack_start(self.header_widget, False, False, 8)
+        # Root Categories intentionally has no external header. Keep this widget
+        # available for legacy callers without allowing recursive show_all() to
+        # resurrect it and reserve a strip above the main menu.
+        self.header_widget.set_no_show_all(True)
+        self.header_widget.hide()
+        main_vbox.pack_start(self.header_widget, False, False, 0)
         main_vbox.reorder_child(self.header_widget, 0)
-        self.header_widget.show_all()
