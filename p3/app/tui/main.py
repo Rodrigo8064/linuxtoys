@@ -33,6 +33,7 @@ from .helper import (
     get_categories,
     get_script_info,
     get_specials_root_item,
+    homebrew_category_info,
     is_search_ready,
     make_widget_id,
     search_scripts_fast,
@@ -55,8 +56,12 @@ from .runner_helper import (
 from .skills_view_tui import SkillsSeekerView
 from .tui_app_page import AppPageWidget, hide_app_page, show_app_page
 
-# info = get_script_info("Steam")
-# breakpoint()
+HOMEBREW_WATCH_INTERVAL = 3.0
+HOMEBREW_STARTUP_DELAY = 15.0
+RENDER_CHUNK_SIZE = 100
+HOMEBREW_PAGE_SIZE = 60
+RENDER_CHUNK_SIZE = 100
+SCROLL_LOAD_MARGIN = 5
 
 
 class HomeScreen(
@@ -74,6 +79,14 @@ class HomeScreen(
         super().__init__(*args, **kwargs)
         self._nav_stack: list[tuple[str, str]] = []
         self._is_skills_seeker_showing = False
+        self._render_lock = asyncio.Lock()
+        self._render_generation = 0
+        self._homebrew_refresh_running = False
+        self._homebrew_awaiting_refresh = False
+        self._homebrew_source_fingerprint = None
+        self._lazy_items = None
+        self._lazy_loaded = 0
+        self._registry_data = None
 
     CSS_PATH = "style.tcss"
     _search_timer: asyncio.TimerHandle | None = None
@@ -180,6 +193,16 @@ class HomeScreen(
         self.query_one("#terminal-conteiner").display = False
         self.query_one("#left-panel-home").border_title = "LinuxToys"
         self.query_one("#menu-panel").border_title = "Menu"
+        self._homebrew_source_fingerprint = (
+            homebrew_catalog.availability_fingerprint()
+        )
+        self.set_interval(HOMEBREW_WATCH_INTERVAL, self._check_homebrew_source)
+        self.set_timer(HOMEBREW_STARTUP_DELAY, self._request_homebrew_refresh)
+        self.watch(
+            self.query_one("#left-panel-home", VerticalScroll),
+            "scroll_y",
+            self._on_items_scroll,
+        )
 
         left_panel = self.query_one("#left-panel-home", VerticalScroll)
         first_button = left_panel.query(InfoButton).first()
@@ -209,14 +232,77 @@ class HomeScreen(
             id=make_widget_id(item["path"]),
         )
 
-    async def _render_items(self, items: list[dict]) -> None:
+    async def _render_items(self, items, *, lazy: bool = False) -> None:
+        self._render_generation += 1
+        generation = self._render_generation
+
+        async with self._render_lock:
+            if generation != self._render_generation:
+                return
+
+            self._set_items_loading(False)
+            self._lazy_items = items if lazy else None
+            self._lazy_loaded = 0
+            left_panel = self.query_one("#left-panel-home", VerticalScroll)
+            await left_panel.remove_children()
+            self._registry_data = parse_registry_file()
+
+            total = len(items)
+            first = min(total, HOMEBREW_PAGE_SIZE) if lazy else total
+            await self._mount_range(items, 0, first, generation)
+
+    async def _mount_range(
+        self, items, start: int, stop: int, generation: int
+    ) -> None:
+        """Monta items[start:stop] em lotes. Deve rodar com _render_lock."""
         left_panel = self.query_one("#left-panel-home", VerticalScroll)
-        await left_panel.remove_children()
-        registry_data = parse_registry_file()
-        buttons = [
-            self._make_info_button(item, registry_data) for item in items
-        ]
-        await left_panel.mount_all(buttons)
+        for lo in range(start, stop, RENDER_CHUNK_SIZE):
+            if generation != self._render_generation:
+                return
+            hi = min(lo + RENDER_CHUNK_SIZE, stop)
+            buttons = [
+                self._make_info_button(item, self._registry_data)
+                for item in items[lo:hi]
+            ]
+            await left_panel.mount_all(buttons)
+            self._lazy_loaded = hi
+
+    def _on_items_scroll(self, scroll_y: float) -> None:
+        """Dispara a próxima página ao chegar perto do fim da lista."""
+        if self._lazy_items is None or self._lazy_loaded >= len(
+            self._lazy_items
+        ):
+            return
+        panel = self.query_one("#left-panel-home", VerticalScroll)
+        if scroll_y >= panel.max_scroll_y - SCROLL_LOAD_MARGIN:
+            self.run_worker(
+                self._load_next_page(),
+                exclusive=True,  # evita páginas duplicadas
+                group="items-page",
+                exit_on_error=False,
+            )
+
+    async def _load_next_page(self) -> None:
+        generation = self._render_generation
+        async with self._render_lock:
+            items = self._lazy_items
+            if items is None or generation != self._render_generation:
+                return  # lista foi trocada: página obsoleta
+            start = self._lazy_loaded
+            stop = min(len(items), start + HOMEBREW_PAGE_SIZE)
+            if start >= stop:
+                return
+            await self._mount_range(items, start, stop, generation)
+
+    def _set_items_loading(self, loading: bool) -> None:
+        self.query_one("#left-panel-home", VerticalScroll).loading = loading
+
+    async def _show_items_message(self, text: str) -> None:
+        """Esvazia o painel e mostra uma mensagem persistente."""
+        await self._render_items([])
+        await self.query_one("#left-panel-home", VerticalScroll).mount(
+            Static(text)
+        )
 
     @on(FocusableLabel.Pressed, "#report-bug")
     def handle_report_bug(self) -> None:
@@ -387,22 +473,8 @@ class HomeScreen(
             *get_categories(translations),
         ]
         if homebrew_catalog.enabled():
-            category_snapshot.append(self._homebrew_category_info())
+            category_snapshot.append(homebrew_category_info())
         return category_snapshot
-
-    def _homebrew_category_info(self):
-        return {
-            "name": "Homebrew",
-            "description": translations.get(
-                "homebrew_category_desc", "Packages from Homebrew."
-            ),
-            "icon": "brew.png",
-            "path": "homebrew://catalog",
-            "type": "category",
-            "is_script": False,
-            "is_subcategory": False,
-            "is_homebrew_category": True,
-        }
 
     async def action_go_back(self) -> None:
         if self._is_app_page_showing:

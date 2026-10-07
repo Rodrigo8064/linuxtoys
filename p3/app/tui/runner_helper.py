@@ -2,12 +2,14 @@ import asyncio
 import os
 import shlex
 import tempfile
+import threading
 from collections.abc import Mapping
 from functools import partial
 from typing import Any
 
 from textual.css.query import NoMatches
 
+from app import homebrew_catalog
 from app.compat import get_system_compat_keys
 from app.easy_cli import (
     _cleanup_tmp_noram_dirs,
@@ -49,10 +51,14 @@ from .helper import (
     SPECIALS_ROOT,
     ScriptResult,
     _classify_exit_code,
+    get_homebrew_items,
     get_scripts_for_category_cached,
     get_specials_items,
+    is_homebrew_catalog_valid,
+    is_homebrew_path,
     is_removable,
     is_specials_path,
+    refresh_homebrew_catalog,
     translations,
 )
 from .manifest_dialog import ManifestPlanDialog, ManifestReportDialog
@@ -131,6 +137,9 @@ class ScriptRunnerMixin:
             self.run_uninstall(button)
 
     async def _navigate_to_category(self, button: InfoButton) -> None:
+        if is_homebrew_path(button.path):
+            await self._open_homebrew_category(button)
+            return
         self._nav_stack.append((button.path, str(button.label)))
         await self._render_items(self._items_for_path(button.path))
         self._update_breadcrumb()
@@ -138,7 +147,156 @@ class ScriptRunnerMixin:
     def _items_for_path(self, path: str) -> list[dict]:
         if is_specials_path(path):
             return get_specials_items(path)
+        if is_homebrew_path(path):
+            return get_homebrew_items()
         return get_scripts_for_category_cached(path)
+
+    def _homebrew_view_active(self) -> bool:
+        return bool(self._nav_stack) and is_homebrew_path(
+            self._nav_stack[-1][0]
+        )
+
+    async def _open_homebrew_category(self, button: InfoButton) -> None:
+        if not homebrew_catalog.enabled():
+            self.notify(
+                translations.get(
+                    "homebrew_unavailable", "Homebrew is not available."
+                ),
+                severity="warning",
+            )
+            await self._sync_homebrew_availability()
+            return
+
+        self._nav_stack.append((button.path, str(button.label)))
+        self._update_breadcrumb()
+        await self._render_items([])
+        if self._homebrew_view_active():
+            self._set_items_loading(True)
+
+        if is_homebrew_catalog_valid():
+            self._homebrew_awaiting_refresh = False
+            self._load_homebrew_items()
+        else:
+            self._homebrew_awaiting_refresh = True
+            self._request_homebrew_refresh()
+
+    def _load_homebrew_items(self) -> None:
+        self.run_worker(
+            self._load_homebrew_items_async(),
+            exclusive=True,
+            group="homebrew-items",
+        )
+
+    async def _load_homebrew_items_async(self) -> None:
+        unavailable = translations.get(
+            "homebrew_catalog_unavailable",
+            "Homebrew metadata is unavailable. Try again later.",
+        )
+        try:
+            items = await asyncio.to_thread(get_homebrew_items)
+        except Exception:  # noqa: BLE001
+            if self._homebrew_view_active():
+                await self._show_items_message(unavailable)
+            return
+        if not self._homebrew_view_active():
+            return
+        if not items:
+            await self._show_items_message(
+                translations.get(
+                    "homebrew_no_items", "No Homebrew packages found."
+                )
+            )
+            return
+        await self._render_items(items, lazy=True)
+
+    def _request_homebrew_refresh(self) -> None:
+        if self._homebrew_refresh_running or not homebrew_catalog.enabled():
+            return
+        self._homebrew_refresh_running = True
+        started = homebrew_catalog.availability_fingerprint()
+        app = self.app
+
+        def worker() -> None:
+            result = refresh_homebrew_catalog()
+            try:
+                app.call_from_thread(
+                    self._finish_homebrew_refresh, result, started
+                )
+            except Exception:
+                pass
+
+        threading.Thread(
+            target=worker, daemon=True, name="linuxtoys-homebrew-source"
+        ).start()
+
+    async def _finish_homebrew_refresh(self, result: dict, started) -> None:
+        """Roda no event loop. Revalida o estado: ele pode ter mudado."""
+        self._homebrew_refresh_running = False
+
+        if not homebrew_catalog.enabled():
+            await self._sync_homebrew_availability()
+            return
+        if homebrew_catalog.availability_fingerprint() != started:
+            self._request_homebrew_refresh()
+            return
+        await self._resolve_homebrew_view(result)
+
+    async def _resolve_homebrew_view(self, result: dict) -> None:
+        awaiting = self._homebrew_awaiting_refresh
+        self._homebrew_awaiting_refresh = False
+        if not self._homebrew_view_active():
+            return
+
+        from app import appstream_cache
+
+        source = (
+            appstream_cache.get_state().get("sources", {}).get("homebrew", {})
+        )
+        ok = bool(result.get("success") and source.get("complete"))
+        unavailable = translations.get(
+            "homebrew_catalog_unavailable",
+            "Homebrew metadata is unavailable. Try again later.",
+        )
+
+        if awaiting:
+            if ok:
+                self._load_homebrew_items()
+            else:
+                await self._show_items_message(unavailable)
+                self.notify(
+                    unavailable, title="Homebrew", severity="error", timeout=8
+                )
+        elif ok and result.get("changed"):
+            self._load_homebrew_items()
+            self.notify(
+                "Homebrew catalog updated.", title="Homebrew", timeout=3
+            )
+        elif not ok:
+            self.notify(
+                unavailable, title="Homebrew", severity="warning", timeout=6
+            )
+
+    async def _check_homebrew_source(self) -> None:
+        fingerprint = homebrew_catalog.availability_fingerprint()
+        if fingerprint == self._homebrew_source_fingerprint:
+            return
+        self._homebrew_source_fingerprint = fingerprint
+        await self._sync_homebrew_availability()
+        self._request_homebrew_refresh()
+
+    async def _sync_homebrew_availability(self) -> None:
+        """Reconcilia a UI com homebrew_catalog.enabled()."""
+        if self._homebrew_view_active() and not homebrew_catalog.enabled():
+            self._homebrew_awaiting_refresh = False
+            self.notify(
+                translations.get(
+                    "homebrew_removed", "Homebrew is no longer available."
+                ),
+                severity="warning",
+            )
+            await self._show_home()
+        elif not self._nav_stack:
+            await self._show_home()
 
     def run_script(self, button: InfoButton) -> None:
         self._running_button = button

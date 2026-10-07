@@ -2,6 +2,7 @@ import re
 import threading
 from enum import Enum, auto
 
+from app import homebrew_catalog
 from app.lang_utils import load_translations
 from app.parser import get_appstream_entries
 from app.search_helper import (
@@ -19,6 +20,7 @@ _search_engine: SearchEngine | None = None
 _cache_lock = threading.Lock()
 SPECIALS_PREFIX = "specials://"
 SPECIALS_ROOT = "specials://root"
+HOMEBRE_PREFIX = "homebrew://"
 
 
 def make_widget_id(identifier: str) -> str:
@@ -141,6 +143,10 @@ def is_specials_path(path: str) -> bool:
     return path.startswith(SPECIALS_PREFIX)
 
 
+def is_homebrew_path(path: str) -> bool:
+    return path.startswith(HOMEBRE_PREFIX)
+
+
 def get_specials_items(path: str, trans=None) -> list[dict]:
     """Resolve a virtual specials:// path into the items to render.
 
@@ -166,6 +172,45 @@ def get_specials_items(path: str, trans=None) -> list[dict]:
     return []
 
 
+def is_homebrew_catalog_valid() -> bool:
+    """Brew presente e catálogo completo, com snapshot e fingerprint atuais."""
+    if not homebrew_catalog.enabled():
+        return False
+    from app import appstream_cache
+
+    source = appstream_cache.get_state().get("sources", {}).get("homebrew", {})
+    return bool(
+        source.get("complete")
+        and homebrew_catalog.binary_snapshot_available()
+        and source.get("fingerprint") == homebrew_catalog.fingerprint()
+    )
+
+
+def refresh_homebrew_catalog() -> dict:
+    """Atualiza o catálogo. BLOQUEANTE: executar apenas em thread."""
+    from app import appstream_cache, appstream_parser
+
+    try:
+        result = appstream_cache.refresh_homebrew_cache()
+        if result.get("success"):
+            if result.get("changed"):
+                ensure_homebrew_context()
+                appstream_parser.prepare_runtime_cache()
+            appstream_parser.get_homebrew_entries()
+        return result
+    except Exception as error:  # noqa: BLE001
+        return {"success": False, "error": str(error)}
+
+
+def get_homebrew_items() -> list[dict]:
+    if not homebrew_catalog.enabled():
+        return []
+    from app import appstream_parser
+
+    ensure_homebrew_context()
+    return appstream_parser.get_homebrew_entries()
+
+
 def get_specials_root_item(trans=None) -> dict:
     active_translations = trans or translations
     return {
@@ -177,6 +222,46 @@ def get_specials_root_item(trans=None) -> dict:
         "is_script": False,
         "widget_id": "is_linuxtoys_specials",
     }
+
+
+def homebrew_category_info(trans=None) -> dict:
+    active_translations = trans or translations
+    return {
+        "name": "Homebrew",
+        "description": active_translations.get(
+            "homebrew_category_desc", "Packages from Homebrew."
+        ),
+        "icon": "brew.png",
+        "path": "homebrew://catalog",
+        "type": "category",
+        "is_script": False,
+        "is_subcategory": False,
+        "is_homebrew_category": True,
+    }
+
+
+def ensure_homebrew_context() -> bool:
+    """Garante o contexto de runtime do appstream_parser. BLOQUEANTE (thread).
+
+    Usa os mesmos argumentos que a GUI (parser.get_appstream_entries), mas
+    sem materializar o catálogo: só precisa publicar _LAST_LOAD_CONTEXT.
+    """
+    from app import appstream_parser, parser
+
+    if appstream_parser._LAST_LOAD_CONTEXT is not None:
+        return True
+    try:
+        appstream_parser._runtime_catalog(
+            parser.SCRIPTS_DIR,
+            curated_entries=parser._get_appstream_curated_entries(
+                translations
+            ),
+            category_paths=parser._indexed_category_paths(),
+        )
+    except Exception:
+        logger.exception("Failed to establish AppStream runtime context")
+        return False
+    return True
 
 
 class ScriptResult(Enum):
