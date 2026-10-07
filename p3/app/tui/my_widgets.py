@@ -5,6 +5,7 @@ import os
 import pty
 import re
 import shlex
+import signal
 import struct
 import termios
 import uuid
@@ -134,28 +135,53 @@ class TerminalPTY:
         self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
     def _open_terminal(self) -> int:
+        argv = ["bash", "--norc", "--noprofile", "--noediting", "+H"]
+        env = dict(
+            os.environ,
+            TERM="xterm-256color",
+            LANG=os.environ.get("LANG") or "C.UTF-8",
+            PS1="$ ",
+            PS2="",
+        )
         pid, fd = pty.fork()
         if pid == 0:
             try:
                 attrs = termios.tcgetattr(0)
-                attrs[3] &= ~termios.ECHO  # attrs[3] é a flag lflag
+                attrs[3] &= ~termios.ECHO
                 termios.tcsetattr(0, termios.TCSANOW, attrs)
             except termios.error:
                 pass
-            argv = ["bash", "--norc", "--noprofile", "--noediting"]
-            lang = os.environ.get("LANG") or "C.UTF-8"
-            env = dict(
-                os.environ,
-                TERM="xterm-256color",
-                LANG=lang,
-                PS1="$ ",
-            )
-            os.execvpe(argv[0], argv, env)
+            try:
+                os.execvpe(argv[0], argv, env)
+            finally:
+                os._exit(127)  # nunca volta para o código do app
         self.child_pid = pid
         return fd
 
     def start(self) -> None:
-        asyncio.create_task(self._run())
+        self._task = asyncio.create_task(self._run())
+
+    def close(self) -> None:
+        """Libera task, fd e processo bash."""
+        task = getattr(self, "_task", None)
+        if task is not None:
+            task.cancel()
+        try:
+            asyncio.get_running_loop().remove_reader(self.p_out)
+        except (ValueError, OSError, RuntimeError):
+            pass
+        try:
+            self.p_out.close()
+        except OSError:
+            pass
+        try:
+            os.kill(self.child_pid, signal.SIGHUP)
+        except ProcessLookupError:
+            pass
+        try:
+            os.waitpid(self.child_pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
 
     async def _run(self) -> None:
         loop = asyncio.get_running_loop()
@@ -201,8 +227,9 @@ class PasswordPromptDetected(Message):
 
 class Terminal(Widget, can_focus=True):
     EXIT_MARKER = "@@LT_EXIT@@:"
-    _EXIT_LINE_RE = re.compile(re.escape(EXIT_MARKER) + r"\d+\r?\n?")
-    _START_LINE_RE = re.compile(r"@@LT_START@@:[0-9a-f]+\r?\n?")
+    _MARKER_TAG = "@@LT_"
+    _MARKER_RE = re.compile(r"@@LT_(?:START@@:[0-9a-f]+|EXIT@@:\d+)\r?\n")
+    _EXIT_CODE_RE = re.compile(re.escape(EXIT_MARKER) + r"(\d+)[\r\n]")
     _PASSWORD_RE = re.compile(r"(?i)password.*:\s*$")
 
     def __init__(self, ncol: int = 80, nrow: int = 24, **kwargs) -> None:
@@ -234,15 +261,38 @@ class Terminal(Widget, can_focus=True):
         self._password_prompt_scan_buffer = ""
         self._password_prompt_pending = False
         self._last_run_marker: str | None = None
+        self._marker_carry = ""
 
     def on_mount(self) -> None:
         self._spawn_pty()
         self.focus()
 
+    @property
+    def is_busy(self) -> bool:
+        return self._awaiting_exit_code
+
+    def _strip_markers(self, chars: str) -> str:
+        """Remove linhas de marcador do texto exibido, mesmo quando elas
+        chegam divididas entre dois blocos de saída."""
+        data = self._MARKER_RE.sub("", self._marker_carry + chars)
+        self._marker_carry = ""
+        tag = self._MARKER_TAG
+
+        idx = data.rfind(tag)
+        if idx != -1 and "\n" not in data[idx:]:
+            self._marker_carry = data[idx:]
+            return data[:idx]
+        for size in range(len(tag) - 1, 0, -1):
+            if data.endswith(tag[:size]):
+                self._marker_carry = data[-size:]
+                return data[:-size]
+        return data
+
     def _spawn_pty(self) -> None:
-        """Sobe um bash novo (usado no primeiro mount E pra recuperar
-        automaticamente se o shell cair no meio do uso)."""
-        self.pty = TerminalPTY(self.ncol, self.nrow)
+        """Sobe um bash novo (primeiro mount e recuperação de queda)."""
+        old_pty, self.pty = self.pty, TerminalPTY(self.ncol, self.nrow)
+        if old_pty is not None:
+            old_pty.close()
         self.pty.start()
         self._screen = pyte.HistoryScreen(
             self.ncol, self.nrow, history=10000, ratio=0.25
@@ -250,9 +300,14 @@ class Terminal(Widget, can_focus=True):
         self.stream = pyte.Stream(self._screen)
         self._display = PyteDisplay([Text()])
         self._exit_scan_buffer = ""
+        self._marker_carry = ""
         if not hasattr(self, "_recv_started"):
             self._recv_started = True
             self.run_worker(self._recv(), exclusive=True)
+
+    def on_unmount(self) -> None:
+        if self.pty is not None:
+            self.pty.close()
 
     def get_full_text(self, only_last_run: bool = False) -> str:
         """Reconstrói o texto puro (sem ANSI/cor) de tudo que já passou
@@ -345,27 +400,30 @@ class Terminal(Widget, can_focus=True):
         command: str | list,
         env: dict[str, str] | None = None,
         pause_on_exit: bool = True,
-    ) -> None:
+    ) -> Bool:
         """Injeta 'bash <script>' no shell persistente, com um marcador
         de saída logo depois pra detectar o fim e capturar o exit code."""
-        if self.pty is None:
+        if self.pty is None or self._awaiting_exit_code:
             return
+
         self._awaiting_exit_code = True
         self._exit_scan_buffer = ""
+        self._marker_carry = ""
+        self._password_prompt_pending = False
+        self._password_prompt_scan_buffer = ""
+        self._screen.reset()
+        self._render_screen()
 
-        if isinstance(command, str):
-            argv = ["bash", command]
-        else:
-            argv = list(command)
-
+        argv = ["bash", command] if isinstance(command, str) else list(command)
         quoted_command = " ".join(shlex.quote(str(part)) for part in argv)
-
-        prefix = ""
         if env:
-            exports = " ".join(
-                f"{key}={shlex.quote(value)}" for key, value in env.items()
+            assignments = " ".join(
+                f"{key}={shlex.quote(str(value))}"
+                for key, value in env.items()
             )
-            prefix = f"export {exports}; "
+            # `env` vale só para este comando: nada vaza para o bash persistente
+            quoted_command = f"env {assignments} {quoted_command}"
+
         self._last_run_marker = f"@@LT_START@@:{uuid.uuid4().hex[:8]}"
         start_left, start_right = self._split_marker(self._last_run_marker)
         exit_left, exit_right = self._split_marker(self.EXIT_MARKER)
@@ -375,9 +433,9 @@ class Terminal(Widget, can_focus=True):
             else ": ;"
         )
         line = (
-            f"{prefix}"
-            f'_lt_s={shlex.quote(start_left)}; _lt_s="$_lt_s"{shlex.quote(start_right)}; '
-            f'echo "$_lt_s"; '
+            f"_lt_s={shlex.quote(start_left)}; "
+            f'_lt_s="$_lt_s"{shlex.quote(start_right)}; '
+            'echo "$_lt_s"; '
             f"{quoted_command}; "
             "__lt_code=$?; "
             'if [ "$__lt_code" -eq 130 ] || [ "$__lt_code" -eq 100 ]; then '
@@ -385,10 +443,12 @@ class Terminal(Widget, can_focus=True):
             "else "
             f"{pause_clause}"
             "fi; "
-            f'_lt_e={shlex.quote(exit_left)}; _lt_e="$_lt_e"{shlex.quote(exit_right)}; '
-            f'echo "$_lt_e$__lt_code"\n'
+            f"_lt_e={shlex.quote(exit_left)}; "
+            f'_lt_e="$_lt_e"{shlex.quote(exit_right)}; '
+            'echo "$_lt_e$__lt_code"\n'
         )
-        asyncio.create_task(self.pty.recv_queue.put(["stdin", line]))
+        self.pty.recv_queue.put_nowait(["stdin", line])
+        return True
 
     async def _recv(self) -> None:
         while True:
@@ -414,9 +474,7 @@ class Terminal(Widget, can_focus=True):
                     chars = msg[1]
                     self._check_exit_marker(chars)
                     self._check_password_prompt(chars)
-                    visible = self._EXIT_LINE_RE.sub("", chars)
-                    visible = self._START_LINE_RE.sub("", visible)
-                    self.stream.feed(visible)
+                    self.stream.feed(self._strip_markers(chars))
                     has_stdout = True
                 elif cmd == "disconnect":
                     self._awaiting_exit_code = False
@@ -433,25 +491,22 @@ class Terminal(Widget, can_focus=True):
     def _check_exit_marker(self, chars: str) -> None:
         if not self._awaiting_exit_code:
             return
-        self._exit_scan_buffer += chars
-        idx = self._exit_scan_buffer.rfind(self.EXIT_MARKER)
-        if idx == -1:
-            keep_from = max(
-                0, len(self._exit_scan_buffer) - (len(self.EXIT_MARKER) - 1)
-            )
-            self._exit_scan_buffer = self._exit_scan_buffer[keep_from:]
-            return
-        rest = self._exit_scan_buffer[idx + len(self.EXIT_MARKER) :]
-        digits = ""
-        for c in rest:
-            if c.isdigit():
-                digits += c
-            else:
-                break
-        if digits:
+        buffer = self._exit_scan_buffer + chars
+        match = None
+        for match in self._EXIT_CODE_RE.finditer(buffer):
+            pass  # fica com a última ocorrência
+        if match is not None:
             self._awaiting_exit_code = False
             self._exit_scan_buffer = ""
-            self.post_message(ScriptFinished(int(digits)))
+            self.post_message(ScriptFinished(int(match.group(1))))
+            return
+        idx = buffer.rfind(self.EXIT_MARKER)
+        keep_from = (
+            idx
+            if idx != -1
+            else max(0, len(buffer) - (len(self.EXIT_MARKER) - 1))
+        )
+        self._exit_scan_buffer = buffer[keep_from:]
 
     def _check_password_prompt(self, chars: str) -> None:
         if self._password_prompt_pending:
@@ -470,9 +525,7 @@ class Terminal(Widget, can_focus=True):
             return
         self._password_prompt_pending = False
         self._password_prompt_scan_buffer = ""
-        asyncio.create_task(
-            self.pty.recv_queue.put(["stdin", password + "\n"])
-        )
+        self.pty.recv_queue.put_nowait(["stdin", password + "\n"])
 
     def cancel_password_prompt(self) -> None:
         """Usuário cancelou o diálogo — libera a detecção de novo (útil

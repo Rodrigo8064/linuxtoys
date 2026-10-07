@@ -20,7 +20,7 @@ from app.easy_cli import (
     resolve_script_dir,
 )
 from app.library_loader import script_command
-from app.manifest_helper import find_script_by_name
+from app.manifest_helper import find_script_by_name_async
 from app.parser import get_breadcrumb_path, script_requires_reboot
 from app.registry_utils import parse_registry_file
 from app.repo_parser import materialize_repo_script
@@ -85,6 +85,7 @@ class ScriptRunnerMixin:
     _running_temp_path: str | None = None
     _running_dev_mode: bool = False
     _running_is_uninstall: bool = False
+    _preparing_run: bool = False
 
     async def handle_desc_button(self, button: InfoButton) -> None:
         """Call a function based on is script or not."""
@@ -344,11 +345,7 @@ class ScriptRunnerMixin:
         self._running_is_uninstall = False
         self._running_is_appstream = False
 
-        env = {
-            "LINUXTOYS_SCRIPT_NAME": script_info.get("name", "unknown"),
-            "DISABLE_ZENITY": "1",
-            "CACHE_DIR": os.environ.get("SCRIPT_DIR", "") + "/scripts",
-        }
+        env = self._script_env(script_info.get("name", "unknown"))
         if self._is_manifest_run and not script_info.get("is_batch"):
             env.update(self._manifest_script_env(script_info))
 
@@ -359,36 +356,124 @@ class ScriptRunnerMixin:
             env=env,
         )
 
-    def run_uninstall(self, button: InfoButton) -> None:
-        script_name = str(button.label)
-        script_info = find_script_by_name(script_name, translations)
-        # script_info = {"name": str(button.label), "path": button.path}
-        uninstall_entry = build_uninstall_script_entry(
-            script_info, translations
-        )
+    @staticmethod
+    def _script_env(script_name: str) -> dict[str, str]:
+        """Ambiente comum a instalação e desinstalação."""
+        env = {
+            "LINUXTOYS_SCRIPT_NAME": script_name,
+            "DISABLE_ZENITY": "1",
+        }
+        script_dir = os.environ.get("SCRIPT_DIR")
+        if script_dir:
+            env["CACHE_DIR"] = os.path.join(script_dir, "scripts")
+        return env
 
-        if not uninstall_entry:
+    def run_uninstall(self, button: InfoButton) -> None:
+        """Valida e prepara a desinstalação sem bloquear o event loop."""
+        terminal = self.query_one("#terminal", Terminal)
+        if self._preparing_run or terminal.is_busy:
             self.notify(
-                f"✗ No removable registry entry found for '{script_name}'.",
-                severity="warning",
+                "Já existe uma execução em andamento.", severity="warning"
             )
             return
+        self._preparing_run = True
+        self.run_worker(
+            self._prepare_uninstall(button), group="uninstall-prepare"
+        )
 
-        uninstall_path = uninstall_entry.get("path")
-        cleanup_path = uninstall_entry.get("cleanup_path")
+    async def _prepare_uninstall(self, button: InfoButton) -> None:
+        script_name = str(button.label)
+        cleanup_path: str | None = None
+        started = False
+        try:
+            script_info = await find_script_by_name_async(
+                script_name, translations
+            )
+            if script_info is None:
+                self.notify(
+                    f"✗ Script '{script_name}' not found.",
+                    severity="warning",
+                )
+                return
 
+            blockers = await asyncio.to_thread(
+                installed_packages.dependency_blockers, script_info
+            )
+            if blockers:
+                details = "\n".join(f"• {item}" for item in blockers)
+                self.notify(
+                    f"✗ Cannot remove '{script_name}' yet — installed "
+                    f"software still depends on it:\n{details}",
+                    severity="warning",
+                    timeout=10,
+                )
+                return
+
+            uninstall_entry = await asyncio.to_thread(
+                build_uninstall_script_entry, script_info, translations
+            )
+            if not uninstall_entry:
+                self.notify(
+                    f"✗ No removable registry entry found for "
+                    f"'{script_name}'.",
+                    severity="warning",
+                )
+                return
+            cleanup_path = uninstall_entry.get("cleanup_path")
+
+            try:
+                command = await asyncio.to_thread(
+                    lambda: script_command(
+                        uninstall_entry["path"], resolve_script_dir()
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.notify(
+                    f"✗ Could not prepare removal of '{script_name}': {exc}",
+                    severity="error",
+                )
+                return
+
+            started = self._start_uninstall(
+                button, script_info, uninstall_entry, command
+            )
+        finally:
+            if cleanup_path and not started:
+                self._cleanup_temp_file(cleanup_path, False)
+            self._preparing_run = False
+
+    def _start_uninstall(
+        self,
+        button: InfoButton,
+        script_info: dict,
+        uninstall_entry: dict,
+        command: list[str],
+    ) -> bool:
+        """Configura o estado de execução e dispara o comando no terminal.
+
+        Retorna False se o terminal não aceitou o comando; a limpeza do
+        script temporário fica por conta de ``_prepare_uninstall``.
+        """
         self._running_button = button
         self._running_script_info = script_info
-        self._running_temp_path = cleanup_path
+        self._running_temp_path = uninstall_entry.get("cleanup_path")
         self._running_dev_mode = False
         self._running_is_uninstall = True
         self._running_is_appstream = False
+        self._running_appstream_action = None
 
         self._show_terminal()
         terminal = self.query_one("#terminal", Terminal)
-        terminal.run_script(
-            script_command(uninstall_path, resolve_script_dir())
+        started = terminal.run_script(
+            command,
+            env=self._script_env(str(button.label)),
         )
+        if not started:
+            self._finish_script_run()
+            self.notify(
+                "Já existe uma execução em andamento.", severity="warning"
+            )
+        return started
 
     def _show_terminal(self) -> None:
         logo = self.query_one("#logo_lt")
@@ -519,7 +604,11 @@ class ScriptRunnerMixin:
                         severity="warning",
                     )
                 else:
-                    self.notify("✗ Automatic reversion failed with exit code")
+                    self.notify(
+                        f"✗ '{script_name}' failed (exit code {exit_code}) "
+                        "and the automatic reversion also failed.",
+                        severity="error",
+                    )
                 self._remove_transmap()
 
             if is_appstream:

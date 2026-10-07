@@ -2,7 +2,6 @@ import re
 import threading
 from enum import Enum, auto
 
-from app import homebrew_catalog
 from app.lang_utils import load_translations
 from app.parser import get_appstream_entries
 from app.search_helper import (
@@ -174,6 +173,8 @@ def get_specials_items(path: str, trans=None) -> list[dict]:
 
 def is_homebrew_catalog_valid() -> bool:
     """Brew presente e catálogo completo, com snapshot e fingerprint atuais."""
+    from app import homebrew_catalog
+
     if not homebrew_catalog.enabled():
         return False
     from app import appstream_cache
@@ -203,8 +204,6 @@ def refresh_homebrew_catalog() -> dict:
 
 
 def get_homebrew_items() -> list[dict]:
-    if not homebrew_catalog.enabled():
-        return []
     from app import appstream_parser
 
     ensure_homebrew_context()
@@ -259,7 +258,6 @@ def ensure_homebrew_context() -> bool:
             category_paths=parser._indexed_category_paths(),
         )
     except Exception:
-        logger.exception("Failed to establish AppStream runtime context")
         return False
     return True
 

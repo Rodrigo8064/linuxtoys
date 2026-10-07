@@ -1,7 +1,7 @@
 import asyncio
 from functools import partial
 
-from textual import on
+from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -15,6 +15,7 @@ from textual.widgets import (
     Link,
     ListItem,
     ListView,
+    LoadingIndicator,
     Static,
 )
 
@@ -53,7 +54,6 @@ from .runner_helper import (
     ScriptRunnerMixin,
     UpdateRunnerMixin,
 )
-from .skills_view_tui import SkillsSeekerView
 from .tui_app_page import AppPageWidget, hide_app_page, show_app_page
 
 HOMEBREW_WATCH_INTERVAL = 3.0
@@ -62,7 +62,6 @@ RENDER_CHUNK_SIZE = 100
 HOMEBREW_PAGE_SIZE = 60
 RENDER_CHUNK_SIZE = 100
 SCROLL_LOAD_MARGIN = 5
-_SKILLS_HIDDEN = ("#logo_lt", "#home-menu", "#terminal-conteiner")
 
 
 class HomeScreen(
@@ -94,6 +93,7 @@ class HomeScreen(
 
     CSS_PATH = "style.tcss"
     _search_timer: asyncio.TimerHandle | None = None
+    _SKILLS_HIDDEN = ("#logo_lt", "#home-menu", "#terminal-conteiner")
 
     BINDINGS = [
         Binding("q", "app.quit", "Sair"),
@@ -219,11 +219,14 @@ class HomeScreen(
 
     @property
     def is_skills_seeker_showing(self) -> bool:
-        return bool(self.query(SkillsSeekerView))
+        return bool(self.query("SkillsSeekerView"))
 
     async def _open_skills_seeker(self) -> None:
+        from .skills_view_tui import SkillsSeekerView
+
         if self.is_skills_seeker_showing:
             return
+
         panel = self.query_one("#menu-panel")
         self._skills_prev_panel_title = panel.border_title
         panel.border_title = "Skills Seeker"
@@ -239,7 +242,7 @@ class HomeScreen(
         search.placeholder = translations.get(
             "skills_search_placeholder", "Search skills"
         )
-        with search.prevent(Input.Changed):  # não dispara o filtro dos botões
+        with search.prevent(Input.Changed):
             search.value = ""
 
         await self.query_one("#menu-panel").mount(SkillsSeekerView())
@@ -248,7 +251,7 @@ class HomeScreen(
         if self._skills_search_timer:
             self._skills_search_timer.stop()
             self._skills_search_timer = None
-        await self.query(SkillsSeekerView).remove()
+        await self.query("SkillsSeekerView").remove()
         self.query_one(
             "#menu-panel"
         ).border_title = self._skills_prev_panel_title
@@ -330,7 +333,7 @@ class HomeScreen(
         async with self._render_lock:
             items = self._lazy_items
             if items is None or generation != self._render_generation:
-                return  # lista foi trocada: página obsoleta
+                return
             start = self._lazy_loaded
             stop = min(len(items), start + HOMEBREW_PAGE_SIZE)
             if start >= stop:
@@ -376,8 +379,7 @@ class HomeScreen(
         ):
             self.query_one("#logo_lt").display = False
             self.query_one("#home-menu").display = False
-            menu_panel = self.query_one("#menu-panel")
-            await menu_panel.mount(SkillsSeekerView())
+            await self._open_skills_seeker()
             return
 
         if button.is_repo_entry and button.has_app_page:
@@ -649,14 +651,40 @@ class HomeScreen(
         )
 
 
-class LinuxToys(App):
-    """enter for linuxtoys TUI"""
+class SplashScreen(Screen):
+    """Tela mínima exibida enquanto o cache de busca é montado."""
 
+    DEFAULT_CSS = """
+    SplashScreen { align: center middle; }
+    SplashScreen > Vertical { width: auto; height: auto; align: center middle; }
+    SplashScreen LoadingIndicator { width: 24; height: 3; }
+    SplashScreen Label { width: 100%; content-align: center middle; color: $text-muted; }
+    """
+
+    def compose(self):
+        with Vertical():
+            yield LoadingIndicator()
+            yield Label(translations.get("loading", "Loading..."))
+
+
+class LinuxToys(App):
     CSS_PATH = "style.tcss"
 
     def on_mount(self) -> None:
-        warm_search_and_category_index(translations)
-        self.push_screen(HomeScreen())
+        self.push_screen(SplashScreen())
+        self._boot()
+
+    @work(thread=True, exclusive=True, group="boot")
+    def _boot(self) -> None:
+        try:
+            warm_search_and_category_index(translations)
+        except Exception as e:  # noqa: BLE001
+            # Sem cache a busca fica mais lenta, mas o app precisa abrir.
+            self.log.error(f"warm index failed: {e}")
+        self.call_from_thread(self._show_home)
+
+    def _show_home(self) -> None:
+        self.switch_screen(HomeScreen())
 
 
 if __name__ == "__main__":
