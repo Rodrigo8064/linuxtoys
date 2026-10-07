@@ -62,6 +62,7 @@ RENDER_CHUNK_SIZE = 100
 HOMEBREW_PAGE_SIZE = 60
 RENDER_CHUNK_SIZE = 100
 SCROLL_LOAD_MARGIN = 5
+_SKILLS_HIDDEN = ("#logo_lt", "#home-menu", "#terminal-conteiner")
 
 
 class HomeScreen(
@@ -78,7 +79,6 @@ class HomeScreen(
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._nav_stack: list[tuple[str, str]] = []
-        self._is_skills_seeker_showing = False
         self._render_lock = asyncio.Lock()
         self._render_generation = 0
         self._homebrew_refresh_running = False
@@ -87,6 +87,10 @@ class HomeScreen(
         self._lazy_items = None
         self._lazy_loaded = 0
         self._registry_data = None
+        self._skills_search_timer = None
+        self._skills_prev_display: dict[str, bool] = {}
+        self._skills_prev_placeholder = ""
+        self._skills_prev_panel_title = ""
 
     CSS_PATH = "style.tcss"
     _search_timer: asyncio.TimerHandle | None = None
@@ -121,7 +125,7 @@ class HomeScreen(
                     for item in self._home_items():
                         yield self._make_info_button(item, registry_data)
             # right panel widgets
-            with Vertical(id="menu-panel"):
+            with VerticalScroll(id="menu-panel"):
                 yield Static(linuxtoys_art, id="logo_lt")
                 yield ListView(
                     ListItem(
@@ -215,8 +219,47 @@ class HomeScreen(
 
     @property
     def is_skills_seeker_showing(self) -> bool:
-        """Verifica se a tela de Skills Seeker está sendo exibida."""
         return bool(self.query(SkillsSeekerView))
+
+    async def _open_skills_seeker(self) -> None:
+        if self.is_skills_seeker_showing:
+            return
+        panel = self.query_one("#menu-panel")
+        self._skills_prev_panel_title = panel.border_title
+        panel.border_title = "Skills Seeker"
+
+        self._skills_prev_display = {
+            sel: self.query_one(sel).display for sel in self._SKILLS_HIDDEN
+        }
+        for sel in self._SKILLS_HIDDEN:
+            self.query_one(sel).display = False
+
+        search = self.query_one("#search-input", Input)
+        self._skills_prev_placeholder = search.placeholder
+        search.placeholder = translations.get(
+            "skills_search_placeholder", "Search skills"
+        )
+        with search.prevent(Input.Changed):  # não dispara o filtro dos botões
+            search.value = ""
+
+        await self.query_one("#menu-panel").mount(SkillsSeekerView())
+
+    async def _close_skills_seeker(self) -> None:
+        if self._skills_search_timer:
+            self._skills_search_timer.stop()
+            self._skills_search_timer = None
+        await self.query(SkillsSeekerView).remove()
+        self.query_one(
+            "#menu-panel"
+        ).border_title = self._skills_prev_panel_title
+
+        for sel, was_displayed in self._skills_prev_display.items():
+            self.query_one(sel).display = was_displayed
+
+        search = self.query_one("#search-input", Input)
+        search.placeholder = self._skills_prev_placeholder
+        with search.prevent(Input.Changed):
+            search.value = ""
 
     def _make_info_button(self, item: dict, registry_data) -> InfoButton:
         return InfoButton(
@@ -309,6 +352,9 @@ class HomeScreen(
         self.app.push_screen(ReportBugDialog())
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
+        button = event.button
+        if not isinstance(button, InfoButton):
+            return
         if self._is_about_showing:
             self._toggle_about_panel(force_hide=True)
             logo = self.query_one("#logo_lt")
@@ -318,10 +364,6 @@ class HomeScreen(
             menu.display = True
             menu_panel.border_title = "Menu"
             self._is_about_showing = False
-
-        button = event.button
-        if not isinstance(button, InfoButton):
-            return
 
         if self.is_skills_seeker_showing:
             await self.action_go_back()
@@ -425,9 +467,12 @@ class HomeScreen(
 
         query = event.value.strip()
 
+        if self.is_skills_seeker_showing:
+            self._schedule_skills_search(query)
+            return
+
         if self._search_timer:
             self._search_timer.cancel()
-
         if not query:
             await self.action_reset_to_home()
             return
@@ -442,6 +487,23 @@ class HomeScreen(
                 name="search_filter",
             ),
         )
+
+    async def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "search-input" and self.is_skills_seeker_showing:
+            for view in self.query(SkillsSeekerView):
+                view.focus_results()
+
+    def _schedule_skills_search(self, query: str) -> None:
+        if self._skills_search_timer:
+            self._skills_search_timer.stop()
+        # Debounce maior que o dos botões: cada busca é uma chamada de rede.
+        self._skills_search_timer = self.set_timer(
+            0.4, partial(self._run_skills_search, query)
+        )
+
+    def _run_skills_search(self, query: str) -> None:
+        for view in self.query(SkillsSeekerView):
+            view.do_search(query)
 
     @on(AppPageWidget.RevertRequested)
     def _on_app_page_revert_requested(
@@ -482,13 +544,7 @@ class HomeScreen(
             return
 
         if self.is_skills_seeker_showing:
-            skills_view = self.query(SkillsSeekerView)
-            if skills_view:
-                await skills_view.remove()
-
-            self.query_one("#logo_lt").display = True
-            self.query_one("#home-menu").display = True
-            self.query_one("#menu-panel").border_title = "Menu"
+            await self._close_skills_seeker()
             return
 
         if self._is_about_showing:
