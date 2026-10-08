@@ -492,7 +492,7 @@ class HomeScreen(
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "search-input" and self.is_skills_seeker_showing:
-            for view in self.query(SkillsSeekerView):
+            for view in self.query("SkillsSeekerView"):
                 view.focus_results()
 
     def _schedule_skills_search(self, query: str) -> None:
@@ -504,7 +504,7 @@ class HomeScreen(
         )
 
     def _run_skills_search(self, query: str) -> None:
-        for view in self.query(SkillsSeekerView):
+        for view in self.query("SkillsSeekerView"):
             view.do_search(query)
 
     @on(AppPageWidget.RevertRequested)
