@@ -7,13 +7,12 @@
 # reboot: yes
 # nocontainer
 # repo: https://github.com/CachyOS/CachyOS-Settings
-# optimized-only: yes
 # systemd: yes
 
 # --- Start of the script code ---
 askpass
 
-if ! [ ! -f /usr/lib/sysctl.d/70-linuxtoys-settings.conf ]; then
+if [ ! -f /usr/lib/sysctl.d/70-linuxtoys-settings.conf ]; then
     prep_tmp
     _cfgsource="https://raw.githubusercontent.com/CachyOS/CachyOS-Settings/master/usr"
     {
