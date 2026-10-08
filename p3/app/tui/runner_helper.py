@@ -31,6 +31,7 @@ from .appstream_executor import (
     AUR_SECURITY_BLOCKED,
     AUR_SECURITY_OK,
     build_aur_install_script,
+    build_flatpak_extension_command,
     build_install_script,
     build_snap_revert_command,
     check_aur_package_security,
@@ -603,12 +604,15 @@ class ScriptRunnerMixin:
             self._on_manifest_item_finished(message)
             return
         script_info = self._running_script_info or {}
+        is_extension = self._is_extension_entry(script_info)
         script_name = script_info.get("name", "Script")
 
         # verify if is reboot
         script_path = script_info.get("path", "")
         system_compat_keys = get_system_compat_keys()
-        reboot = script_requires_reboot(script_path, system_compat_keys)
+        reboot = not is_extension and script_requires_reboot(
+            script_path, system_compat_keys
+        )
 
         temp_path = self._running_temp_path
         dev_mode = self._running_dev_mode
@@ -621,22 +625,16 @@ class ScriptRunnerMixin:
         action_verb = "remove" if is_uninstall else "install"
 
         if result is ScriptResult.SUCCESS:
-            if not dev_mode and not is_uninstall:
+            if not dev_mode and not is_uninstall and not is_extension:
                 _save_script_to_registry(script_name, TRANSMAP_PATH)
                 _cleanup_tmp_noram_dirs(TRANSMAP_PATH)
                 self._remove_transmap()
             self._cleanup_temp_file(temp_path, dev_mode)
 
             if is_appstream:
-                page = self._current_app_page()
-                if page is not None:
-                    await show_app_page(
-                        self,
-                        script_info,
-                        translations=translations,
-                        featured=None,
-                        installed=not is_uninstall,
-                    )
+                await self._refresh_app_page_after_run(
+                    script_info, is_uninstall
+                )
             if reboot:
                 self.app.push_screen(
                     RebootDialog(), callback=self._finish_script_run
@@ -652,15 +650,9 @@ class ScriptRunnerMixin:
                 self._remove_transmap()
             self._cleanup_temp_file(temp_path, dev_mode)
             if is_appstream:
-                page = self._current_app_page()
-                if page is not None:
-                    action = self._running_appstream_action
-                    if action == "uninstall":
-                        page.reset_remove_button()
-                    elif action == "revert":
-                        page.reset_revert_button()
-                    else:
-                        page.reset_install_button()
+                await self._refresh_app_page_after_run(
+                    script_info, is_uninstall
+                )
             self.app.push_screen(
                 CancelledDialog(script_name), callback=self._finish_script_run
             )
@@ -673,19 +665,15 @@ class ScriptRunnerMixin:
             )
             self._cleanup_temp_file(temp_path, dev_mode)
             if is_appstream:
-                page = self._current_app_page()
-                if page is not None:
-                    action = self._running_appstream_action
-                    if action == "uninstall":
-                        page.reset_remove_button()
-                    elif action == "revert":
-                        page.reset_revert_button()
-                    else:
-                        page.reset_install_button()
+                await self._refresh_app_page_after_run(
+                    script_info, is_uninstall
+                )
             self._finish_script_run()
 
         else:  # ScriptResult.ERROR
-            if is_appstream and not is_uninstall:
+            if is_extension:
+                pass
+            elif is_appstream and not is_uninstall:
                 _save_script_to_registry(script_path, TRANSMAP_PATH)
                 self._remove_transmap()
             elif not dev_mode and not is_uninstall:
@@ -710,15 +698,9 @@ class ScriptRunnerMixin:
                 self._remove_transmap()
 
             if is_appstream:
-                page = self._current_app_page()
-                if page is not None:
-                    action = self._running_appstream_action
-                    if action == "uninstall":
-                        page.reset_remove_button()
-                    elif action == "revert":
-                        page.reset_revert_button()
-                    else:
-                        page.reset_install_button()
+                await self._refresh_app_page_after_run(
+                    script_info, is_uninstall
+                )
 
             terminal = self.query_one("#terminal", Terminal)
             terminal_text = terminal.get_full_text()
@@ -898,6 +880,46 @@ class ScriptRunnerMixin:
         except NoMatches:
             return None
 
+    @staticmethod
+    def _is_extension_entry(entry: Mapping[str, Any] | None) -> bool:
+        """Extensões Flatpak carregam ``parent_id`` (appstream_cache)."""
+        return bool((entry or {}).get("parent_id"))
+
+    def _reset_app_page_buttons(self) -> None:
+        """Reabilita os controles da página após erro/cancelamento."""
+        page = self._current_app_page()
+        if page is None:
+            return
+        if self._is_extension_entry(self._running_script_info):
+            page.refresh_extensions()
+            return
+        action = self._running_appstream_action
+        if action == "uninstall":
+            page.reset_remove_button()
+        elif action == "revert":
+            page.reset_revert_button()
+        else:
+            page.reset_install_button()
+
+    async def _refresh_app_page_after_run(
+        self, script_info: dict, is_uninstall: bool
+    ) -> None:
+        page = self._current_app_page()
+        if page is None:
+            return
+        if self._is_extension_entry(script_info):
+            # A página do app continua montada; só a lista muda.
+            self.query_one("#terminal-conteiner").display = False
+            page.refresh_extensions()
+            return
+        await show_app_page(
+            self,
+            script_info,
+            translations=translations,
+            featured=None,
+            installed=not is_uninstall,
+        )
+
 
 class AppstreamRunnerMixin:
     """Instalação, remoção e reversão de itens via AppStream."""
@@ -915,6 +937,17 @@ class AppstreamRunnerMixin:
         page = self._current_app_page()
         if page is not None:
             page.reset_remove_button()
+
+    def _reset_appstream_install_button(
+        self, entry: Mapping[str, Any]
+    ) -> None:
+        page = self._current_app_page()
+        if page is None:
+            return
+        if self._is_extension_entry(entry):
+            page.refresh_extensions()
+        else:
+            page.reset_install_button()
 
     def run_appstream_install(self, script_info: Mapping[str, Any]) -> None:
         entry = dict(script_info)
@@ -1163,6 +1196,44 @@ class AppstreamRunnerMixin:
             env=self._script_env(name, TRANSMAP_PATH=TRANSMAP_PATH),
             pause_on_exit=False,
         )
+
+    def _refresh_extensions_page(self) -> None:
+        page = self._current_app_page()
+        if page is not None:
+            page.refresh_extensions()
+
+    def run_appstream_extension(
+        self, info: Mapping[str, Any], *, remove: bool
+    ) -> None:
+        entry = dict(info)
+        name = str(entry.get("name") or entry.get("flatpak_ref") or "")
+        try:
+            argv = build_flatpak_extension_command(entry, remove)
+        except ValueError as exc:
+            self.notify(f"✗ {exc}", severity="warning")
+            self._refresh_extensions_page()
+            return
+        if not self._ensure_terminal_free():
+            self._refresh_extensions_page()
+            return
+
+        self._running_button = None
+        self._running_script_info = entry
+        self._running_temp_path = None
+        self._running_dev_mode = False
+        self._running_is_uninstall = remove
+        self._running_is_appstream = True
+        self._running_appstream_action = (
+            "extension_remove" if remove else "extension_install"
+        )
+
+        terminal = self.query_one("#terminal", Terminal)
+        started = terminal.run_script(
+            argv, env=self._script_env(name), pause_on_exit=False
+        )
+        if not started:
+            self._finish_script_run()
+            self._refresh_extensions_page()
 
 
 class ManifestRunnerMixin:

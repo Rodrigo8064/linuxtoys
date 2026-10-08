@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 from rich.text import Text
-from textual import on
+from textual import on, work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
@@ -22,16 +23,16 @@ from textual.widgets import (
     TabPane,
 )
 
+from app import appstream_cache
+
 __all__ = ["AppPageWidget", "FeaturedCard", "show_app_page", "hide_app_page"]
 
-# IDs da homescreen existente
 MENU_PANEL = "#menu-panel"
 BODY = "#body-home"
 LIST_VIEW = "#home-menu"
 LOGO = "#logo_lt"
 TERMINAL = "#terminal-conteiner"
 
-# Geometria do "Try These" (GUI: 280px mín. por card, até 5 colunas)
 MIN_CARD_WIDTH = 30
 CARD_HEIGHT = 5
 MAX_COLUMNS = 5
@@ -145,6 +146,14 @@ class FeaturedCard(Static, can_focus=True):
 class AppPageWidget(Vertical):
     """Página de app. Recebe tudo que precisa no construtor."""
 
+    DEFAULT_CSS = """
+    AppPageWidget #app-tabs.no-ext ContentTabs { display: none; }
+    AppPageWidget #app-rating-confirm { height: auto; }
+    AppPageWidget #app-rating-confirm-text { width: 1fr; height: auto; }
+    AppPageWidget .ext-row { height: auto; padding: 0 1; }
+    AppPageWidget .ext-info { width: 1fr; height: auto; }
+    """
+
     # ---- mensagens para o host ------------------------------------------- #
     class BackRequested(Message):
         pass
@@ -189,6 +198,26 @@ class AppPageWidget(Vertical):
 
     class UninstallRequested(InstallRequested):
         pass
+
+    class ExtensionInstallRequested(Message):
+        """Payload já inclui ``is_flatpak_extension`` (igual à GUI)."""
+
+        def __init__(self, info: Mapping[str, Any]) -> None:
+            super().__init__()
+            self.info = info
+
+    class ExtensionRemoveRequested(Message):
+        def __init__(
+            self, info: Mapping[str, Any], record_id: Any = None
+        ) -> None:
+            super().__init__()
+            self.info = info
+            self.record_id = record_id
+
+    class ExtensionCancelRequested(Message):
+        def __init__(self, job_id: Any) -> None:
+            super().__init__()
+            self.job_id = job_id
 
     # ---- construção ------------------------------------------------------- #
     def __init__(
@@ -239,8 +268,18 @@ class AppPageWidget(Vertical):
         self._translated_blocks: Any = None
         self._showing_translation = False
 
-        # Avaliação do usuário (None = ainda não avaliou)
+        # Avaliação (estado real vem do appstream_cache, como na GUI)
         self._user_rating: int | None = script_info.get("user_rating")
+        self._rated = self._user_rating is not None
+        self._can_rate = False
+        self._rating_busy = False
+        self._pending_stars: int | None = None
+        self._snap_vote_synced: set[str] = set()
+
+        # Extensões Flatpak da fonte selecionada (aba criada sob demanda)
+        self._extensions = self._load_extensions()
+        self._extension_jobs: list[Mapping[str, Any]] = []
+        self._extensions_populated = False
 
         # Featured: mesma categoria primeiro, nunca o app atual
         current = _script_key(script_info)
@@ -418,8 +457,6 @@ class AppPageWidget(Vertical):
 
     # ---- compose ---------------------------------------------------------- #
     def compose(self) -> ComposeResult:
-        info = self.script_info
-
         with Horizontal(id="app-top"):
             yield Button("←", id="app-back", tooltip=self._t("back", "Back"))
             yield Static(self._name_text(), id="app-name")
@@ -442,22 +479,19 @@ class AppPageWidget(Vertical):
             id="app-actions",
         )
         yield self._rating_row()
+        yield self._rating_confirm_row()
 
-        content = self._build_content()
-        extensions = list(info.get("extensions") or ())
-        if extensions:
-            with TabbedContent(id="app-tabs"):
-                with TabPane(
-                    self._t("app_page_details", "Details"), id="tab-details"
-                ):
-                    yield content
-                with TabPane(
-                    self._t("app_page_extensions", "Extensions"),
-                    id="tab-extensions",
-                ):
-                    yield self._build_extensions(extensions)
-        else:
-            yield content
+        # Sempre TabbedContent: a aba Extensions entra/sai quando a fonte
+        # muda (GUI: _sync_extensions_tabs). Sem extensões, a barra some.
+        with TabbedContent(
+            id="app-tabs", classes="" if self._extensions else "no-ext"
+        ):
+            with TabPane(
+                self._t("app_page_details", "Details"), id="tab-details"
+            ):
+                yield self._build_content()
+            if self._extensions:
+                yield self._extensions_pane()
 
     def _primary_actions(self) -> list[Widget]:
         install = Button(
@@ -472,12 +506,7 @@ class AppPageWidget(Vertical):
             id="app-remove",
         )
         remove.display = self._installed
-        revert = Button(
-            "↺ " + self._t("app_page_snap_revert", "Revert").strip(),
-            id="app-revert",
-        )
-        revert.display = self._installed and self._has_snap_source()
-        widgets: list[Widget] = [install, remove, revert]
+        widgets: list[Widget] = [install, remove]
 
         if len(self._source_options) >= 2:
             recommended = self._recommended_source()
@@ -576,6 +605,24 @@ class AppPageWidget(Vertical):
         row.display = False
         return row
 
+    def _rating_confirm_row(self) -> Horizontal:
+        row = Horizontal(
+            Static(id="app-rating-confirm-text"),
+            Button(
+                self._t("app_page_rate_submit", "Submit"),
+                variant="success",
+                id="app-rating-submit",
+            ),
+            Button(
+                self._t("cancel_btn_label", "Cancel"),
+                id="app-rating-cancel",
+            ),
+            id="app-rating-confirm",
+            classes="app-row",
+        )
+        row.display = False
+        return row
+
     def _description_text(self) -> str | None:
         description = str(self.script_info.get("description") or "").strip()
         return description or None
@@ -612,22 +659,165 @@ class AppPageWidget(Vertical):
             children[-1].display = False
         return VerticalScroll(*children, id="app-content")
 
-    def _build_extensions(self, extensions: Sequence[Any]) -> VerticalScroll:
-        items = []
-        for ext in extensions:
-            if isinstance(ext, Mapping):
-                text = Text(
-                    str(ext.get("name") or ext.get("id") or ""), style="bold"
+    # ---- extensões -------------------------------------------------------- #
+    def _load_extensions(self) -> list[Mapping[str, Any]]:
+        """Mesma fonte da GUI: addons Flatpak da fonte selecionada."""
+        return [
+            dict(item)
+            for item in appstream_cache.get_flatpak_extensions(dict(self._selected))
+            or ()
+        ]
+
+    def _extensions_pane(self) -> TabPane:
+        return TabPane(
+            self._t("app_page_extensions", "Extensions"),
+            VerticalScroll(id="app-extensions"),
+            id="tab-extensions",
+        )
+
+    def _extension_state(
+        self,
+        ref: str,
+        installed: set[str],
+        jobs: Mapping[str, Mapping[str, Any]],
+    ) -> tuple[str, Mapping[str, Any] | None]:
+        state = "installed" if ref in installed else "available"
+        record = jobs.get(ref)
+        if record and record.get("status") in ("queued", "running"):
+            state = (
+                "removing"
+                if record.get("action") == "extension_remove"
+                else record["status"]
+            )
+        return state, record
+
+    def _extension_row(
+        self,
+        info: Mapping[str, Any],
+        ref: str,
+        state: str,
+        record: Mapping[str, Any] | None,
+    ) -> Horizontal:
+        # (texto secundário, rótulo do botão, variante, ação)
+        views = {
+            "available": (
+                str(info.get("summary") or ""),
+                "⬇ " + self._t("skills_install_label", "Install").strip(),
+                "success",
+                "install",
+            ),
+            "installed": (
+                self._t("app_page_installed", "Installed"),
+                "🗑 " + self._t("skills_remove_label", "Remove").strip(),
+                "error",
+                "remove",
+            ),
+            "queued": (
+                self._t("queued", "Waiting to install"),
+                self._t("cancel_btn_label", "Cancel"),
+                "default",
+                "cancel",
+            ),
+            "removing": (
+                self._t("skills_removing", "Removing…"),
+                "…",
+                "default",
+                None,
+            ),
+            "running": (
+                self._t("skills_installing", "Installing…"),
+                "…",
+                "default",
+                None,
+            ),
+        }
+        secondary, label, variant, action = views[state]
+        name = str(info.get("name") or info.get("id") or ref)
+        text = Text(name, style="bold")
+        if secondary:
+            text.append("\n" + secondary, style="dim")
+        button = Button(label, variant=variant, disabled=action is None)
+        button.ext_action = (action, info, record)  # type: ignore[attr-defined]
+        return Horizontal(
+            Static(text, classes="ext-info"), button, classes="ext-row"
+        )
+
+    def refresh_extensions(
+        self, jobs: Sequence[Mapping[str, Any]] | None = None
+    ) -> None:
+        """Atualiza a aba Extensions. ``jobs`` = ``runner.snapshot()``."""
+        if jobs is not None:
+            self._extension_jobs = list(jobs)
+        if self._extensions_populated:
+            self._render_extensions()
+
+    @work(exclusive=True, group="extensions")
+    async def _render_extensions(self) -> None:
+        installed = await asyncio.to_thread(
+            appstream_cache.installed_flatpak_extension_refs,
+            dict(self._selected),
+        )
+        jobs: dict[str, Mapping[str, Any]] = {}
+        for record in self._extension_jobs:
+            ref = str(
+                (record.get("info") or {}).get("flatpak_ref") or ""
+            ).strip()
+            if ref:
+                jobs.setdefault(ref, record)
+
+        rows = []
+        for info in self._extensions:
+            ref = str(info.get("flatpak_ref") or "").strip()
+            if ref:
+                state, record = self._extension_state(ref, installed, jobs)
+                rows.append(self._extension_row(info, ref, state, record))
+        container = self.query_one("#app-extensions", VerticalScroll)
+        await container.remove_children()
+        await container.mount_all(rows)
+
+    async def _sync_extensions_tabs(self) -> None:
+        """Mostra Details/Extensions só se a fonte selecionada tiver addons."""
+        self._extensions = self._load_extensions()
+        self._extensions_populated = False
+        tabs = self.query_one("#app-tabs", TabbedContent)
+        has_pane = bool(self.query("#tab-extensions"))
+        if self._extensions and not has_pane:
+            await tabs.add_pane(self._extensions_pane())
+        elif not self._extensions and has_pane:
+            await tabs.remove_pane("tab-extensions")
+        tabs.set_class(not self._extensions, "no-ext")
+        if self._extensions and tabs.active == "tab-extensions":
+            self._populate_extensions()
+
+    def _populate_extensions(self) -> None:
+        """Preenche as linhas só quando a aba é aberta (como na GUI)."""
+        if not self._extensions_populated:
+            self._extensions_populated = True
+            self._render_extensions()
+
+    def _extension_pressed(
+        self,
+        button: Button,
+        action: str,
+        info: Mapping[str, Any],
+        record: Mapping[str, Any] | None,
+    ) -> None:
+        button.disabled = True
+        if action == "install":
+            self.post_message(
+                self.ExtensionInstallRequested(
+                    {**info, "is_flatpak_extension": True}
                 )
-                summary = str(
-                    ext.get("summary") or ext.get("description") or ""
-                ).strip()
-                if summary:
-                    text.append("\n" + summary, style="dim")
-            else:
-                text = Text(str(ext), style="bold")
-            items.append(Static(text, classes="ext-item"))
-        return VerticalScroll(*items, id="app-extensions")
+            )
+        elif action == "remove":
+            done = record is not None and record.get("status") == "success"
+            self.post_message(
+                self.ExtensionRemoveRequested(
+                    dict(info), record["id"] if done else None
+                )
+            )
+        elif action == "cancel" and record is not None:
+            self.post_message(self.ExtensionCancelRequested(record["id"]))
 
     def _needs_translation(self) -> bool:
         info = self.script_info
@@ -645,6 +835,7 @@ class AppPageWidget(Vertical):
     # ---- ciclo de vida ---------------------------------------------------- #
     def on_mount(self) -> None:
         self._refresh_rating()
+        self._load_rating_state()
         self.call_after_refresh(self._schedule_featured)
         self.call_after_refresh(self._focus_first)
 
@@ -661,6 +852,9 @@ class AppPageWidget(Vertical):
 
     @on(TabbedContent.TabActivated)
     def _tab_changed(self) -> None:
+        tabs = self.query_one("#app-tabs", TabbedContent)
+        if tabs.active == "tab-extensions":
+            self._populate_extensions()
         self._featured_signature = None
         self._schedule_featured()
 
@@ -670,12 +864,14 @@ class AppPageWidget(Vertical):
         self.query_one("#app-install").display = not installed
         self.query_one("#app-remove").display = installed
         self._refresh_rating()
+        self._load_rating_state()
 
     def set_snap_revert_visible(self, visible: bool) -> None:
-        self.query_one("#app-revert").display = visible
+        """Mantido por compatibilidade: a TUI não oferece Revert."""
 
     def set_user_rating(self, stars: int | None) -> None:
         self._user_rating = stars
+        self._rated = stars is not None
         self._refresh_rating()
 
     def set_translated_blocks(self, blocks: Any) -> None:
@@ -707,15 +903,27 @@ class AppPageWidget(Vertical):
         self._featured_signature = None
         self.call_after_refresh(self._schedule_featured)
 
+    def _rating_supported(self) -> bool:
+        """GUI: avaliação só para entradas AppStream e nunca em Homebrew."""
+        return bool(
+            self.script_info.get("is_appstream_entry")
+            and self._selected.get("appstream_source") != "homebrew"
+        )
+
     def _refresh_rating(self) -> None:
         try:
             row = self.query_one("#app-rating")
-        except Exception:
+        except NoMatches:
             return
-        row.display = self._installed
-        rated = self._user_rating is not None
+        row.display = self._installed and self._rating_supported()
         snap = self._is_snap()
         tooltip = self._t("app_page_rate_stars", "Rate {stars} stars")
+        blocked = (
+            not self._installed
+            or self._rated
+            or self._rating_busy
+            or not self._can_rate
+        )
         for i in range(1, 6):
             btn = self.query_one(f"#app-rate-{i}", Button)
             if snap:
@@ -724,26 +932,181 @@ class AppPageWidget(Vertical):
                 btn.tooltip = "Do not recommend" if i == 1 else "Recommend"
             else:
                 btn.display = True
-                btn.label = (
-                    "★" if rated and i <= (self._user_rating or 0) else "☆"
-                )
+                shown = self._rated and i <= (self._user_rating or 0)
+                btn.label = "★" if shown else "☆"
                 btn.tooltip = tooltip.format(stars=i)
-            btn.disabled = not self._installed or rated
-        if rated:
-            row.tooltip = self._t(
-                "app_page_rate_done", "You have already rated this app."
-            )
-        else:
-            row.tooltip = None
+            btn.disabled = blocked
+        row.tooltip = (
+            self._t("app_page_rate_done", "You have already rated this app.")
+            if self._rated
+            else None
+        )
 
-    def _has_snap_source(self) -> bool:
+    # ---- avaliação (mesma lógica da GUI, via appstream_cache) ------------ #
+    def _rating_app_id(self) -> str:
         info = self.script_info
-        if str(info.get("snap_name") or "").strip():
-            return True
-        for option in info.get("source_options") or ():
-            if str(option.get("snap_name") or "").strip():
-                return True
-        return False
+        return str(info.get("appstream_id") or info.get("id") or "").strip()
+
+    def _snap_identity(self) -> tuple[str, str]:
+        info = self._selected
+        return (
+            str(info.get("snap_id", "") or "").strip(),
+            str(
+                info.get("snap_name", "") or info.get("package-name", "") or ""
+            ).strip(),
+        )
+
+    def _read_rating_state(
+        self, snap: bool, installed: bool
+    ) -> tuple[bool, int | None, bool]:
+        """(já avaliou, estrelas enviadas, pode avaliar). Roda em thread."""
+        if snap:
+            snap_id, snap_name = self._snap_identity()
+            if installed and snap_id and snap_id not in self._snap_vote_synced:
+                self._snap_vote_synced.add(snap_id)
+                appstream_cache.sync_snap_vote(snap_id)
+            revision = (
+                appstream_cache.get_snap_installed_revision(snap_name)
+                if installed and snap_name
+                else None
+            )
+            rated = bool(
+                snap_id
+                and revision
+                and appstream_cache.get_submitted_snap_vote(snap_id, revision)
+                is not None
+            )
+            return rated, None, bool(snap_id and snap_name and revision)
+        app_id = self._rating_app_id()
+        rated = bool(app_id) and appstream_cache.has_submitted_odrs_rating(
+            app_id
+        )
+        stars = (
+            appstream_cache.get_submitted_odrs_rating(app_id)
+            if rated
+            else None
+        )
+        return rated, stars, bool(app_id) and not rated
+
+    @work(exclusive=True, group="rating-state")
+    async def _load_rating_state(self) -> None:
+        if not self._rating_supported():
+            return
+        state = await asyncio.to_thread(
+            self._read_rating_state, self._is_snap(), self._installed
+        )
+        self._rated, self._user_rating, self._can_rate = state
+        self._refresh_rating()
+
+    def _rating_summary(self, stars: int) -> str:
+        presets = {
+            5: ("app_page_rate_5", "Excellent, this app is a must have!!"),
+            4: ("app_page_rate_4", "Very good app. Give it a try."),
+            3: ("app_page_rate_3", "Decent pick."),
+            2: ("app_page_rate_2", "Needs improvements..."),
+            1: ("app_page_rate_1", "Had issues."),
+        }
+        return self._t(*presets[stars])
+
+    def _rating_confirm_text(self, stars: int) -> Text:
+        text = Text(
+            self._t("app_page_rate_confirm_title", "Submit Rating?"),
+            style="bold",
+        )
+        if self._is_snap():
+            vote = "👍 Recommend" if stars == 5 else "👎 Do not recommend"
+            text.append("\n" + vote)
+        else:
+            warning = (
+                self._t(
+                    "app_page_rate_confirm_message",
+                    "This rating cannot be changed or retracted after it is "
+                    "submitted.",
+                )
+                .replace("\\n", "\n")
+                .split("\n\n", 1)[0]
+                .strip()
+            )
+            text.append("\n" + "★" * stars + "☆" * (5 - stars), style="yellow")
+            text.append("\n" + warning, style="dim")
+        return text
+
+    def _ask_rating_confirmation(self, stars: int) -> None:
+        if not self._installed or self._rating_busy or not self._can_rate:
+            return
+        self._pending_stars = stars
+        self.query_one("#app-rating-confirm-text", Static).update(
+            self._rating_confirm_text(stars)
+        )
+        self.query_one("#app-rating-confirm").display = True
+        self.query_one("#app-rating-submit", Button).focus()
+
+    def _close_rating_confirmation(self) -> None:
+        self._pending_stars = None
+        try:
+            self.query_one("#app-rating-confirm").display = False
+        except NoMatches:
+            pass
+
+    def _submit_rating(self) -> None:
+        stars = self._pending_stars
+        self._close_rating_confirmation()
+        if stars is None:
+            return
+        self._rating_busy = True
+        self._refresh_rating()
+        self._submit_rating_worker(stars, self._is_snap())
+
+    def _send_rating(self, stars: int, snap: bool) -> tuple[bool, Any]:
+        """Envia a avaliação ao backend. Roda em thread."""
+        if snap:
+            snap_id, snap_name = self._snap_identity()
+            revision = appstream_cache.get_snap_installed_revision(snap_name)
+            if not snap_id or not snap_name or revision is None:
+                return False, None
+            voted = appstream_cache.get_submitted_snap_vote(snap_id, revision)
+            if voted is not None:
+                return False, None
+            return appstream_cache.submit_snap_vote(
+                snap_id, snap_name, stars == 5
+            )
+        return appstream_cache.submit_odrs_rating(
+            self._rating_app_id(),
+            stars,
+            self._rating_summary(stars),
+            self._t("app_page_rate_signature", "Submitted via LinuxToys"),
+            str(self._selected.get("appstream_version", "") or "unknown"),
+        )
+
+    @work(group="rating-submit")
+    async def _submit_rating_worker(self, stars: int, snap: bool) -> None:
+        success, error = await asyncio.to_thread(
+            self._send_rating, stars, snap
+        )
+        self._rating_busy = False
+        if success:
+            key, default = (
+                ("app_page_rate_success_message_snap",
+                 "Thank you! Your vote was submitted to Canonical Snap "
+                 "ratings.")
+                if snap
+                else ("app_page_rate_success_message",
+                      "Thank you! Your rating was submitted to ODRS.")
+            )
+            title = self._t("app_page_rate_success_title", "Rating Submitted")
+            self.app.notify(self._t(key, default), title=title)
+        else:
+            message = self._t(
+                "app_page_rate_failed_message",
+                "Could not submit the rating. Please try again later.",
+            )
+            self.app.notify(
+                f"{message}\n\n{error}" if error else message,
+                title=self._t("app_page_rate_failed_title", "Rating Failed"),
+                severity="error",
+            )
+        self._load_rating_state()
+        self._refresh_rating()
 
     # ---- featured (preenche só o espaço sobrando, como na GUI) ------------ #
     def _schedule_featured(self) -> None:
@@ -812,7 +1175,10 @@ class AppPageWidget(Vertical):
     def _button_pressed(self, event: Button.Pressed) -> None:
         event.stop()
         bid = event.button.id or ""
-        if bid == "app-back":
+        extension = getattr(event.button, "ext_action", None)
+        if extension is not None:
+            self._extension_pressed(event.button, *extension)
+        elif bid == "app-back":
             self.post_message(self.BackRequested())
         elif bid == "app-install":
             event.button.disabled = True
@@ -824,14 +1190,12 @@ class AppPageWidget(Vertical):
             event.button.disabled = True
             event.button.label = "..."
             self.post_message(self.UninstallRequested(self._selected))
-        elif bid == "app-revert":
-            event.button.disabled = True
-            event.button.label = "..."
-            self.post_message(self.RevertRequested(self._selected))
+        elif bid == "app-rating-submit":
+            self._submit_rating()
+        elif bid == "app-rating-cancel":
+            self._close_rating_confirmation()
         elif bid.startswith("app-rate-"):
-            self.post_message(
-                self.RateRequested(int(bid.rsplit("-", 1)[1]), self._selected)
-            )
+            self._ask_rating_confirmation(int(bid.rsplit("-", 1)[1]))
         elif bid in (
             "app-purchase",
             "app-subscription",
@@ -865,12 +1229,7 @@ class AppPageWidget(Vertical):
         button.label = "🗑 " + self._t("app_page_remove", "Remover").strip()
 
     def reset_revert_button(self) -> None:
-        try:
-            button = self.query_one("#app-revert", Button)
-        except NoMatches:
-            return
-        button.disabled = False
-        button.label = "↺ " + self._t("app_page_snap_revert", "Revert").strip()
+        """Mantido por compatibilidade: a TUI não oferece Revert."""
 
     def _on_translate_pressed(self, button: Button) -> None:
         if self._showing_translation:
@@ -885,14 +1244,18 @@ class AppPageWidget(Vertical):
             )
 
     @on(Select.Changed)
-    def _select_changed(self, event: Select.Changed) -> None:
+    async def _select_changed(self, event: Select.Changed) -> None:
         event.stop()
         sid = event.select.id or ""
         if sid == "app-source":
             if event.value is _BLANK:
                 return
             self._selected = self._source_options[int(event.value)]
+            self._close_rating_confirmation()
+            self._rated, self._user_rating, self._can_rate = False, None, False
             self._refresh_rating()
+            self._load_rating_state()
+            await self._sync_extensions_tabs()
             self._featured_signature = None
             self._schedule_featured()
             self.post_message(self.SourceChanged(self._selected))

@@ -509,11 +509,17 @@ class HomeScreen(
         for view in self.query("SkillsSeekerView"):
             view.do_search(query)
 
-    @on(AppPageWidget.RevertRequested)
-    def _on_app_page_revert_requested(
-        self, message: AppPageWidget.RevertRequested
+    @on(AppPageWidget.ExtensionInstallRequested)
+    def _on_app_page_extension_install_requested(
+        self, message: AppPageWidget.ExtensionInstallRequested
     ) -> None:
-        self.run_appstream_snap_revert(message.script_info)
+        self.run_appstream_extension(message.info, remove=False)
+
+    @on(AppPageWidget.ExtensionRemoveRequested)
+    def _on_app_page_extension_remove_requested(
+        self, message: AppPageWidget.ExtensionRemoveRequested
+    ) -> None:
+        self.run_appstream_extension(message.info, remove=True)
 
     def _execute_search_worker(self, query: str) -> None:
         # If cache is still warming on first keystroke, this ensures it finishes
@@ -549,6 +555,8 @@ class HomeScreen(
 
         if self.is_skills_seeker_showing:
             await self._close_skills_seeker()
+            self.query_one("#logo_lt").display = True
+            self.query_one("#home-menu").display = True
             return
 
         if self._is_about_showing:
