@@ -125,17 +125,31 @@ class RemoveScriptScreen(ModalScreen[bool]):
         Binding("escape", "cancel", translations.get("script_runner_close"))
     ]
 
-    def __init__(self, name: str, description: str) -> None:
+    def __init__(
+        self,
+        name: str,
+        description: str,
+        *,
+        title: str | None = None,
+        confirm_label: str | None = None,
+    ) -> None:
         super().__init__()
         self.script_name = name
         self.description = description
+        self._dialog_title = title
+        self._confirm_label = confirm_label
 
     def compose(self) -> ComposeResult:
+        heading = (
+            self._dialog_title
+            or f"{translations.get('term_view_remove', 'Remove')} "
+            f"'{self.script_name}'?"
+        )
+        confirm_label = self._confirm_label or translations.get(
+            "term_view_remove", "Remove"
+        )
         with Vertical(id="confirm-dialog"):
-            yield Static(
-                f"{translations.get('term_view_remove', 'Remove')} '{self.script_name}'?",
-                id="confirm-title",
-            )
+            yield Static(heading, id="confirm-title")
             yield Static(self.description, id="confirm-description")
             with Horizontal(id="confirm-buttons"):
                 yield Button(
@@ -144,9 +158,7 @@ class RemoveScriptScreen(ModalScreen[bool]):
                     variant="error",
                 )
                 yield Button(
-                    translations.get("term_view_remove", "Remove"),
-                    id="execute-btn",
-                    variant="success",
+                    confirm_label, id="execute-btn", variant="success"
                 )
 
     def on_mount(self) -> None:

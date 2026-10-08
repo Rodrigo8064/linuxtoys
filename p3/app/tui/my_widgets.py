@@ -71,6 +71,7 @@ class InfoButton(Button):
         is_repo_entry: bool = False,
         is_appstream_entry: bool = False,
         has_app_page: bool = False,
+        info: dict | None = None,
         **kwargs,
     ) -> None:
         super().__init__(label, tooltip=description, **kwargs)
@@ -81,8 +82,14 @@ class InfoButton(Button):
         self.script_name = label
         self.is_installed = is_installed
         self.is_appstream_entry = is_appstream_entry
-        self.revert = is_removable(
-            str(label), path, is_repo_entry, is_appstream_entry
+        self.info = info or {}
+        self.revert = bool(is_installed) and is_removable(
+            str(label),
+            path,
+            is_repo_entry,
+            is_appstream_entry,
+            is_script=is_script,
+            info=self.info,
         )
         self.is_repo_entry = is_repo_entry
         self.has_app_page = has_app_page

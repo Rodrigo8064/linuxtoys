@@ -1,6 +1,8 @@
 import re
 import threading
+from collections.abc import Mapping
 from enum import Enum, auto
+from typing import Any
 
 from app.lang_utils import load_translations
 from app.parser import get_appstream_entries
@@ -48,20 +50,41 @@ def get_script_info(script_name: str) -> dict | None:
     )
 
 
+def is_registered_entry(info: Mapping[str, Any], registry_data) -> bool:
+    """Mesma regra do GUI (_appstream_registry_managed), para qualquer item."""
+    candidates = (
+        info.get("registry_name"),
+        info.get("appstream_id"),
+        info.get("name"),
+        info.get("appstream_canonical_name"),
+    )
+    return any(
+        str(candidate).strip() in registry_data
+        for candidate in candidates
+        if candidate
+    )
+
+
 def is_removable(
     script_name: str,
     script_path: str,
     is_repo_entry: bool,
     is_appstream_entry: bool,
+    is_script: bool = True,
+    info: dict | None = None,
 ) -> bool:
-    global _script_cache
     script_cache = _script_cache
-    script_info = {
-        "name": script_name,
-        "path": script_path,
-        "is_repo_entry": is_repo_entry,
-        "is_appstream_entry": is_appstream_entry,
-    }
+    if script_cache is None:
+        return False
+
+    script_info = dict(info or {})
+    script_info.update(
+        name=script_name,
+        path=script_path,
+        is_script=is_script,
+        is_repo_entry=is_repo_entry,
+        is_appstream_entry=is_appstream_entry,
+    )
     return script_cache.is_script_removable(script_info)
 
 
@@ -125,6 +148,13 @@ def search_scripts_fast(query: str) -> list[dict]:
     return [
         result.item_info for group in groups for result in group["scripts"]
     ]
+
+
+def refresh_removable_state() -> None:
+    """Recalcula o cache de 'removível' após instalar/remover algo."""
+    script_cache = _script_cache
+    if script_cache is not None:
+        script_cache.refresh_removable_cache()
 
 
 def get_categories(trans=None) -> list[dict]:

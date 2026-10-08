@@ -9,8 +9,8 @@ from typing import Any
 
 from textual.css.query import NoMatches
 
-from app import homebrew_catalog
-from app.compat import get_system_compat_keys
+from app import homebrew_catalog, installed_packages
+from app.compat import get_revert_capability, get_system_compat_keys
 from app.easy_cli import (
     _cleanup_tmp_noram_dirs,
     _save_script_to_registry,
@@ -56,9 +56,11 @@ from .helper import (
     get_specials_items,
     is_homebrew_catalog_valid,
     is_homebrew_path,
+    is_registered_entry,
     is_removable,
     is_specials_path,
     refresh_homebrew_catalog,
+    refresh_removable_state,
     translations,
 )
 from .manifest_dialog import ManifestPlanDialog, ManifestReportDialog
@@ -92,50 +94,128 @@ class ScriptRunnerMixin:
         if button.is_repo_entry and button.has_app_page:
             pass
         elif button.is_script:
-            self._handle_script_button(button)
+            await self._handle_script_button(button)
         else:
             await self._navigate_to_category(button)
 
-    def _handle_script_button(self, button: InfoButton) -> None:
+    @staticmethod
+    def _read_removal_state(button: InfoButton) -> tuple[dict, bool]:
+        """Leituras de arquivo que não devem rodar na thread da UI."""
+        registry_data = parse_registry_file()
+        is_script = button.is_script
+        removable = is_removable(
+            str(button.label),
+            button.path,
+            button.is_repo_entry,
+            button.is_appstream_entry,
+            is_script=is_script,
+            info=button.info,
+        )
+        return registry_data, removable
+
+    async def _handle_script_button(self, button: InfoButton) -> None:
         """Handle script button actions based on its execution state.
 
         Push the confirmation screen if it is the script's first run,
         otherwise push the installation reversal screen.
         """
         script_name = str(button.label)
-        registry_data = parse_registry_file()
-        is_first_run = script_name not in registry_data
-        is_script_removable = is_removable(
-            script_name,
-            button.path,
-            button.is_repo_entry,
-            button.is_appstream_entry,
+        registry_data, removable = await asyncio.to_thread(
+            self._read_removal_state, button
+        )
+        is_first_run = not is_registered_entry(
+            button.info or {"name": script_name}, registry_data
         )
 
-        if not is_first_run and is_script_removable:
-            self.app.push_screen(
-                RemoveScriptScreen(script_name, button.description),
-                callback=lambda confirmed: self._on_confirm_uninstall(
-                    button, confirmed
-                ),
-            )
-        else:
+        if is_first_run or not removable:
             self.app.push_screen(
                 ConfirmScriptScreen(script_name, button.description),
                 callback=lambda confirmed: self._on_confirm_install(
                     button, confirmed
                 ),
             )
+            return
+        script_info = button.info or await find_script_by_name_async(
+            script_name, translations
+        )
+        if script_info is None:
+            self.notify(
+                f"✗ Script '{script_name}' not found.", severity="warning"
+            )
+            return
+
+        blockers = await asyncio.to_thread(
+            installed_packages.dependency_blockers, script_info
+        )
+        if blockers:
+            self._notify_removal_blocked(script_name, blockers)
+            return
+        capability = await asyncio.to_thread(
+            self._revert_capability, script_info
+        )
+        is_internal = capability == "internal"
+        if is_internal:
+            screen = RemoveScriptScreen(
+                script_name,
+                translations.get(
+                    "internal_revert_confirm_message",
+                    "This script has a custom removal method. Running it "
+                    "again will attempt to remove its components. Do you "
+                    "want to continue?",
+                ),
+                title=translations.get(
+                    "internal_revert_confirm_title",
+                    "Re-run Script for Removal?",
+                ),
+                confirm_label=translations.get("yes", "Yes"),
+            )
+        else:
+            screen = RemoveScriptScreen(script_name, button.description)
+
+        self.app.push_screen(
+            screen,
+            callback=lambda confirmed: self._on_confirm_uninstall(
+                button, script_info, confirmed, is_internal
+            ),
+        )
+
+    def _notify_removal_blocked(
+        self, script_name: str, blockers: list[str]
+    ) -> None:
+        message = translations.get(
+            "dependency_block_message",
+            "Installed software still depends on '{name}'. "
+            "Remove it first:\n\n{blockers}",
+        ).format(
+            name=script_name,
+            blockers="\n".join(f"• {item}" for item in blockers),
+        )
+        self.notify(
+            message,
+            title=translations.get(
+                "dependency_block_title", "Removal Blocked"
+            ),
+            severity="warning",
+            timeout=10,
+        )
 
     def _on_confirm_install(self, button: InfoButton, confirmed: bool) -> None:
         if confirmed:
             self.run_script(button)
 
     def _on_confirm_uninstall(
-        self, button: InfoButton, confirmed: bool
+        self,
+        button: InfoButton,
+        script_info: dict,
+        confirmed: bool,
+        is_internal: bool = False,
     ) -> None:
-        if confirmed:
-            self.run_uninstall(button)
+        if not confirmed:
+            return
+        if is_internal:
+            self.run_script(button)
+            return
+        self.run_uninstall(button, script_info)
 
     async def _navigate_to_category(self, button: InfoButton) -> None:
         if is_homebrew_path(button.path):
@@ -300,6 +380,9 @@ class ScriptRunnerMixin:
             await self._show_home()
 
     def run_script(self, button: InfoButton) -> None:
+        if not self._ensure_terminal_free():
+            return
+
         self._running_button = button
         self._execute_script_info(
             {
@@ -311,6 +394,8 @@ class ScriptRunnerMixin:
         )
 
     def _execute_script_info(self, script_info: dict) -> None:
+        if not self._ensure_terminal_free():
+            return
         if script_info.get("is_repo_entry"):
             try:
                 script_info = materialize_repo_script(script_info)
@@ -357,18 +442,54 @@ class ScriptRunnerMixin:
         )
 
     @staticmethod
-    def _script_env(script_name: str) -> dict[str, str]:
-        """Ambiente comum a instalação e desinstalação."""
+    def _script_env(script_name: str, **extra: str) -> dict[str, str]:
+        """Ambiente comum a instalação, remoção e AppStream."""
         env = {
-            "LINUXTOYS_SCRIPT_NAME": script_name,
+            "LINUXTOYS_SCRIPT_NAME": script_name or "unknown",
             "DISABLE_ZENITY": "1",
         }
         script_dir = os.environ.get("SCRIPT_DIR")
         if script_dir:
             env["CACHE_DIR"] = os.path.join(script_dir, "scripts")
+        env.update(extra)
         return env
 
-    def run_uninstall(self, button: InfoButton) -> None:
+    def _ensure_terminal_free(self) -> bool:
+        """Evita sobrescrever o estado de uma execução em andamento."""
+        if self.query_one("#terminal", Terminal).is_busy:
+            self.notify(
+                "Já existe uma execução em andamento.", severity="warning"
+            )
+            return False
+        return True
+
+    def _notify_removal_not_available(self) -> None:
+        self.notify(
+            translations.get(
+                "remove_not_available_message",
+                "No removable components were detected for this script.",
+            ),
+            title=translations.get(
+                "remove_not_available_title", "Removal Not Available"
+            ),
+            severity="warning",
+        )
+
+    @staticmethod
+    def _revert_capability(script_info: dict):
+        """Capacidade de revert do script (roda em thread)."""
+        path = script_info.get("path", "")
+        if (
+            not script_info.get("is_script")
+            or script_info.get("is_repo_entry")
+            or script_info.get("is_appstream_entry")
+            or not path
+            or not os.path.isfile(path)
+        ):
+            return "yes"
+        return get_revert_capability(path, get_system_compat_keys())
+
+    def run_uninstall(self, button: InfoButton, script_info: dict) -> None:
         """Valida e prepara a desinstalação sem bloquear o event loop."""
         terminal = self.query_one("#terminal", Terminal)
         if self._preparing_run or terminal.is_busy:
@@ -378,46 +499,21 @@ class ScriptRunnerMixin:
             return
         self._preparing_run = True
         self.run_worker(
-            self._prepare_uninstall(button), group="uninstall-prepare"
+            self._prepare_uninstall(button, script_info),
+            group="uninstall-prepare",
         )
 
-    async def _prepare_uninstall(self, button: InfoButton) -> None:
-        script_name = str(button.label)
+    async def _prepare_uninstall(
+        self, button: InfoButton, script_info: dict
+    ) -> None:
         cleanup_path: str | None = None
         started = False
         try:
-            script_info = await find_script_by_name_async(
-                script_name, translations
-            )
-            if script_info is None:
-                self.notify(
-                    f"✗ Script '{script_name}' not found.",
-                    severity="warning",
-                )
-                return
-
-            blockers = await asyncio.to_thread(
-                installed_packages.dependency_blockers, script_info
-            )
-            if blockers:
-                details = "\n".join(f"• {item}" for item in blockers)
-                self.notify(
-                    f"✗ Cannot remove '{script_name}' yet — installed "
-                    f"software still depends on it:\n{details}",
-                    severity="warning",
-                    timeout=10,
-                )
-                return
-
             uninstall_entry = await asyncio.to_thread(
                 build_uninstall_script_entry, script_info, translations
             )
             if not uninstall_entry:
-                self.notify(
-                    f"✗ No removable registry entry found for "
-                    f"'{script_name}'.",
-                    severity="warning",
-                )
+                self._notify_removal_not_available()
                 return
             cleanup_path = uninstall_entry.get("cleanup_path")
 
@@ -429,7 +525,7 @@ class ScriptRunnerMixin:
                 )
             except Exception as exc:  # noqa: BLE001
                 self.notify(
-                    f"✗ Could not prepare removal of '{script_name}': {exc}",
+                    f"✗ Could not prepare removal of '{button.label}': {exc}",
                     severity="error",
                 )
                 return
@@ -454,6 +550,8 @@ class ScriptRunnerMixin:
         Retorna False se o terminal não aceitou o comando; a limpeza do
         script temporário fica por conta de ``_prepare_uninstall``.
         """
+        if not self._ensure_terminal_free():
+            return False
         self._running_button = button
         self._running_script_info = script_info
         self._running_temp_path = uninstall_entry.get("cleanup_path")
@@ -659,6 +757,24 @@ class ScriptRunnerMixin:
         self._running_is_appstream = False
         self._running_appstream_action = None
 
+        self.run_worker(
+            self._refresh_removable_state(),
+            group="removable-refresh",
+            exclusive=True,
+        )
+
+    async def _refresh_removable_state(self) -> None:
+        """Atualiza o cache e redesenha a categoria aberta."""
+        await asyncio.to_thread(refresh_removable_state)
+        if (
+            not self._nav_stack
+            or self._current_app_page() is not None
+            or self._homebrew_view_active()
+        ):
+            return
+        current_path, _ = self._nav_stack[-1]
+        await self._render_items(self._items_for_path(current_path))
+
     def _on_error_dialog_closed(
         self,
         wants_report: bool,
@@ -795,8 +911,14 @@ class AppstreamRunnerMixin:
     _running_dev_mode: bool
     _running_is_uninstall: bool
 
+    def _reset_appstream_remove_button(self) -> None:
+        page = self._current_app_page()
+        if page is not None:
+            page.reset_remove_button()
+
     def run_appstream_install(self, script_info: Mapping[str, Any]) -> None:
         entry = dict(script_info)
+        name = entry.get("name", "")
         raw_script_path = build_install_script(entry)
 
         resolve_script_dir()
@@ -811,7 +933,11 @@ class AppstreamRunnerMixin:
                 pass
         except (IOError, OSError):
             pass
-
+        if not self._ensure_terminal_free():
+            page = self._current_app_page()
+            if page is not None:
+                page.reset_install_button()
+            return
         self._running_button = None
         self._running_script_info = entry
         self._running_temp_path = script_path
@@ -823,12 +949,7 @@ class AppstreamRunnerMixin:
         terminal = self.query_one("#terminal", Terminal)
         terminal.run_script(
             script_path,
-            env={
-                "LINUXTOYS_SCRIPT_NAME": entry.get("name", "unknown"),
-                "DISABLE_ZENITY": "1",
-                "CACHE_DIR": os.environ.get("SCRIPT_DIR", "") + "/scripts",
-                "TRANSMAP_PATH": TRANSMAP_PATH,
-            },
+            env=self._script_env(name, TRANSMAP_PATH=TRANSMAP_PATH),
             pause_on_exit=False,
         )
 
@@ -836,6 +957,7 @@ class AppstreamRunnerMixin:
         self, script_info: Mapping[str, Any]
     ) -> None:
         entry = dict(script_info)
+        name = entry.get("name", "")
         try:
             argv = build_snap_revert_command(entry)
         except ValueError:
@@ -880,36 +1002,84 @@ class AppstreamRunnerMixin:
         terminal = self.query_one("#terminal", Terminal)
         terminal.run_script(
             script_path,
-            env={
-                "LINUXTOYS_SCRIPT_NAME": entry.get("name", "unknown"),
-                "DISABLE_ZENITY": "1",
-                "CACHE_DIR": os.environ.get("SCRIPT_DIR", "") + "/scripts",
-                "TRANSMAP_PATH": TRANSMAP_PATH,
-            },
+            env=self._script_env(name, TRANSMAP_PATH=TRANSMAP_PATH),
             pause_on_exit=False,
         )
 
     def run_appstream_uninstall(self, script_info: Mapping[str, Any]) -> None:
-        entry = dict(script_info)
-        name = entry.get("name", "")
-        plain_script_info = {"name": name, "path": entry.get("path", "")}
-        uninstall_entry = build_uninstall_script_entry(
-            plain_script_info, translations
+        if self._preparing_run or not self._ensure_terminal_free():
+            self._reset_appstream_remove_button()
+            return
+        self._preparing_run = True
+        self.run_worker(
+            self._prepare_appstream_uninstall(dict(script_info)),
+            group="uninstall-prepare",
         )
 
-        if not uninstall_entry:
-            self.notify(
-                f"✗ No removable registry entry found for '{name}'.",
-                severity="warning",
+    @staticmethod
+    def _resolve_appstream_removal(
+        entry: dict,
+    ) -> tuple[dict | None, list[str]]:
+        """Decide como remover um item AppStream (roda em thread)."""
+        blockers = installed_packages.dependency_blockers(entry)
+        if blockers:
+            return None, blockers
+
+        if not is_registered_entry(entry, parse_registry_file()):
+            observed = installed_packages.match(entry)
+            if observed is not None:
+                return (
+                    installed_packages.build_external_removal(
+                        entry, observed, translations
+                    ),
+                    [],
+                )
+        return build_uninstall_script_entry(entry, translations), []
+
+    async def _prepare_appstream_uninstall(self, entry: dict) -> None:
+        name = entry.get("name", "")
+        cleanup_path: str | None = None
+        started = False
+        try:
+            remove_info, blockers = await asyncio.to_thread(
+                self._resolve_appstream_removal, entry
             )
-            page = self._current_app_page()
-            if page is not None:
-                page.reset_remove_button()
-            return
+            if blockers:
+                self._notify_removal_blocked(name, blockers)
+                return
+            if not remove_info:
+                self._notify_removal_not_available()
+                return
+            cleanup_path = remove_info.get("cleanup_path")
 
-        uninstall_path = uninstall_entry["path"]
-        cleanup_path = uninstall_entry.get("cleanup_path")
+            try:
+                command = await asyncio.to_thread(
+                    lambda: script_command(
+                        remove_info["path"], resolve_script_dir()
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.notify(
+                    f"✗ Could not prepare removal of '{name}': {exc}",
+                    severity="error",
+                )
+                return
 
+            started = self._start_appstream_uninstall(
+                entry, cleanup_path, command
+            )
+        finally:
+            if cleanup_path and not started:
+                self._cleanup_temp_file(cleanup_path, False)
+            if not started:
+                self._reset_appstream_remove_button()
+            self._preparing_run = False
+
+    def _start_appstream_uninstall(
+        self, entry: dict, cleanup_path: str | None, command: list[str]
+    ) -> bool:
+        if not self._ensure_terminal_free():
+            return False
         self._running_button = None
         self._running_script_info = entry
         self._running_temp_path = cleanup_path
@@ -919,10 +1089,14 @@ class AppstreamRunnerMixin:
         self._running_appstream_action = "uninstall"
 
         terminal = self.query_one("#terminal", Terminal)
-        terminal.run_script(
-            script_command(uninstall_path, resolve_script_dir()),
+        started = terminal.run_script(
+            command,
+            env=self._script_env(entry.get("name", "unknown")),
             pause_on_exit=False,
         )
+        if not started:
+            self._finish_script_run()
+        return started
 
     async def run_appstream_aur_install(
         self, script_info: Mapping[str, Any]
@@ -970,7 +1144,11 @@ class AppstreamRunnerMixin:
                 pass
         except (IOError, OSError):
             pass
-
+        if not self._ensure_terminal_free():
+            page = self._current_app_page()
+            if page is not None:
+                page.reset_install_button()
+            return
         self._running_button = None
         self._running_script_info = entry
         self._running_temp_path = script_path
@@ -982,12 +1160,7 @@ class AppstreamRunnerMixin:
         terminal = self.query_one("#terminal", Terminal)
         terminal.run_script(
             script_path,
-            env={
-                "LINUXTOYS_SCRIPT_NAME": name or "unknown",
-                "DISABLE_ZENITY": "1",
-                "CACHE_DIR": os.environ.get("SCRIPT_DIR", "") + "/scripts",
-                "TRANSMAP_PATH": TRANSMAP_PATH,
-            },
+            env=self._script_env(name, TRANSMAP_PATH=TRANSMAP_PATH),
             pause_on_exit=False,
         )
 
