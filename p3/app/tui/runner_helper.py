@@ -949,10 +949,27 @@ class AppstreamRunnerMixin:
         else:
             page.reset_install_button()
 
+    @staticmethod
+    def _build_appstream_install_script(entry: dict) -> str:
+        """Gera o script bruto de instalação conforme a fonte do item."""
+        if entry.get("appstream_source") == "homebrew":
+            return homebrew_catalog.materialize_install(entry)["path"]
+        return build_install_script(entry)
+
     def run_appstream_install(self, script_info: Mapping[str, Any]) -> None:
         entry = dict(script_info)
         name = entry.get("name", "")
-        raw_script_path = build_install_script(entry)
+        try:
+            raw_script_path = self._build_appstream_install_script(entry)
+        except ValueError as exc:
+            self.notify(
+                f"✗ Could not prepare install of '{name}': {exc}",
+                severity="error",
+            )
+            page = self._current_app_page()
+            if page is not None:
+                page.reset_install_button()
+            return
 
         resolve_script_dir()
         script_path = create_temp_file(raw_script_path)

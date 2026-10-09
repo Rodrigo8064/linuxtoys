@@ -453,6 +453,8 @@ class HomeScreen(
     async def _on_app_page_install_requested(
         self, message: AppPageWidget.InstallRequested
     ) -> None:
+        if type(message) is not AppPageWidget.InstallRequested:
+            return
         entry = message.script_info
         if str(entry.get("path", "")).startswith("aur://"):
             await self.run_appstream_aur_install(entry)
