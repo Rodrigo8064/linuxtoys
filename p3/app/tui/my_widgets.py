@@ -407,7 +407,7 @@ class Terminal(Widget, can_focus=True):
         command: str | list,
         env: dict[str, str] | None = None,
         pause_on_exit: bool = True,
-    ) -> Bool:
+    ) -> bool:
         """Injeta 'bash <script>' no shell persistente, com um marcador
         de saída logo depois pra detectar o fim e capturar o exit code."""
         if self.pty is None or self._awaiting_exit_code:

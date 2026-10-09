@@ -674,7 +674,7 @@ class ScriptRunnerMixin:
             if is_extension:
                 pass
             elif is_appstream and not is_uninstall:
-                _save_script_to_registry(script_path, TRANSMAP_PATH)
+                _save_script_to_registry(script_name, TRANSMAP_PATH)
                 self._remove_transmap()
             elif not dev_mode and not is_uninstall:
                 revert_info = {
@@ -951,16 +951,29 @@ class AppstreamRunnerMixin:
 
     @staticmethod
     def _build_appstream_install_script(entry: dict) -> str:
-        """Gera o script bruto de instalação conforme a fonte do item."""
+        script_dir = resolve_script_dir()
         if entry.get("appstream_source") == "homebrew":
-            return homebrew_catalog.materialize_install(entry)["path"]
-        return build_install_script(entry)
+            raw_path = homebrew_catalog.materialize_install(entry)["path"]
+            return script_command(raw_path, script_dir), raw_path
+
+        raw_path = build_install_script(entry)
+        script_path = create_temp_file(raw_path)
+        try:
+            os.remove(raw_path)
+        except OSError:
+            pass
+        return script_path, script_path
 
     def run_appstream_install(self, script_info: Mapping[str, Any]) -> None:
         entry = dict(script_info)
         name = entry.get("name", "")
+        if not self._ensure_terminal_free():
+            page = self._current_app_page()
+            if page is not None:
+                page.reset_install_button()
+            return
         try:
-            raw_script_path = self._build_appstream_install_script(entry)
+            command, temp_path = self._prepare_install_command(entry)
         except ValueError as exc:
             self.notify(
                 f"✗ Could not prepare install of '{name}': {exc}",
@@ -971,26 +984,14 @@ class AppstreamRunnerMixin:
                 page.reset_install_button()
             return
 
-        resolve_script_dir()
-        script_path = create_temp_file(raw_script_path)
-        try:
-            os.remove(raw_script_path)
-        except OSError:
-            pass
-
         try:
             with open(TRANSMAP_PATH, "w"):
                 pass
         except (IOError, OSError):
             pass
-        if not self._ensure_terminal_free():
-            page = self._current_app_page()
-            if page is not None:
-                page.reset_install_button()
-            return
         self._running_button = None
         self._running_script_info = entry
-        self._running_temp_path = script_path
+        self._running_temp_path = temp_path
         self._running_dev_mode = False
         self._running_is_uninstall = False
         self._running_is_appstream = True
@@ -998,8 +999,12 @@ class AppstreamRunnerMixin:
 
         terminal = self.query_one("#terminal", Terminal)
         terminal.run_script(
-            script_path,
-            env=self._script_env(name, TRANSMAP_PATH=TRANSMAP_PATH),
+            command,
+            env=self._script_env(
+                name,
+                TRANSMAP_PATH=TRANSMAP_PATH,
+                SCRIPT_DIR=os.environ.get("SCRIPT_DIR", ""),
+            ),
             pause_on_exit=False,
         )
 
