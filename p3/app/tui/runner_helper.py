@@ -950,7 +950,7 @@ class AppstreamRunnerMixin:
             page.reset_install_button()
 
     @staticmethod
-    def _build_appstream_install_script(entry: dict) -> str:
+    def _prepare_install_command(entry: dict) -> tuple[Any, str]:
         script_dir = resolve_script_dir()
         if entry.get("appstream_source") == "homebrew":
             raw_path = homebrew_catalog.materialize_install(entry)["path"]
@@ -1003,7 +1003,6 @@ class AppstreamRunnerMixin:
             env=self._script_env(
                 name,
                 TRANSMAP_PATH=TRANSMAP_PATH,
-                SCRIPT_DIR=os.environ.get("SCRIPT_DIR", ""),
             ),
             pause_on_exit=False,
         )
