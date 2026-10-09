@@ -606,6 +606,7 @@ class ScriptRunnerMixin:
         script_info = self._running_script_info or {}
         is_extension = self._is_extension_entry(script_info)
         script_name = script_info.get("name", "Script")
+        registry_name = script_info.get("registry_name", script_name)
 
         # verify if is reboot
         script_path = script_info.get("path", "")
@@ -626,7 +627,7 @@ class ScriptRunnerMixin:
 
         if result is ScriptResult.SUCCESS:
             if not dev_mode and not is_uninstall and not is_extension:
-                _save_script_to_registry(script_name, TRANSMAP_PATH)
+                _save_script_to_registry(registry_name, TRANSMAP_PATH)
                 _cleanup_tmp_noram_dirs(TRANSMAP_PATH)
                 self._remove_transmap()
             self._cleanup_temp_file(temp_path, dev_mode)
@@ -674,7 +675,7 @@ class ScriptRunnerMixin:
             if is_extension:
                 pass
             elif is_appstream and not is_uninstall:
-                _save_script_to_registry(script_name, TRANSMAP_PATH)
+                _save_script_to_registry(registry_name, TRANSMAP_PATH)
                 self._remove_transmap()
             elif not dev_mode and not is_uninstall:
                 revert_info = {
@@ -968,27 +969,22 @@ class AppstreamRunnerMixin:
         entry = dict(script_info)
         name = entry.get("name", "")
         if not self._ensure_terminal_free():
-            page = self._current_app_page()
-            if page is not None:
-                page.reset_install_button()
+            self._reset_install_button()
             return
         try:
+            os.makedirs(
+                os.path.dirname(TRANSMAP_PATH), mode=0o700, exist_ok=True
+            )
+            with open(TRANSMAP_PATH, "w"):
+                pass
             command, temp_path = self._prepare_install_command(entry)
-        except ValueError as exc:
+        except (OSError, ValueError) as exc:
             self.notify(
                 f"✗ Could not prepare install of '{name}': {exc}",
                 severity="error",
             )
-            page = self._current_app_page()
-            if page is not None:
-                page.reset_install_button()
+            self._reset_install_button()
             return
-
-        try:
-            with open(TRANSMAP_PATH, "w"):
-                pass
-        except (IOError, OSError):
-            pass
         self._running_button = None
         self._running_script_info = entry
         self._running_temp_path = temp_path
@@ -1006,6 +1002,11 @@ class AppstreamRunnerMixin:
             ),
             pause_on_exit=False,
         )
+
+    def _reset_install_button(self) -> None:
+        page = self._current_app_page()
+        if page is not None:
+            page.reset_install_button()
 
     def run_appstream_snap_revert(
         self, script_info: Mapping[str, Any]
