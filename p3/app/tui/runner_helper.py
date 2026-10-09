@@ -62,6 +62,7 @@ from .helper import (
     is_specials_path,
     refresh_homebrew_catalog,
     refresh_removable_state,
+    search_homebrew_items,
     translations,
 )
 from .manifest_dialog import ManifestPlanDialog, ManifestReportDialog
@@ -909,7 +910,6 @@ class ScriptRunnerMixin:
         if page is None:
             return
         if self._is_extension_entry(script_info):
-            # A página do app continua montada; só a lista muda.
             self.query_one("#terminal-conteiner").display = False
             page.refresh_extensions()
             return
@@ -920,6 +920,57 @@ class ScriptRunnerMixin:
             featured=None,
             installed=not is_uninstall,
         )
+
+    def _schedule_homebrew_search(self, query: str) -> None:
+        if self._homebrew_search_timer:
+            self._homebrew_search_timer.stop()
+        self._homebrew_search_timer = self.set_timer(
+            0.2, partial(self._run_homebrew_search, query)
+        )
+
+    def _run_homebrew_search(self, query: str) -> None:
+        if (
+            not self._homebrew_view_active()
+        ):  # saiu da categoria durante o debounce
+            return
+        self.run_worker(
+            self._homebrew_search_async(query),
+            exclusive=True,
+            group="homebrew-items",
+            exit_on_error=False,
+        )
+
+    async def _homebrew_search_async(self, query: str) -> None:
+        if not query:
+            await self._load_homebrew_items_async()
+            return
+
+        try:
+            results = await asyncio.to_thread(search_homebrew_items, query)
+        except Exception:  # noqa: BLE001
+            logger.exception("Homebrew search failed")
+            if self._homebrew_view_active():
+                await self._show_items_message(
+                    translations.get(
+                        "homebrew_catalog_unavailable",
+                        "Homebrew metadata is unavailable. Try again later.",
+                    )
+                )
+            return
+
+        # Resultado obsoleto: saiu da categoria ou o texto já mudou.
+        current = self.query_one("#search-input", Input).value.strip()
+        if not self._homebrew_view_active() or current != query:
+            return
+
+        if not results:
+            await self._show_items_message(
+                translations.get(
+                    "homebrew_no_results", "No Homebrew packages found."
+                )
+            )
+            return
+        await self._render_items(results, lazy=True)
 
 
 class AppstreamRunnerMixin:

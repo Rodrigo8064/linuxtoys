@@ -240,6 +240,18 @@ def get_homebrew_items() -> list[dict]:
     return appstream_parser.get_homebrew_entries()
 
 
+def search_homebrew_items(query: str) -> list[dict]:
+    """Busca só no Homebrew (Rust). BLOQUEANTE: executar em thread."""
+    from app import homebrew_catalog
+
+    if not homebrew_catalog.enabled():
+        return []
+    from app import appstream_parser
+
+    ensure_homebrew_context()
+    return list(appstream_parser.search_homebrew_entries(query))
+
+
 def get_specials_root_item(trans=None) -> dict:
     active_translations = trans or translations
     return {

@@ -88,6 +88,7 @@ class HomeScreen(
         self._lazy_loaded = 0
         self._registry_data = None
         self._skills_search_timer = None
+        self._homebrew_search_timer = None
         self._skills_prev_display: dict[str, bool] = {}
         self._skills_prev_placeholder = ""
         self._skills_prev_panel_title = ""
@@ -325,7 +326,7 @@ class HomeScreen(
         if scroll_y >= panel.max_scroll_y - SCROLL_LOAD_MARGIN:
             self.run_worker(
                 self._load_next_page(),
-                exclusive=True,  # evita páginas duplicadas
+                exclusive=True,
                 group="items-page",
                 exit_on_error=False,
             )
@@ -475,6 +476,11 @@ class HomeScreen(
 
         if self.is_skills_seeker_showing:
             self._schedule_skills_search(query)
+            return
+
+        if self._homebrew_view_active():
+            if not self._homebrew_awaiting_refresh:
+                self._schedule_homebrew_search(query)
             return
 
         if self._search_timer:
